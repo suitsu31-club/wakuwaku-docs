@@ -1,0 +1,190 @@
+---
+title: 検索
+description: 型付きのフィルターとソートを組み立て、クライアントの JSON から安全に受け取り、クライアントが外せないスコープの下で検索を実行します。
+icon: SearchCode
+---
+
+検索リクエストの多くはエンドユーザーから始まります。検索ボックス、ファセットのチェックボックス、ソートのドロップダウンなどです。ユーザー入力を Meilisearch のフィルター文字列に連結するというよくある近道は、インジェクションの温床です。wakuwaku はフィルター文字列を、インデックスのフィールドしか指定できない型付きの木に置き換え、それをクライアントの JSON からデシリアライズし、クライアントのフィルターからは外せないサーバー側のスコープと組み合わせます。
+
+このページの例では、[概要](/ja/docs/data/meilisearch) で記述した `PostIndex` を使います。
+
+## 型付きフィルター [#typed-filters]
+
+[`Filter<F>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/enum.Filter.html) はフィールド `F` に対する条件の木です。`F` はインデックスの `Filterable` enum です。
+
+```rust
+use wakuwaku::entity::meilisearch::filter::Filter;
+
+let recent_async_posts = Filter::And(vec![
+    Filter::In(PostFilter::Tags, vec!["async".into(), "tokio".into()]),
+    Filter::Gte(PostFilter::PublishedAt, 1_700_000_000_i64.into()),
+]);
+```
+
+| バリアント | 意味 |
+|---|---|
+| `Eq(f, v)` / `Ne(f, v)` | 等しい / 等しくない。配列の属性では、要素のいずれかが等しいこと。文字列は大文字小文字を区別せずに比較します。 |
+| `Gt`、`Gte`、`Lt`、`Lte` | 比較。 |
+| `Between(f, low, high)` | 2 つの値の間 (両端を含む)。 |
+| `In(f, values)` | いずれかの値に等しい。値がなければ何にもマッチしません。 |
+| `Exists(f)` | ドキュメントがその属性を持つ (`null` や空でも)。 |
+| `IsNull(f)` / `IsEmpty(f)` | 属性が `null` / `""`、`[]`、`{}` のいずれか。 |
+| `Not(filter)`、`And(filters)`、`Or(filters)` | 否定とグループ。 |
+| `DangerouslyRaw(expr)` | 生の Meilisearch 式。[後述](#raw-expressions) します。 |
+
+値は [`Value`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/enum.Value.html) で、真偽値、整数、浮動小数点数、文字列のいずれかです。`.into()` で `bool`、整数型、`f32`/`f64`、`String`、`&str` から変換できます。
+
+### 同じフィルターを JSON で
+
+フィルターは外部タグ形式の JSON からデシリアライズされるので、クライアントは上のフィルターを次のように送れます。
+
+```json
+{"and": [{"in": ["tags", ["async", "tokio"]]}, {"gte": ["published_at", 1700000000]}]}
+```
+
+`render()` はこれを Meilisearch の構文に変換します。グループの各要素は括弧で囲まれ、すべての属性と値はクォートされエスケープされます。
+
+```text
+("tags" IN ["async", "tokio"]) AND ("published_at" >= "1700000000")
+```
+
+### 起こりえないこと
+
+フィルターは 3 つの時点で検査されます。強いものから順に並べます。
+
+| 時点 | 拒否されるもの |
+|---|---|
+| コンパイル時 | インデックスの `Filterable` enum にないフィールド。あるインデックス用のフィルターで別のインデックスの検索をスコープすること: `Filter<UserFilter>` は `Filter<PostFilter>` ではありません。 |
+| デシリアライズ時 | 未知の属性名 (`{"exists": "password"}`)、未知の演算子、生の式。`DangerouslyRaw` は serde でスキップされるので、クライアントは `{"dangerously_raw": "..."}` を送れません。 |
+| レンダリング時 | 空の `And`/`Or` (`EmptyGroup`)、NaN や無限大の浮動小数点数 (`NonFiniteNumber`)、`MAX_DEPTH` = 64 を超えるネスト (`TooDeep`)。 |
+
+値によるインジェクションは構造上起こりません。クォート内では `"` と `\` がエスケープされるので、値が文字列を途中で閉じることはできません。
+
+```rust
+let sneaky = Filter::Eq(PostFilter::Tags, r#"x" OR workspace_id EXISTS"#.into());
+// レンダリング結果: "tags" = "x\" OR workspace_id EXISTS"
+```
+
+コンパイル時の検査の例です。users インデックス用のフィルターで posts の検索をスコープすることはできません。
+
+```rust
+let request = SearchRequest::<PostIndex>::new();
+// error[E0308]: mismatched types: expected `PostFilter`, found `UserFilter`
+let search = Search::scoped(request, Filter::Eq(UserFilter::Team, "core".into()));
+```
+
+## ソート
+
+[`Sort<F>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/struct.Sort.html) は、インデックスの `Sortable` enum のフィールドと順序を指定します。`Sort::asc(field)` / `Sort::desc(field)` で組み立てるか、クライアントに `{"field": "published_at", "order": "desc"}` を送らせます。順序の既定値は昇順です。ソートは指定順に、関連度より先に適用されます。
+
+## クライアントからの検索リクエスト
+
+[`SearchRequest<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/search/struct.SearchRequest.html) は、インデックス `I` の検索についてクライアントが要求できるもののすべてです。リクエストボディから直接デシリアライズできます。
+
+```json
+{
+  "q": "rust",
+  "filter": {"gte": ["published_at", 1700000000]},
+  "sort": [{"field": "published_at", "order": "desc"}],
+  "facets": ["tags"],
+  "page": 2,
+  "hitsPerPage": 20
+}
+```
+
+どのフィールドも省略可能です。`q` がなければ、スコープ内のすべてのドキュメントがマッチします。ファセットはフィルター可能なフィールド、ソートはソート可能なフィールドでなければなりません。未知のトップレベルフィールドは拒否される (`deny_unknown_fields`) ので、サーバーが無視するオプションをクライアントが有効だと思い込むことはありません。たとえば `{"q": "rust", "limit": 1000}` は ``unknown field `limit` `` で失敗します。
+
+## スコープの下で検索を実行する [#running-a-search-under-a-scope]
+
+[`Search<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/search/struct.Search.html) は、クライアントのリクエストにサーバーが強制する条件を加えます。
+
+- **スコープ**: `Search::scoped(request, scope)` は、検索対象を `scope` にマッチするドキュメントに限定します。`Search::unscoped(request)` はインデックスのすべてのドキュメントを検索します。インデックス全体が公開されている場合にだけ使ってください。
+- **ページサイズの上限**: 要求された `hitsPerPage` の既定値は 20、上限は 100 です。上限は `.max_hits_per_page(n)` で変更でき、それより大きい要求は黙って `n` になります。
+
+スコープとクライアントのフィルターは、フィルター配列の別々の要素として Meilisearch に送られます。Meilisearch は各要素を個別にパースしてから `AND` で結合するので、クライアント側の部分にあるものは、紛れ込んだ括弧でさえ、スコープを広げられません。
+
+`Search<I>` のエフェクトは `Read<I>` で、SDK の `SearchResults<I::Document>` を出力します。ドキュメントはあなたのドキュメント型としてデシリアライズされるので、その型にない属性がサーバー経由でクライアントに届くことはありません。
+
+完全なハンドラーの例です。[他のクエリ](/ja/docs/data/queries) と同様にハンドルについてジェネリックにし、必要なクエリを列挙します。ケーパビリティは、ハンドルを接続する場所で一度だけ検査されます。
+
+```rust title="src/search/handlers.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::deps::meilisearch_sdk::search::SearchResults;
+use wakuwaku::entity::meilisearch::filter::Filter;
+use wakuwaku::entity::meilisearch::search::{Search, SearchRequest};
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// 呼び出し元のワークスペースの投稿を検索する。
+///
+/// `body` はクライアントが送った JSON。
+pub async fn search_posts<D>(
+    meili: &D,
+    workspace_id: i64,
+    body: &str,
+) -> Result<SearchResults<PostDocument>, BoxError>
+where
+    D: Processor<Search<PostIndex>, Output = SearchResults<PostDocument>, Error = Error>,
+{
+    // 未知のフィールド、未知の属性、生のフィルターはここで失敗する。
+    let request: SearchRequest<PostIndex> = serde_json::from_str(body)?;
+    // 空のグループ、NaN、深すぎるネストはここで 400 として失敗する。
+    if let Some(filter) = &request.filter {
+        filter.render()?;
+    }
+
+    // クライアントのフィルターはこのスコープと AND される。外すことはできない。
+    let scope = Filter::Eq(PostFilter::WorkspaceId, workspace_id.into());
+    let search = Search::scoped(request, scope).max_hits_per_page(50);
+    Ok(meili.process(search).await?)
+}
+```
+
+<Callout type="info" title="なぜ先にフィルターをレンダリングするのか">
+  レンダリングできないフィルターは、そうしなければクエリ自体を `FilterError` を包んだ `Error::Other` で失敗させます。これは Meilisearch の障害と見分けにくいものです。先に `render()` を呼べば、クライアントエラーとして応答できます。
+</Callout>
+
+これを、検索キーから作った読み取り専用ハンドル ([`search_handle`](/ja/docs/data/meilisearch#indexes-entities-and-capabilities) を参照) に接続します: `search_posts(&search_handle(url, key)?, workspace, body)`。
+
+### サーバーで組み立てる検索
+
+クライアントは必須ではありません。`SearchRequest::new()` は空のリクエストで、自分で埋められます。
+
+```rust title="src/search/handlers.rs"
+use wakuwaku::entity::meilisearch::filter::Sort;
+
+/// ある著者の最新の投稿のタイトル。
+pub async fn latest_titles<D>(meili: &D, workspace_id: i64, author_id: i64) -> Result<Vec<String>, Error>
+where
+    D: Processor<Search<PostIndex>, Output = SearchResults<PostDocument>, Error = Error>,
+{
+    let mut request = SearchRequest::<PostIndex>::new();
+    request.filter = Some(Filter::Eq(PostFilter::AuthorId, author_id.into()));
+    request.sort = vec![Sort::desc(PostSort::PublishedAt)];
+    request.hits_per_page = Some(10);
+
+    let scope = Filter::Eq(PostFilter::WorkspaceId, workspace_id.into());
+    let results = meili.process(Search::scoped(request, scope)).await?;
+    Ok(results.hits.into_iter().map(|hit| hit.result.title).collect())
+}
+```
+
+## 生の式 [#raw-expressions]
+
+`Filter::dangerously_raw(expr)` は Meilisearch 独自の構文で書いた式を保持し、そのままレンダリングします。地理フィルターのように、型付きの木では表現できないもののためにあります。クライアントは送れませんが、式そのものは完全に信頼されます。
+
+<Callout type="error" title="生のフィルターのルール">
+  - **信頼できない入力から組み立てないでください。** `format!("author = {name}")` に名前 `x OR author EXISTS` を渡すと、すべてのドキュメントにマッチします。SQL と同じくインジェクションです。
+  - **括弧では封じ込められません。** `AND` は `OR` より強く結合するので、生のテキスト `a = 1) OR (b = 2` を `(scope) AND (...)` の中に置くと、スコープの外の `b = 2` にマッチします。生のノードは、それを含むフィルター全体の意味を書き換えられます。
+  - **インデックスのフィールドを超えて届きます。** フィルター可能な任意の属性を指定でき、`_foreign()` で結合したインデックスのドキュメントにもフィルターをかけられます。
+</Callout>
+
+生のノードにできないのは、*別の* フィルターから抜け出すことです。スコープ付き検索では、リクエストのフィルター内の生のノードはスコープを外せません。ただし *スコープ内* の生のノードはスコープをすべてにマッチさせられるので、スコープは型付きのままにしてください。
+
+## 次のステップ
+
+<Cards>
+  <Card title="テナントトークン" href="/ja/docs/data/meilisearch/tenant-tokens" description="同じスコープを、Meilisearch を直接検索するフロントエンドに対して Meilisearch が強制します。" />
+  <Card title="書き込み" href="/ja/docs/data/meilisearch/writes" description="ドキュメントをインデックスに入れる。" />
+</Cards>

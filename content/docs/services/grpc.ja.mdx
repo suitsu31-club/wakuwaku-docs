@@ -1,0 +1,656 @@
+---
+title: gRPC サービス
+description: .proto ファイルから tonic のサーバーを生成し、実装を ServiceBuilder から組み立て、共通のミドルウェアとグレースフルシャットダウン付きで公開します。
+icon: Network
+---
+
+wakuwaku は [tonic](https://docs.rs/tonic/0.14/tonic/) を置き換えるものではありません。`.proto` ファイルは tonic のコード生成器でコンパイルし、生成されたトレイトをサービスが実装し、tonic の `Server` がそれを公開します。wakuwaku が担うのはその間の配線です。各サービス実装を **[`ServiceBuilder`](/ja/docs/core/service-builder) に登録済みの依存から組み立て**、生成されたサーバーで包み、型レベルのリストにまとめて、一度の呼び出しで全サーバーをルーターに追加します。
+
+Spring でいえば gRPC スターターの `@GrpcService` Bean に相当しますが、違いが二つあります。スキャンによる自動検出はなく、すべてのサーバーをコードで明示的に登録すること。そして、依存が登録されていないサーバーはコンパイルが通らないことです。
+
+<GrpcRegistrationDiagram lang="ja" />
+
+図の流れを順に説明します。
+
+1. `ServiceBuilder::grpc_service` が実装の `Dep` をサービスビルダーから探し、clone します。
+2. `ServiceCreation::create_service` がその clone から実装を作ります。
+3. 渡したコンストラクタ(通常は `XxxServer::new`)が実装を生成済みサーバーで包みます。
+4. サーバーは型レベルのリストである `GrpcServiceRegisterCenter` に push されます。Box 化も動的ディスパッチもありません。
+5. `into_router_fn` がリストを `impl FnOnce(Router<L>) -> Router<L>` に変換します。この関数は登録順にすべてのサーバーを tonic のルーターに追加します。
+
+## .proto ファイルからコードを生成する [#generating-code-from-a-proto-file]
+
+### プロジェクト構成 [#project-layout]
+
+<Files>
+  <Folder name="accounts-service" defaultOpen>
+    <File name="Cargo.toml" />
+    <File name="build.rs" />
+    <Folder name="proto" defaultOpen>
+      <File name="accounts.proto" />
+    </Folder>
+    <Folder name="src" defaultOpen>
+      <File name="main.rs" />
+      <File name="deps.rs" />
+      <File name="accounts.rs" />
+      <File name="sessions.rs" />
+      <File name="admin.rs" />
+    </Folder>
+  </Folder>
+</Files>
+
+### 依存関係 [#dependencies]
+
+wakuwaku の機能は基本的に `wakuwaku` 一つから import しますが、生成された gRPC コードは例外です。`tonic-prost-build` が書き出すコードは `tonic::`、`tonic_prost::`、`::prost::` を直接参照するため、これらのクレートはサービスの **直接の依存** にする必要があります。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = "1.0.0-rc1"  # デフォルト feature に `grpc` が含まれる
+# 生成コードが直接参照するクレート
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+```
+
+`tonic` は wakuwaku と同じマイナーバージョン(wakuwaku 1.0.0-rc1 では 0.14)にしてください。そうすれば Cargo が両者を一つのクレートに解決し、`tonic` と `wakuwaku::deps::tonic` は同じ型になります。バージョンが異なると、生成されたサーバーは別の `tonic` のトレイトを実装することになり、wakuwaku に受け付けられません。
+
+コード生成器は Protocol Buffers コンパイラ `protoc` を呼び出します。最初のビルドの前に、パッケージマネージャーでインストールする(または環境変数 `PROTOC` でパスを指定する)必要があります。
+
+### proto ファイル [#the-proto-file]
+
+このページでは、三つのサービスを含む一つのファイルを使います。
+
+```proto title="proto/accounts.proto"
+syntax = "proto3";
+
+package accounts.v1;
+
+// Reads and creates accounts.
+service Accounts {
+  rpc GetAccount(GetAccountRequest) returns (Account);
+  rpc CreateAccount(CreateAccountRequest) returns (Account);
+}
+
+// Signs users out.
+service Sessions {
+  rpc RevokeSessions(RevokeSessionsRequest) returns (RevokeSessionsResponse);
+}
+
+// Back-office operations; every call is audited.
+service Admin {
+  rpc DeleteAccount(DeleteAccountRequest) returns (DeleteAccountResponse);
+}
+
+message Account {
+  uint64 id = 1;
+  string email = 2;
+}
+
+message GetAccountRequest {
+  uint64 id = 1;
+}
+
+message CreateAccountRequest {
+  string email = 1;
+}
+
+message RevokeSessionsRequest {
+  uint64 account_id = 1;
+}
+
+message RevokeSessionsResponse {
+  uint32 revoked = 1;
+}
+
+message DeleteAccountRequest {
+  uint64 id = 1;
+}
+
+message DeleteAccountResponse {
+  bool deleted = 1;
+}
+```
+
+### build.rs [#buildrs]
+
+```rust title="build.rs"
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // OUT_DIR に `accounts.v1.rs` を生成する:
+    // メッセージ (prost) と、サービスごとのサーバーモジュール (tonic)。
+    tonic_prost_build::compile_protos("proto/accounts.proto")?;
+    Ok(())
+}
+```
+
+`compile_protos` はサーバーとクライアントの両方を生成します。サーバーだけを生成する、derive を追加する、複数ファイルを扱うといった細かい制御が必要なら `tonic_prost_build::configure()` を使います。詳しくは [tonic-prost-build のドキュメント](https://docs.rs/tonic-prost-build/0.14/tonic_prost_build/) を参照してください。
+
+生成されたファイルは、proto のパッケージ名に合わせたモジュールに取り込みます。
+
+```rust title="src/main.rs"
+pub mod proto {
+    tonic::include_proto!("accounts.v1");
+}
+```
+
+これで `service Xxx` ごとに、`proto::xxx_server` の中に実装すべきトレイト `Xxx` と、実装 `T` を包むサーバー型 `XxxServer<T>` ができます。
+
+## サービスを実装する [#implementing-a-service]
+
+サービス実装はただの構造体です。生成されたトレイトを実装し、さらに [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装して、どの登録済みの値から作られるかを示します。
+
+例では次の共有依存を使います。コネクションプールや Redis ハンドルの代わりとなるダミーです。大事なのは **clone が安価** で、すべての clone が同じ状態を共有することです。`grpc_service` はサーバーを作るたびに依存をサービスビルダーから clone するためです。
+
+```rust title="src/deps.rs"
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex;
+
+use crate::proto::Account;
+
+/// データベースプールの代わり: clone は安価で、すべての clone がデータを共有する。
+#[derive(Clone, Default)]
+pub struct AccountStore {
+    next_id: Arc<AtomicU64>,
+    accounts: Arc<Mutex<HashMap<u64, Account>>>,
+}
+
+impl AccountStore {
+    pub fn get(&self, id: u64) -> Option<Account> {
+        self.accounts.lock().get(&id).cloned()
+    }
+
+    pub fn insert(&self, email: String) -> Account {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let account = Account { id, email };
+        self.accounts.lock().insert(id, account.clone());
+        account
+    }
+
+    pub fn remove(&self, id: u64) -> bool {
+        self.accounts.lock().remove(&id).is_some()
+    }
+}
+
+/// アカウントごとの有効なセッション数。
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    sessions: Arc<Mutex<HashMap<u64, u32>>>,
+}
+
+impl SessionStore {
+    pub fn revoke_all(&self, account_id: u64) -> u32 {
+        self.sessions.lock().remove(&account_id).unwrap_or(0)
+    }
+}
+
+/// 追記専用の監査ログ。
+#[derive(Clone, Default)]
+pub struct AuditLog {
+    entries: Arc<Mutex<Vec<String>>>,
+}
+
+impl AuditLog {
+    pub fn record(&self, entry: String) {
+        self.entries.lock().push(entry);
+    }
+}
+```
+
+(このダミーは [`parking_lot`](https://docs.rs/parking_lot) を使っています。そのまま使う場合は `parking_lot = "0.12"` を追加してください。実際のサービスでは本物の依存に置き換えます。)
+
+`Accounts` の実装は `AccountStore` から作ります。
+
+```rust title="src/accounts.rs"
+use tonic::{Request, Response, Status};
+use wakuwaku::ServiceCreation;
+
+use crate::deps::AccountStore;
+use crate::proto::accounts_server::Accounts;
+use crate::proto::{Account, CreateAccountRequest, GetAccountRequest};
+
+pub struct AccountsService {
+    store: AccountStore,
+}
+
+impl ServiceCreation for AccountsService {
+    type Dep = AccountStore;
+
+    fn create_service(store: AccountStore) -> Self {
+        Self { store }
+    }
+}
+
+#[tonic::async_trait]
+impl Accounts for AccountsService {
+    async fn get_account(
+        &self,
+        request: Request<GetAccountRequest>,
+    ) -> Result<Response<Account>, Status> {
+        let id = request.into_inner().id;
+        self.store
+            .get(id)
+            .map(Response::new)
+            .ok_or_else(|| Status::not_found(format!("account {id} does not exist")))
+    }
+
+    async fn create_account(
+        &self,
+        request: Request<CreateAccountRequest>,
+    ) -> Result<Response<Account>, Status> {
+        let email = request.into_inner().email;
+        if !email.contains('@') {
+            return Err(Status::invalid_argument("email must contain '@'"));
+        }
+        Ok(Response::new(self.store.insert(email)))
+    }
+}
+```
+
+`Sessions` も同じ形で、`SessionStore` から作ります。
+
+```rust title="src/sessions.rs"
+use tonic::{Request, Response, Status};
+use wakuwaku::ServiceCreation;
+
+use crate::deps::SessionStore;
+use crate::proto::sessions_server::Sessions;
+use crate::proto::{RevokeSessionsRequest, RevokeSessionsResponse};
+
+pub struct SessionsService {
+    sessions: SessionStore,
+}
+
+impl ServiceCreation for SessionsService {
+    type Dep = SessionStore;
+
+    fn create_service(sessions: SessionStore) -> Self {
+        Self { sessions }
+    }
+}
+
+#[tonic::async_trait]
+impl Sessions for SessionsService {
+    async fn revoke_sessions(
+        &self,
+        request: Request<RevokeSessionsRequest>,
+    ) -> Result<Response<RevokeSessionsResponse>, Status> {
+        let revoked = self.sessions.revoke_all(request.into_inner().account_id);
+        Ok(Response::new(RevokeSessionsResponse { revoked }))
+    }
+}
+```
+
+<Callout type="info" title="リクエストの検証">
+Protobuf のメッセージはどのフィールドにも任意の値を受け付けます。「`@` を含むメールアドレス」を `if` ではなく型で表す方法は [サービスでのバリデーション](/ja/docs/validation/in-services) を参照してください。
+</Callout>
+
+## サーバーを登録する [#registering-servers]
+
+[`ServiceBuilder::grpc_service`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html#method.grpc_service) は三つの型パラメータ `<Server, ServiceImpl, Position>` と、一つの引数を取ります。
+
+| パラメータ | 書く内容 | 理由 |
+| --- | --- | --- |
+| `Server` | `AccountsServer<_>` | 生成されたサーバー。その型パラメータは `ServiceImpl` から推論されます。 |
+| `ServiceImpl` | `AccountsService` | あなたの実装。その `ServiceCreation::Dep` が検索対象になります。 |
+| `Position` | `_` | `Dep` がサービスビルダーのどこにあるか。その型が一度だけ登録されていれば推論されます。 |
+| 引数 | `AccountsServer::new` | 作られた実装をサーバーに変換します。 |
+
+呼び出しはチェーンでき、最後に `into_router_fn` で締めます。
+
+```rust title="src/main.rs"
+let (services, register) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .grpc_service::<SessionsServer<_>, SessionsService, _>(SessionsServer::new)
+    .into_router_fn();
+
+// `services` は手元に残る: cron ジョブやコンシューマーに渡せる
+let _store: &AccountStore = services.provide::<AccountStore, _>();
+
+let router = Server::builder().add_routes(Routes::default());
+register(router).serve("[::1]:50051".parse()?).await?;
+```
+
+知っておくとよい点です。
+
+- **サーバーはすぐに作られます。** 最初のリクエストが来たときではなく、`grpc_service` を呼んだ時点です。遅延初期化による驚きはありません。
+- **サービスビルダーは返ってきます。** `into_router_fn` は登録関数と一緒にサービスビルダーを返すので、同じ依存を [cron ジョブ](/ja/docs/services/cron-jobs) や [イベントコンシューマー](/ja/docs/events/consuming) にも使えます。
+- **`register` はルーターを渡して一度だけ呼びます。** 登録順にサーバーを追加し、ルーターのミドルウェアには手を触れません([ミドルウェア](#middleware-layers-and-interceptors) を参照)。
+- 同じ `Dep` 型を複数回登録している場合、`_` は推論できません。[サービスビルダー](/ja/docs/core/service-builder) で説明している `Here` / `There<Here>` で位置を指定します。
+
+引数は任意の `FnOnce(ServiceImpl) -> Server` なので、途中で生成済みサーバーを設定できます。たとえばメッセージサイズの上限です。
+
+```rust
+let (_services, register) = ServiceBuilder::new(AccountStore::default())
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(|service| {
+        AccountsServer::new(service).max_decoding_message_size(1024 * 1024)
+    })
+    .into_router_fn();
+```
+
+## 複数の依存が必要なサービス [#services-that-need-several-dependencies]
+
+`ServiceCreation` は **一つ** の登録済みの値からサービスを作ります。`Admin` サービスは `AccountStore` と `AuditLog` の両方を必要とします。両方を渡す方法は二つあります。
+
+### まとめて登録する [#register-a-group]
+
+おすすめの方法です。サービスが必要とするものをまとめた値を一つ登録し、それを `Dep` にします。サービスは引き続き `grpc_service` で組み立てられ、サービスの依存が一か所にまとまって見通しもよくなります。(この `Admin` 実装は [後述](#build-it-by-hand-with-into_parts) のものと同じで、`self.deps.store` と `self.deps.audit` を使います。)
+
+```rust
+/// `AdminService` が必要とするものをまとめた、一つの登録値。
+#[derive(Clone)]
+pub struct AdminDeps {
+    pub store: AccountStore,
+    pub audit: AuditLog,
+}
+
+pub struct GroupedAdminService {
+    deps: AdminDeps,
+}
+
+impl ServiceCreation for GroupedAdminService {
+    type Dep = AdminDeps;
+
+    fn create_service(deps: AdminDeps) -> Self {
+        Self { deps }
+    }
+}
+```
+
+```rust
+let store = AccountStore::default();
+let audit = AuditLog::default();
+
+let (_services, register) = ServiceBuilder::new(store.clone())
+    .push(audit.clone())
+    .push(AdminDeps { store, audit })
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .grpc_service::<AdminServer<_>, GroupedAdminService, _>(AdminServer::new)
+    .into_router_fn();
+```
+
+### `into_parts` で手作業で組み立てる [#build-it-by-hand-with-into_parts]
+
+サービスがそもそも `ServiceCreation` に合わない場合は、チェーンを `into_router_fn` ではなく `into_parts` で締めます。サービスビルダーと [`GrpcServiceRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/struct.GrpcServiceRegisterCenter.html) そのものが返るので、`provide` で得たものからサービスを作り、そのサーバーを `push` します。
+
+```rust title="src/admin.rs"
+use tonic::{Request, Response, Status};
+
+use crate::deps::{AccountStore, AuditLog};
+use crate::proto::admin_server::Admin;
+use crate::proto::{DeleteAccountRequest, DeleteAccountResponse};
+
+/// 二つの登録値が必要なので、手作業で組み立てる。
+pub struct AdminService {
+    pub store: AccountStore,
+    pub audit: AuditLog,
+}
+
+#[tonic::async_trait]
+impl Admin for AdminService {
+    async fn delete_account(
+        &self,
+        request: Request<DeleteAccountRequest>,
+    ) -> Result<Response<DeleteAccountResponse>, Status> {
+        let id = request.into_inner().id;
+        let deleted = self.store.remove(id);
+        self.audit.record(format!("delete account {id}: {deleted}"));
+        Ok(Response::new(DeleteAccountResponse { deleted }))
+    }
+}
+```
+
+```rust title="src/main.rs"
+let (services, register) = services
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .grpc_service::<SessionsServer<_>, SessionsService, _>(SessionsServer::new)
+    .into_parts();
+
+let admin = AdminService {
+    store: services.provide::<AccountStore, _>().clone(),
+    audit: services.provide::<AuditLog, _>().clone(),
+};
+let register = register.push(AdminServer::new(admin)).into_router_fn();
+```
+
+`push` はどのように作ったサーバーでも受け付けます。`provide` は引き続きコンパイル時に検査されるので、未登録の型を要求すればここでもビルドが失敗します。
+
+## ミドルウェア: レイヤーとインターセプター [#middleware-layers-and-interceptors]
+
+登録関数はルーターのレイヤースタックに一切触れません。ミドルウェアはルーターを作る **前に** tonic の [`Server`](https://docs.rs/tonic/0.14/tonic/transport/struct.Server.html) に設定し、`add_routes(Routes::default())` で空のルーターから始めます。設定したものはすべて、登録関数が追加するすべてのサーバーに適用されます。
+
+```rust title="src/main.rs"
+/// 登録したすべてのサーバーの、すべての呼び出しの前に実行される。
+fn require_request_id(request: Request<()>) -> Result<Request<()>, Status> {
+    if request.metadata().contains_key("x-request-id") {
+        Ok(request)
+    } else {
+        Err(Status::invalid_argument("missing x-request-id header"))
+    }
+}
+```
+
+```rust title="src/main.rs"
+// 3. ミドルウェアはルーターを作る前に Server に設定する
+let router = Server::builder()
+    .timeout(Duration::from_secs(10))
+    .layer(InterceptorLayer::new(require_request_id))
+    .add_routes(Routes::default());
+```
+
+`InterceptorLayer`(`tonic::service` にあります)はインターセプター関数をレイヤーに変換します。`Server` には `timeout`、`concurrency_limit_per_connection`、`http2_keepalive_interval` といった組み込みの設定もあります。
+
+[tower](https://docs.rs/tower/0.5/tower/) のレイヤーも同じように使えます。複数重ねるときは tower のビルダーを使います(`tower = { version = "0.5", features = ["limit"] }` が必要です)。
+
+```rust
+let router = Server::builder()
+    .layer(
+        tower::ServiceBuilder::new()
+            .layer(tower::limit::ConcurrencyLimitLayer::new(256))
+            .layer(InterceptorLayer::new(require_request_id)),
+    )
+    .add_routes(Routes::default());
+let _router = register(router);
+```
+
+<Callout type="warn" title="二つの ServiceBuilder">
+`tower::ServiceBuilder` はミドルウェアを積み重ねるもので、`wakuwaku::ServiceBuilder` は依存を保持するものです。両者は無関係です。`main.rs` で取り違えないよう、tower のほうはフルパスで書く(または別名で import する)ことをおすすめします。
+</Callout>
+
+### 一つのサーバーだけにインターセプターを掛ける [#an-interceptor-for-one-server-only]
+
+生成されたサーバーには `XxxServer::with_interceptor` がありますが、これが返すサーバー(`InterceptedService`)は `RoutableService` が要求するものとは別のボディ型で応答するため([後述](#what-the-compiler-checks))、`grpc_service` にも `push` にも渡せません。こうしたサーバーは、登録関数を呼んだ **後で** ルーターに追加します。`register` が返すルーターは普通の tonic のルーターです。
+
+```rust
+let (_services, register) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .into_router_fn();
+
+let sessions = SessionsService::create_service(SessionStore::default());
+
+let router = Server::builder().add_routes(Routes::default());
+register(router)
+    // ヘッダーを検査するのは `Sessions` だけ
+    .add_service(SessionsServer::with_interceptor(sessions, require_request_id))
+    .serve("[::1]:50051".parse()?)
+    .await?;
+```
+
+## グレースフルシャットダウン付きで公開する [#serving-with-graceful-shutdown]
+
+`main.rs` の全体です。共有依存、それらから作るサーバーと手作業で作るサーバー、ミドルウェア、そして Ctrl-C で止まるサーバーです。
+
+```rust title="src/main.rs"
+mod accounts;
+mod admin;
+mod deps;
+mod sessions;
+
+pub mod proto {
+    tonic::include_proto!("accounts.v1");
+}
+
+use std::time::Duration;
+
+use tonic::service::{InterceptorLayer, Routes};
+use tonic::transport::Server;
+use tonic::{Request, Status};
+use wakuwaku::ServiceBuilder;
+
+use crate::accounts::AccountsService;
+use crate::admin::AdminService;
+use crate::deps::{AccountStore, AuditLog, SessionStore};
+use crate::proto::accounts_server::AccountsServer;
+use crate::proto::admin_server::AdminServer;
+use crate::proto::sessions_server::SessionsServer;
+use crate::sessions::SessionsService;
+
+/// 登録したすべてのサーバーの、すべての呼び出しの前に実行される。
+fn require_request_id(request: Request<()>) -> Result<Request<()>, Status> {
+    if request.metadata().contains_key("x-request-id") {
+        Ok(request)
+    } else {
+        Err(Status::invalid_argument("missing x-request-id header"))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 共有依存
+    let services = ServiceBuilder::new(AccountStore::default())
+        .push(SessionStore::default())
+        .push(AuditLog::default());
+
+    // 2. 依存から作るサーバーと、手作業で作るサーバー
+    let (services, register) = services
+        .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+        .grpc_service::<SessionsServer<_>, SessionsService, _>(SessionsServer::new)
+        .into_parts();
+
+    let admin = AdminService {
+        store: services.provide::<AccountStore, _>().clone(),
+        audit: services.provide::<AuditLog, _>().clone(),
+    };
+    let register = register.push(AdminServer::new(admin)).into_router_fn();
+
+    // 3. ミドルウェアはルーターを作る前に Server に設定する
+    let router = Server::builder()
+        .timeout(Duration::from_secs(10))
+        .layer(InterceptorLayer::new(require_request_id))
+        .add_routes(Routes::default());
+
+    // 4. すべてのサーバーを追加し、Ctrl-C まで公開する
+    let addr = "[::1]:50051".parse()?;
+    register(router)
+        .serve_with_shutdown(addr, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+```
+
+`serve_with_shutdown` は future が完了すると新しい接続の受け付けをやめ、処理中のリクエストを最後まで終わらせます。cron ジョブやコンシューマーも動かしている場合は、サーバーが戻ってから止めます。組み合わせ方は [cron ジョブ](/ja/docs/services/cron-jobs#shutting-down) に、サービス全体での順序は [ライフサイクル](/ja/docs/core/lifecycle) にあります。
+
+## コンパイラが検査すること [#what-the-compiler-checks]
+
+`grpc_service` と `push` はどちらも、サーバーが [`RoutableService`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/trait.RoutableService.html) を実装していることを要求します。実装すべきものはありません。次の境界に付けた名前にすぎず、境界を満たす型はすべて自動的にこれを実装します。
+
+| 境界 | 意味 |
+| --- | --- |
+| `Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>` | tonic の `Body` で応答し、エラーはトランスポートエラーではなく必ず gRPC のステータスとして返す tonic サービス。 |
+| `Future: Send + 'static` | 応答をどの Tokio ワーカーでも進められる。 |
+| `NamedService` | `accounts.v1.Accounts` のような完全修飾名を持ち、それがルートになる。 |
+| `Clone + Send + Sync + 'static` | ルーターが接続をまたいで共有できる。 |
+
+tonic が生成する `XxxServer<T>` は、`T` が `Send + Sync + 'static` であればすべて満たします。そして生成されたトレイトが実装にちょうどそれを要求しています。実際に境界が問題になるのはラッパーだけです。`InterceptedService` は独自のボディ型で応答するため受け付けられません([サーバー全体のレイヤーを使うか、後から追加します](#an-interceptor-for-one-server-only))。
+
+そのほかの検査です。
+
+- **登録されていない依存はコンパイルエラーです。** `AccountsService::Dep` が `AccountStore` なのに `AccountStore` を push していなければ、`grpc_service::<AccountsServer<_>, AccountsService, _>` はビルドできません。
+- **トレイトメソッドの実装漏れはコンパイルエラーです。** これは tonic の通常どおりで、生成されたトレイトには proto のすべての `rpc` が並びます。
+
+<Callout type="error" title="サービス名の重複は起動時に panic する">
+同じ `NamedService::NAME` を持つ二つのサーバー(たとえば同じサーバーを二回登録した場合)は一つのルーターに共存できません。これはコンパイルエラー **ではありません**。登録関数を呼んだ時点で `Invalid route "/accounts.v1.Accounts/{*rest}": Insertion failed due to conflict with previously registered route` のようなメッセージで panic します。登録関数は `main` の早い段階、ほかの何かを起動する前に呼びましょう。そうすれば、バイナリを初めて動かした時点で誤りに気づけます。
+</Callout>
+
+## ServiceBuilder を使わない場合 [#without-a-servicebuilder]
+
+`GrpcServiceRegisterCenter` は、自分で作ったサーバーだけで単独で使うこともできます。`new` でリストを始め、`push` で伸ばし、`into_router_fn` で締めます。
+
+```rust
+use wakuwaku::services::grpc_service::GrpcServiceRegisterCenter;
+
+let store = AccountStore::default();
+let register = GrpcServiceRegisterCenter::new(AccountsServer::new(
+    AccountsService::create_service(store),
+))
+.push(SessionsServer::new(SessionsService::create_service(
+    SessionStore::default(),
+)))
+.into_router_fn();
+let _router = register(Server::builder().add_routes(Routes::default()));
+```
+
+`into_parts` の後でも同じことができます。手作業で作ったサーバーとサービスビルダーから作ったサーバーは、こうして一つのリストにまとまります。`RoutableService` の境界を満たすサーバーなら何でもこの方法で push できます。満たさないものは、`register` を呼んだ後でルーターに追加します。
+
+## サービスをテストする [#testing-a-service]
+
+サービス実装はただの構造体なので、ユニットテストでは `create_service` で作り、トレイトメソッドを直接呼びます。サーバーもネットワークも、生成されたクライアントも要りません。
+
+```rust title="src/accounts.rs"
+#[cfg(test)]
+mod tests {
+    use tonic::{Code, Request};
+    use wakuwaku::ServiceCreation;
+
+    use super::AccountsService;
+    use crate::deps::AccountStore;
+    use crate::proto::accounts_server::Accounts;
+    use crate::proto::{CreateAccountRequest, GetAccountRequest};
+
+    #[tokio::test]
+    async fn created_accounts_can_be_read_back() {
+        let service = AccountsService::create_service(AccountStore::default());
+
+        let created = service
+            .create_account(Request::new(CreateAccountRequest { email: "a@example.com".into() }))
+            .await
+            .unwrap()
+            .into_inner();
+        let read = service
+            .get_account(Request::new(GetAccountRequest { id: created.id }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(read, created);
+    }
+
+    #[tokio::test]
+    async fn unknown_accounts_are_not_found() {
+        let service = AccountsService::create_service(AccountStore::default());
+        let status = service
+            .get_account(Request::new(GetAccountRequest { id: 42 }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), Code::NotFound);
+    }
+}
+```
+
+これが [証明駆動プログラミング](/ja/docs/core/proof-driven) で説明している役割分担です。配線はコンパイラが証明し、各サービスの振る舞いはユニットテストが証明します。詳しくは [テスト](/ja/docs/core/testing) を参照してください。
+
+<Cards>
+  <Card title="cron ジョブ" href="/ja/docs/services/cron-jobs" description="同じサービスビルダーから組み立てたスキャンやクリーンアップを、一定間隔で実行します。" />
+  <Card title="サービスビルダー" href="/ja/docs/core/service-builder" description="依存を登録し、型で検索する仕組み。" />
+  <Card title="サービスでのバリデーション" href="/ja/docs/validation/in-services" description="Protobuf のフィールドを検証済みのドメイン型に変換します。" />
+  <Card title="ライフサイクル" href="/ja/docs/core/lifecycle" description="サービス全体の起動と停止の順序。" />
+</Cards>

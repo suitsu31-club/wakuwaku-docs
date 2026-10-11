@@ -1,0 +1,233 @@
+---
+title: Redis
+description: Use Redis as a capability-checked data source, with typed caches, locks, a rate limiter, pipes, live views and stream buffers.
+icon: Zap
+---
+
+Redis is where a microservice keeps the state that is shared between replicas but doesn't belong in the primary database: cached reads, locks, rate-limit counters, messages on their way to a websocket, the chunks of a streamed LLM answer. The `redis` feature of wakuwaku turns Redis into a [data source](/en/docs/data/queries) like PostgreSQL: every command is a typed query, and a `Db` handle only runs the queries its capability allows.
+
+On top of the data source, wakuwaku ships ready-made data structures, each one a small `const` value whose methods build queries:
+
+| Structure | Module | Use it for |
+| --- | --- | --- |
+| [`Cache`, `HashedCache`](/en/docs/data/redis/cache) | `collection::cache` | Bodies with a TTL; the hashed variant answers "has it changed?" without downloading the body. |
+| [`Lock`, `RwLock`](/en/docs/data/redis/lock) | `collection::lock` | Mutual exclusion across replicas, with leases. |
+| [`TokenBucket`](/en/docs/data/redis/rate-limiter) | `collection::token_bucket_limiter` | Rate limiting with bursts. |
+| [`Pipe`](/en/docs/data/redis/pipe) | `dynamic::pipe` | A one-way, one-receiver message queue, like one direction of a websocket. |
+| [`LiveView`](/en/docs/data/redis/live-view) | `dynamic::live_view` | A durable document with versioned commits that subscribers follow as diffs. |
+| [`StreamBuffer`](/en/docs/data/redis/stream-buffer) | `dynamic::stream_buffer` | An append-only array with an end, followed by any number of subscribers. |
+
+The *collections* are queried on demand. The *dynamic* structures can also be followed as they change.
+
+If you come from Spring, this page covers what Spring Data Redis' connection setup does, and the subpages replace the usual mix of `RedisCacheManager`, a distributed lock registry and a rate-limiting library, with one typing discipline across all of them.
+
+## Setup
+
+Enable the `redis` feature. Bodies stored in Redis are serialized with [kanau](https://docs.rs/kanau)'s `MessageSer` / `MessageDe`; the JSON derives need a direct `kanau` dependency with its `serde_json` feature, plus `serde`:
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["redis"] }
+kanau = { version = "0.6", features = ["serde_json"] }  # JsonMessageSer / JsonMessageDe
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+Cargo unifies this `kanau` with the one wakuwaku uses, so `wakuwaku::deps::kanau` and `kanau` are the same crate. See [Serializing the body](/en/docs/events/defining-events#serializing-the-body) for how the derives work and how to write `MessageSer` / `MessageDe` by hand instead.
+
+The Redis client itself is re-exported as `wakuwaku::deps::redis`, so you don't add `redis` to `Cargo.toml`.
+
+### Connecting
+
+A [`RedisSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/struct.RedisSource.html) wraps a cloneable async connection and runs each query on a clone of it. With the default `MultiplexedConnection` the clones share one socket, so this is cheap. Wrap the source in a `Db` with a capability:
+
+```rust title="src/redis.rs"
+use wakuwaku::deps::redis;
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Db, ReadWrite};
+
+/// The Redis handle every component of this service shares.
+pub type Redis = Db<RedisSource, ReadWrite>;
+
+pub async fn connect(client: &redis::Client) -> redis::RedisResult<Redis> {
+    let connection = client.get_multiplexed_async_connection().await?;
+    Ok(Db::new(RedisSource::new(connection)))
+}
+```
+
+`RedisSource<C>` accepts any `C: ConnectionLike + Clone + Send + Sync`, so a cluster connection or a `ConnectionManager` works the same way.
+
+### Registering it
+
+`Db` is `Clone` whenever its source is, so register it in the [`ServiceBuilder`](/en/docs/core/service-builder) and build components from it:
+
+```rust title="src/main.rs"
+use wakuwaku::{ServiceBuilder, ServiceCreation};
+
+pub struct SessionService {
+    redis: Redis,
+}
+
+impl ServiceCreation for SessionService {
+    type Dep = Redis;
+
+    fn create_service(redis: Redis) -> Self {
+        Self { redis }
+    }
+}
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let services = ServiceBuilder::new(connect(&client).await?);
+    let redis: &Redis = services.provide::<Redis, _>();
+    Ok(())
+}
+```
+
+Every query of this section is then run with `redis.process(query).await`, the [`Processor`](https://docs.rs/kanau) method that `Db` implements for each query its capability covers.
+
+## Your own Redis queries
+
+The built-in structures are queries like any other. When you need a command they don't cover, write the query yourself: [`Query`](/en/docs/data/queries) declares which entity it touches, and `Execute<RedisSource<C>>` runs it on the connection.
+
+```rust title="src/session.rs"
+use wakuwaku::deps::redis::aio::ConnectionLike;
+use wakuwaku::deps::redis::{self, AsyncCommands};
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Entity, Execute, Query, Write};
+
+/// The entity: login sessions, wherever they are stored.
+pub struct Session;
+impl Entity for Session {}
+
+pub struct StoreSession {
+    pub token: String,
+    pub user: u64,
+}
+
+impl Query for StoreSession {
+    type Effect = Write<Session>;
+}
+
+impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for StoreSession {
+    type Output = ();
+
+    async fn execute(self, conn: &mut C) -> redis::RedisResult<()> {
+        conn.set_ex(format!("session:{}", self.token), self.user, 3600).await
+    }
+}
+```
+
+The error type of every Redis query is `RedisError`. The built-in structures also report a body that fails to (de)serialize, and a key whose contents don't match what the structure wrote (`"corrupted item"`), as a `RedisError`.
+
+## Names and keys
+
+Each structure is generic over the type `N` that names its items: `Cache<u64, Profile>` is keyed by user ID, `Lock<str>` by a string. A name must implement [`Name`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/trait.Name.html), which strings, byte strings and every integer type already do. For an identifier newtype, write its canonical form:
+
+```rust
+use wakuwaku::entity::redis::Name;
+
+pub struct UserId(pub u64);
+
+impl Name for UserId {
+    fn write_name(&self, key: &mut Vec<u8>) {
+        self.0.write_name(key);
+    }
+}
+```
+
+An item lives under the key
+
+```text
+@@wakuwaku-entity:<kind>:<namespace>:<name>
+```
+
+where `<kind>` is the structure type (`Cache`, `Lock`, `TokenBucket`, …) and `<namespace>` is the first argument of its `new`. Items made of several keys (`RwLock`, `Pipe`, `LiveView`) wrap `<namespace>:<name>` in braces and append a suffix per key, so all their keys share one Redis Cluster hash slot and their Lua scripts and `MULTI` blocks work on a cluster.
+
+<Callout type="warn" title="One namespace per structure">
+  Two structures of the same kind with the same namespace share their keys. `Cache<u64, Profile>` and `Cache<u64, Settings>` both named `"user"` would overwrite each other's bodies and then fail to deserialize them. Give each `const` its own namespace.
+</Callout>
+
+## Capabilities
+
+Each structure type is also the [entity](/en/docs/data/queries) its queries read and write, so `Cache<u64, Profile>` and `Cache<str, Page>` are different entities. Which queries count as writes follows what they do in Redis, not what they look like:
+
+| Structure | Read queries | Write queries |
+| --- | --- | --- |
+| `Cache` | `get` | `put`, `remove` |
+| `HashedCache` | `get`, `hash`, `get_if_changed` | `put`, `remove` |
+| `Lock` | | `try_lock`, `release`, `extend` |
+| `RwLock` | | `try_read`, `try_write`, `release`, `extend` |
+| `TokenBucket` | | `acquire`, `reset` |
+| `Pipe` | | `send`, `close`, `receive` (taking a message removes it) |
+| `LiveView` | `get`, `version`, `history`, `subscribe`, `resume` | `create`, `commit`, `remove` |
+| `StreamBuffer` | `read`, `subscribe` | `append`, `finish`, `remove` |
+
+A `Db<_, ReadOnly>` therefore can't take a lock or consume a rate-limit token, and putting a body through it doesn't compile:
+
+```rust
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Db, ReadOnly};
+
+async fn warm(replica: &Db<RedisSource, ReadOnly>, user: u64, profile: Profile) -> RedisResult<()> {
+    // error: `ReadOnly: CanWrite<Cache<u64, Profile>>` is not satisfied
+    replica.process(PROFILES.put(&user, profile)).await
+}
+```
+
+A capability can also grant access to some structures only. This gateway reads every cache but writes only the session cache:
+
+```rust
+use wakuwaku::entity::redis::collection::cache::Cache;
+use wakuwaku::entity::{CanRead, CanWrite};
+
+pub struct SessionToken(String);
+pub struct Session {
+    user: u64,
+}
+
+/// Reads every cache, writes only the session cache.
+pub enum Gateway {}
+impl<N: ?Sized, B> CanRead<Cache<N, B>> for Gateway {}
+impl CanWrite<Cache<SessionToken, Session>> for Gateway {}
+```
+
+## Following changes: dedicated connections
+
+Receiving from a pipe and subscribing to a live view or a stream buffer are queries too, so the capability is checked as usual. They output a receiver or subscription that waits with blocking Redis commands (`BLPOP`, `XREAD BLOCK`) on a connection you pass to the query.
+
+A blocking command stalls every other command sent on the same socket, so that connection must be used for nothing else: never pass a clone of the multiplexed connection inside your `RedisSource`. It must also not time out a response before the block ends. Open one per receiver with the response timeout turned off:
+
+```rust title="src/redis.rs"
+use wakuwaku::deps::redis::AsyncConnectionConfig;
+use wakuwaku::deps::redis::aio::MultiplexedConnection;
+
+/// A connection for one receiver or subscription, used for nothing else.
+pub async fn dedicated_connection(
+    client: &redis::Client,
+) -> redis::RedisResult<MultiplexedConnection> {
+    let config = AsyncConnectionConfig::new().set_response_timeout(None);
+    client.get_multiplexed_async_connection_with_config(&config).await
+}
+```
+
+The examples in the following pages use this helper. Each receiver and subscription has an `async fn recv` and an `into_stream` that turns it into a `futures::Stream`.
+
+## Server requirements
+
+- Locks and the rate limiter read the server clock with `TIME` inside Lua scripts. This needs effects replication of scripts, the default since Redis 5. Because the clock is the server's, clock skew between your replicas doesn't matter.
+- Pipe receivers block with fractional `BLPOP` timeouts, which need Redis 6.
+- Structures that span several keys keep them in one hash slot, so Redis Cluster is supported.
+
+## Next steps
+
+<Cards>
+  <Card title="Caches" href="/en/docs/data/redis/cache" description="Cache-aside with typed bodies and hash-based revalidation." />
+  <Card title="Locks" href="/en/docs/data/redis/lock" description="Leases, extension, reader-writer locks and the cron-job pattern." />
+  <Card title="Rate limiter" href="/en/docs/data/redis/rate-limiter" description="Token buckets refilled continuously by the server clock." />
+  <Card title="Pipes" href="/en/docs/data/redis/pipe" description="One-way message queues from one sender to one receiver." />
+  <Card title="Live views" href="/en/docs/data/redis/live-view" description="Versioned documents followed as diffs." />
+  <Card title="Stream buffers" href="/en/docs/data/redis/stream-buffer" description="Append-only arrays for streamed output such as LLM chunks." />
+</Cards>

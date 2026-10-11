@@ -1,0 +1,5 @@
+{
+  "title": "Meilisearch",
+  "icon": "Search",
+  "pages": ["index", "search", "writes", "tenant-tokens", "sync"]
+}

@@ -1,0 +1,317 @@
+---
+title: Composing predicates
+description: Combine predicates with And and Or, choose a check order, and write predicates that query a database.
+icon: Combine
+---
+
+Real rules are rarely a single check. `wakuwaku::proof` has two combinators, [`And`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.And.html) and [`Or`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.Or.html). Each is itself a predicate, so they nest, and each keeps the evidence of the operands that held. This page uses the `Limits`, `NonEmpty` and `ShortEnough` predicates from [the overview](/en/docs/validation).
+
+## And
+
+`And<A, B>` holds when both `A` and `B` hold for the subject. Its evidence is a tuple struct with the evidence of both sides, `And(Evidence<A>, Evidence<B>)`, so you destructure it:
+
+```rust
+pub type ValidUsername = And<NonEmpty, ShortEnough>;
+
+pub fn register(name: Proven<String, ValidUsername>) -> String {
+    let And(_, short_enough) = name.evidence();
+    format!("{} ({} bytes to spare)", name.subject(), short_enough.spare)
+}
+```
+
+`short_enough` is a `&Evidence<ShortEnough>`; field access goes through `Deref`, so `short_enough.spare` just works.
+
+## Or
+
+`Or<A, B>` holds when `A` or `B` (or both) hold. Its evidence is an enum that records which sides are **known** to hold:
+
+| Variant | Meaning |
+| --- | --- |
+| `Or::Left(Evidence<A>)` | `A` held. Says nothing about `B`: it failed, could not be decided, or was never checked. |
+| `Or::Right(Evidence<B>)` | `B` held. Says nothing about `A`. |
+| `Or::Both(Evidence<A>, Evidence<B>)` | Both held. |
+
+Matching on the evidence lets later code act on what was actually proven. The sign-in example further down accepts "a username or an email address" and uses the evidence to find out which one it was:
+
+```rust
+/// What a user typed into the "username or email" box.
+pub type SignInId = Or<NameRegistered, EmailRegistered>;
+
+pub fn resolve(login: &Proven<String, SignInId>) -> Result<i64, &'static str> {
+    match login.evidence() {
+        Or::Left(by_name) => Ok(by_name.user.id),
+        Or::Right(by_email) => Ok(by_email.user.id),
+        // One user's name is another user's email: refuse to guess.
+        Or::Both(by_name, by_email) if by_name.user.id != by_email.user.id => {
+            Err("ambiguous sign-in id")
+        }
+        Or::Both(by_name, _) => Ok(by_name.user.id),
+    }
+}
+```
+
+## Check order
+
+`prove` takes a [`CheckOrder`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.CheckOrder.html), which tells `And` and `Or` how to evaluate their operands. The order is forwarded unchanged to nested predicates, so it applies to the whole tree. Leaf predicates receive it too and may ignore it.
+
+- `CheckOrder::Sequential` awaits the operands one after another, left to right.
+- `CheckOrder::Parallel` polls both operands concurrently on the current task with `tokio::join!`. Nothing is spawned, and both run to completion even when one fails early.
+
+What happens next depends on the combinator:
+
+| | `Sequential` | `Parallel` |
+| --- | --- | --- |
+| `And<A, B>` | `A` first. If `A` fails, its error is returned and **`B` is not run**. | Both run. If both fail, `A`'s error is returned. |
+| `Or<A, B>` | `A`, then `B`. **`B` runs even when `A` already held.** | Both run. |
+
+`Or` never short-circuits, in either order: its evidence reports `Both` when both sides hold, so it has to run both. Its result is:
+
+- both hold: `Or::Both`;
+- exactly one holds: that side's evidence, and the other side's error, **including an I/O error**, is discarded;
+- both fail: `A`'s error; `B`'s is discarded.
+
+<Callout type="warn" title="Or swallows the failing side's I/O error">
+If `A` holds and `B` could not be decided because its database was down, `Or<A, B>` still succeeds with `Or::Left`. That is logically correct (`A` is enough), but the outage is not reported through the proof. Monitor the backing services separately.
+</Callout>
+
+### Choosing an order
+
+- Use `Sequential` when the left operand is cheap and likely to fail: in an `And`, a failing left side saves the right side entirely.
+- Use `Parallel` when several operands do I/O and latency matters: their waits overlap.
+- With `Parallel`, the error you get when several operands fail is always the leftmost one, so put the check whose reason you most want to report on the left.
+
+<Callout type="info" title="The right context is always built">
+`And` and `Or` build the right operand's context once per check by cloning the left one and converting it with `From` (see [Mixing contexts](#mixing-contexts)), even when `B` ends up not running. Keep contexts cheap to clone: handles, pools, `Arc`s.
+</Callout>
+
+## I/O predicates
+
+A predicate can do I/O: its context holds the handles it needs, and its `IoError` type says what can go wrong. Here, two predicates read a `users` table through a read-only [`Db`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html) handle from `wakuwaku::entity` (feature `sqlx-pg`; see [Queries](/en/docs/data/queries) for how queries are defined).
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+```
+
+First the query. It declares that it reads `User`, so it runs through a `Db<_, ReadOnly>`:
+
+```rust title="src/users.rs"
+use crate::validation::{Limits, NonEmpty, ShortEnough};
+use std::convert::Infallible;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Db, Entity, Execute, Query, Read, ReadOnly};
+use wakuwaku::proof::{
+    And, CheckOrder, DeniedReason, Or, Predicate, Proven, ValidateContext, ValidateError, prove,
+};
+
+pub struct User;
+impl Entity for User {}
+
+#[derive(Debug, Clone)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+pub struct FindUserByName(pub String);
+
+impl Query for FindUserByName {
+    type Effect = Read<User>;
+}
+
+impl Execute<PgSource> for FindUserByName {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (i64, String)>("SELECT id, name FROM users WHERE name = $1")
+            .bind(self.0)
+            .fetch_optional(conn)
+            .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+
+// `FindUserByEmail` is the same query with `WHERE email = $1`.
+```
+
+Then the context and its error type. `Directory` holds the database handle and also the `Limits`, for reasons explained in [Mixing contexts](#mixing-contexts):
+
+```rust title="src/users.rs"
+/// Why a lookup could not be decided.
+#[derive(Debug)]
+pub enum LookupError {
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for LookupError {
+    fn from(e: sqlx::Error) -> Self {
+        LookupError::Db(e)
+    }
+}
+
+/// Context of the predicates that read the user table.
+#[derive(Clone)]
+pub struct Directory {
+    pub users: Db<PgSource, ReadOnly>,
+    pub limits: Limits,
+}
+
+impl ValidateContext for Directory {
+    type IoError = LookupError;
+}
+```
+
+Now the predicates. `UsernameAvailable` holds when **no** row is found, so it has nothing to carry. `NameRegistered` holds when a row **is** found, and carries that row as its evidence, so code holding the proof never queries for the user again:
+
+```rust title="src/users.rs"
+pub static TAKEN: DeniedReason = DeniedReason("username is already taken");
+pub static UNKNOWN_NAME: DeniedReason = DeniedReason("no user with this name");
+
+/// "No user has this name yet."
+pub struct UsernameAvailable;
+
+impl Predicate<String> for UsernameAvailable {
+    type Ctx = Directory;
+
+    async fn check(
+        name: &String,
+        ctx: &Directory,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<LookupError>> {
+        let found = ctx
+            .users
+            .process(FindUserByName(name.clone()))
+            .await
+            .map_err(|e| ValidateError::IoError(e.into()))?;
+        match found {
+            None => Ok(UsernameAvailable),
+            Some(_) => Err(ValidateError::Deny(TAKEN)),
+        }
+    }
+}
+
+/// "A user has this name." Carries the row the lookup found.
+pub struct NameRegistered {
+    pub user: UserRow,
+}
+
+impl Predicate<String> for NameRegistered {
+    type Ctx = Directory;
+
+    async fn check(
+        name: &String,
+        ctx: &Directory,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<LookupError>> {
+        match ctx.users.process(FindUserByName(name.clone())).await {
+            Ok(Some(user)) => Ok(NameRegistered { user }),
+            Ok(None) => Err(ValidateError::Deny(UNKNOWN_NAME)),
+            Err(e) => Err(ValidateError::IoError(e.into())),
+        }
+    }
+}
+
+// `EmailRegistered { user }` has the same shape, using `FindUserByEmail`.
+```
+
+A database error becomes `IoError`, never `Deny`: "the database did not answer" is not "the name is taken". `SignInId = Or<NameRegistered, EmailRegistered>` from the [Or](#or) section combines the two lookups.
+
+## Mixing contexts
+
+An `And` or `Or` has **one** context: the left operand's. The right operand gets its own context by cloning the left one and converting it with `From`. For `And<A, B>` (and the same for `Or`) the compiler requires:
+
+| Bound | Why |
+| --- | --- |
+| `A::Ctx: Clone + Send + Sync` | It is cloned to build `B`'s context. |
+| `B::Ctx: From<A::Ctx>` | `B`'s context is derived from `A`'s. |
+| `B`'s `IoError: Into<A's IoError>` (`And` only) | `And` returns `B`'s I/O error when `B` fails. `Or` only ever returns `A`'s error, so it needs no conversion. |
+
+So the left operand must have the "bigger" context. To put the `Limits`-based rules to the right of a `Directory` predicate, give `Directory` both conversions:
+
+```rust title="src/users.rs"
+/// Lets predicates with `IoError = Infallible` sit on the right of an `And`.
+impl From<Infallible> for LookupError {
+    fn from(never: Infallible) -> Self {
+        match never {}
+    }
+}
+
+/// Lets `Limits`-based predicates sit on the right of a `Directory` predicate.
+impl From<Directory> for Limits {
+    fn from(directory: Directory) -> Self {
+        directory.limits
+    }
+}
+
+/// A name a new account may take.
+pub type NewUsername = And<UsernameAvailable, And<NonEmpty, ShortEnough>>;
+```
+
+Swapping the operands does not compile, because a `Directory` cannot be built from `Limits`:
+
+```rust
+let _ = prove::<_, And<NonEmpty, UsernameAvailable>>(name, &limits, CheckOrder::Sequential).await;
+// error[E0277]: the trait bound `Directory: From<Limits>` is not satisfied
+// error[E0277]: the trait bound `Infallible: From<LookupError>` is not satisfied
+```
+
+If most of your predicates share one context type (one per service is common), all of these bounds hold trivially and you can order operands freely.
+
+### Cheap checks before I/O
+
+With `NewUsername` as written, `Sequential` order runs the database lookup first, because `UsernameAvailable` must be on the left. When you want the cheap rules to gate the query, prove the parts separately and join them with `Proven::from_both`:
+
+```rust title="src/users.rs"
+/// Cheap rules first, the database only for names that pass them.
+pub async fn check_new_username(
+    name: String,
+    ctx: &Directory,
+) -> Result<Proven<String, NewUsername>, ValidateError<LookupError>> {
+    let rules = match prove::<_, And<NonEmpty, ShortEnough>>(name, &ctx.limits, CheckOrder::Sequential).await {
+        Ok(rules) => rules,
+        Err(ValidateError::Deny(reason)) => return Err(ValidateError::Deny(reason)),
+        Err(ValidateError::IoError(never)) => match never {},
+    };
+    let available =
+        prove::<_, UsernameAvailable>(rules.subject().clone(), ctx, CheckOrder::Sequential).await?;
+    // Both proofs are about equal strings, so the conjunction holds.
+    Proven::from_both(available, rules).map_err(|_| unreachable!("same subject"))
+}
+```
+
+`from_both(a, b)` requires `T: Eq`. It compares the two subjects, keeps `a`'s subject and both evidences, and returns both proofs unchanged if the subjects differ. It is only as sound as `T`'s `Eq`: a custom `Eq` that ignores a field one of the predicates inspects would let a proof through for the wrong value.
+
+## Nesting
+
+Because `And` and `Or` are predicates, they nest to any depth. Name the shapes you use with type aliases, as `NewUsername` does. The evidence nests the same way; dereference an `Evidence` to reach the inner combinator:
+
+```rust title="src/users.rs"
+pub fn spare_bytes(name: &Proven<String, NewUsername>) -> usize {
+    let And(_available, rules) = name.evidence();
+    let And(_non_empty, short_enough) = &**rules;
+    short_enough.spare
+}
+```
+
+`rules` is a `&Evidence<And<NonEmpty, ShortEnough>>`; `&**rules` is the `&And<NonEmpty, ShortEnough>` inside it.
+
+## Splitting and joining proofs
+
+Besides checking a combined predicate, you can move between a combination and its parts without rechecking:
+
+| Method | From | To |
+| --- | --- | --- |
+| `Proven::into_a` / `into_b` | `Proven<T, And<A, B>>` | `Proven<T, A>` / `Proven<T, B>` (the other evidence is dropped) |
+| `Proven::from_a` / `from_b` | `Proven<T, A>` / `Proven<T, B>` | `Proven<T, Or<A, B>>` (`Or::Left` / `Or::Right`) |
+| `Proven::from_both` | `Proven<T, A>` and `Proven<T, B>`, equal subjects | `Proven<T, And<A, B>>` |
+
+Reordering, regrouping and distributing go through the Boolean-algebra laws in [Deriving proofs](/en/docs/validation/derivation).
+
+## Next steps
+
+<Cards>
+  <Card title="Deriving proofs" href="/en/docs/validation/derivation" description="Commutativity, associativity, absorption and more, applied to proofs." />
+  <Card title="Using proofs in services" href="/en/docs/validation/in-services" description="Put the Directory context in a ServiceBuilder and validate gRPC requests." />
+</Cards>

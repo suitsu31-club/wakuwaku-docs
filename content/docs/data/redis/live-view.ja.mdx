@@ -1,0 +1,178 @@
+---
+title: ライブビュー
+description: Redis に永続的でバージョン付きのドキュメントを置き、書き手は楽観的に差分をコミットし、購読者はすべての変化に追従します。
+icon: Eye
+---
+
+[`LiveView`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/live_view/struct.LiveView.html) は、1 から始まるバージョンにおける本体 `B` と、そこに至った差分の履歴を保持します。書き手は 1 コミットずつ前に進め、購読者は差分のストリームとして追従します。ライブのスコアボード、注文追跡ページ、共有の ToDo リスト、少数のバックエンドが更新し多数のブラウザが見守るダッシュボードなどを想像してください。
+
+ライブビューは、普通は別々に作る 3 つのものを組み合わせています。
+
+- **最新バージョンの O(1) 読み取り**。キャッシュのように読めます。
+- **楽観的並行性制御**。各コミットは自分が基にするバージョンを指定するので、競合した書き手は互いを上書きする代わりに衝突を検出します。
+- **再生可能な変更フィード**。購読者はコミットごとに差分を受け取り、遅れた購読者は追いつきます。全体のスナップショットを受け取るのは、見逃した差分がまとめられて（squash されて）消えた場合だけです。
+
+<LiveViewDiagram lang="ja" />
+
+## 本体と差分を定義する
+
+本体は [`LiveViewDiff`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/live_view/trait.LiveViewDiff.html) を実装します。差分の型と、その適用方法を定めます。どちらも kanau の `MessageSer` / `MessageDe` でシリアライズされます。
+
+```rust title="src/scoreboard.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use wakuwaku::entity::redis::dynamic::live_view::LiveViewDiff;
+
+#[derive(Clone, Default, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Scoreboard {
+    pub scores: BTreeMap<String, u32>,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Scored {
+    pub team: String,
+    pub points: u32,
+}
+
+impl LiveViewDiff for Scoreboard {
+    type Diff = Scored;
+
+    fn apply(&mut self, diff: Scored) {
+        *self.scores.entry(diff.team).or_default() += diff.points;
+    }
+}
+```
+
+`apply` はただの Rust なので、他の関数と同じようにユニットテストしてください。すべての購読者が何を見るかはこの関数が決めます。
+
+## 書き込み: create と commit
+
+```rust title="src/scoreboard.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::entity::redis::dynamic::live_view::{Commit, LiveView};
+
+/// ゲームごとのスコアボード。200 差分を超えると squash する。
+pub const SCOREBOARDS: LiveView<u64, Scoreboard> = LiveView::new("scoreboard", 200);
+
+pub async fn open_game(redis: &Redis, game: u64) -> RedisResult<bool> {
+    redis.process(SCOREBOARDS.create(&game, Scoreboard::default())).await
+}
+
+/// 新しいバージョンを出力する。ゲームが存在しなければ `None`。
+pub async fn score(redis: &Redis, game: u64, team: &str, points: u32) -> RedisResult<Option<u64>> {
+    loop {
+        let Some(latest) = redis.process(SCOREBOARDS.get(&game)).await? else {
+            return Ok(None);
+        };
+        let diff = Scored { team: team.to_owned(), points };
+        let mut next = latest.body;
+        next.apply(diff.clone());
+        match redis.process(SCOREBOARDS.commit(&game, latest.version, diff, next)).await? {
+            Commit::Committed { version } => return Ok(Some(version)),
+            // 別の書き手が先にコミットした: 新しい head の上で作り直す。
+            Commit::Conflict { .. } => continue,
+            Commit::Absent => return Ok(None),
+        }
+    }
+}
+```
+
+- `create(name, body)` はバージョン 1 を作ります。ビューがすでに存在すれば `false` を出力し、何も変更しません。
+- `get(name)` は `Option<Versioned<B>>`、つまり最新の `version` と `body` を出力します。`version(name)` は番号だけを読みます。
+- `commit(name, parent, diff, body)` はビューを `parent` から `parent + 1` へ進めます。出力は `Commit::Committed { version }`、ビューが先に進んでいた場合の `Commit::Conflict { head }`、または `Commit::Absent` です。コミットしない限り何も変わりません。
+
+`Conflict` の扱い方としては上のリトライループが一般的です。読み直し、意図を適用し直し、もう一度コミットします。JPA の `@Version` 列による楽観的ロックの Redis 版にあたります。
+
+<Callout type="warn" title="body は親に diff を適用したものと等しくなければならない">
+  `commit` は差分と結果の本体の両方を送りますが、それらが一致するかは誰も検査しません。最新バージョンの読み手は `body` を受け取り、購読者は `diff` を適用するので、両者が一致しなければ静かに食い違っていきます。上の例のように、`body` は必ず親の本体に `apply` を呼んで作ってください。
+</Callout>
+
+## 追従: subscribe
+
+```rust title="src/scoreboard.rs"
+use wakuwaku::entity::redis::dynamic::live_view::Versioned;
+
+pub async fn follow(redis: &Redis, client: &redis::Client, game: u64) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let Some((mut board, mut subscription)) =
+        redis.process(SCOREBOARDS.subscribe(&game, conn)).await?
+    else {
+        return Ok(()); // そのゲームは存在しない
+    };
+    render(&board);
+    loop {
+        let event = subscription.recv().await?;
+        board.update(event);
+        render(&board);
+    }
+}
+```
+
+`subscribe(name, conn)` は、最新の `Versioned<B>` と、それ以降のすべてのバージョンへの `LiveViewSubscription` を組で出力します。ビューが存在しなければ `None` です。`conn` は[専用コネクション](/ja/docs/data/redis#following-changes-dedicated-connections)です。
+
+各 `recv` は `LiveViewEvent` を出力します。
+
+- `Diff { version, diff }`: 直前のバージョンが `diff` によって `version` になった。
+- `Snapshot(Versioned<B>)`: あるバージョンにおける本体全体。購読がそこに至る差分を読む前に、それらが新しいベースに squash された場合に、差分の代わりに送られます。
+
+`Versioned::update(event)` はどちらの種類も適用できるので、ローカルのコピーはビューと等しく保たれます。購読はそれ自体では終わりません。購読を止めるには、購読か `into_stream` のストリームを drop します。
+
+### 既知のバージョンから再開する
+
+すでにあるバージョンを表示しているクライアント、たとえばネットワークの瞬断の後に再接続するブラウザは、本体全体をもう一度受け取る必要はありません。`resume(name, version, conn)` は `version` の直後から購読を始めます。
+
+```rust title="src/scoreboard.rs"
+use wakuwaku::entity::redis::dynamic::live_view::LiveViewEvent;
+
+/// クライアントはすでに `version` を表示している: その後に来たものを送る。
+pub async fn catch_up(
+    redis: &Redis,
+    client: &redis::Client,
+    game: u64,
+    version: u64,
+) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let mut subscription = redis.process(SCOREBOARDS.resume(&game, version, conn)).await?;
+    loop {
+        match subscription.recv().await? {
+            LiveViewEvent::Diff { version, diff } => send_diff(version, diff).await,
+            LiveViewEvent::Snapshot(board) => send_snapshot(board).await,
+        }
+    }
+}
+```
+
+`recv` が失敗した後も同様です。`subscription.version()` は最後に届けたイベントのバージョンなので、新しいコネクションを開いてそこから `resume` します。
+
+## Redis 上の表現
+
+各名前は同じクラスターハッシュスロットにある 2 つのキーからなります。
+
+- **head**: `…:LiveView:{<namespace>:<name>}:h`。最新のバージョン `v` と本体 `b` を持つハッシュです。`get` はこれだけを読むので、最新バージョンを O(1) で読めます。
+- **履歴**: `…:l`。エントリ ID が `<version>-0` の Redis ストリームです。そのバージョンの本体を持つ *ベース* エントリから始まり、以降のバージョンごとに差分を持つエントリが 1 つずつ続きます。
+
+`create` と `commit` は Lua スクリプトなので、バージョンの検査、head の更新、履歴への追記はアトミックに行われます。履歴がすでに `max_diffs` 個の差分を持っているとき、次のコミットは履歴を切り詰め、新しい本体とその差分の両方を持つ新しいベースを書き込みます。最新に追いついている購読者は引き続き差分を読み、もっと遅れていた購読者は次の差分があった場所にベースを見つけて `Snapshot` を受け取ります。
+
+購読は、持っているバージョンより後の履歴を `XREAD BLOCK` で最大 128 エントリずつ読みます。待機する前に見逃したものをすべて読むので、バージョンを飛ばすことはありません。
+
+`history(name)` はベースとそれ以降の差分を `History<B>` として出力します。`History::into_latest` はそれらを適用するので、監査や、差分が head を再現することのテストに便利です。
+
+## `max_diffs` の選び方
+
+`LiveView::new(namespace, max_diffs)` は履歴の上限を決めます。上限を大きくすると、より遅れた購読者でも全体のスナップショットではなく差分を受け取れますが、ビューごとのメモリが増えます。小さくすると履歴は短く保たれますが、遅い購読者にスナップショットを送る頻度が上がります。対話的なビューの多くには数百差分程度の上限が適しています。
+
+## 落とし穴
+
+- **ライブビューは失効しません。** 不要になったら `remove` を呼んでください。
+- **削除は購読者に通知されません。** 購読者は待ち続けます。削除の前に「終了」を表す最後の差分をコミットするなど、独自のプロトコルで伝えてください。
+- **同じ名前でビューを作り直さないでください。** 作り直すとバージョンが 1 から始まり、バージョン 1 より先にいた購読者はそれを決して見ません。代わりに新しい名前を使ってください。
+- **Capability。** `get`、`version`、`history`、`subscribe`、`resume` は読み取り、`create`、`commit`、`remove` は書き込みです。`Db<_, ReadOnly>` ですべての購読者に対応でき、`ReadWrite` が必要なのは書き手だけです。
+
+## 次のステップ
+
+<Cards>
+  <Card title="ストリームバッファ" href="/ja/docs/data/redis/stream-buffer" description="終端を持つ追記専用の出力を、任意のインデックスから追従します。" />
+  <Card title="キャッシュ" href="/ja/docs/data/redis/cache" description="読み手がときどき最新の値を必要とするだけの場合に。" />
+</Cards>

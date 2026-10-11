@@ -1,0 +1,366 @@
+---
+title: イベントの定義
+description: wakuwaku の Iggy イベント層で使うパーティションキー、イベント型、型タグ、ボディのシリアライズを宣言します。
+icon: FileCode
+---
+
+wakuwaku のイベント型は、普通の Rust の型にいくつかのトレイト実装を加えたものです。これらの実装で、パブリッシャーとコンシューマがその型について知る必要のあることがすべて決まります。
+
+| トレイト | 答える問い |
+|---|---|
+| [`PartitionKey`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/trait.PartitionKey.html)（キー型に実装） | どのトピックか。どのパーティションか。どのイベント同士に順序があるか。 |
+| [`Event`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/trait.Event.html) | ワイヤ上でどう識別するか。キーは何か。どの程度の順序が必要か。ランをどう縮約できるか。 |
+| [`EventBody`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/trait.EventBody.html) | ログに格納するバイト列をどうエンコード・デコードするか。 |
+
+このページでは、セクション全体で使う 2 つのイベント `OrderPlaced` と `PaymentReceived` を作ります。どちらも注文をキーとします。
+
+## パーティションキー [#partition-keys]
+
+パーティションキーとは、そのイベントの順序を守るべき対象です。ユーザー、注文、口座などがこれにあたります。キーを保持する小さな型に `PartitionKey` を実装します。
+
+```rust title="src/events.rs"
+use std::hash::DefaultHasher;
+use wakuwaku::iggy::{IggySuperPartitionName, PartitionKey};
+
+/// 注文をキーとするイベントはすべて `orders` トピックに送られる。
+#[derive(Hash)]
+pub struct OrderId(pub u64);
+
+impl PartitionKey for OrderId {
+    type PartitionMerge = DefaultHasher;
+    const SUPER_PARTITION_NAME: IggySuperPartitionName = IggySuperPartitionName("orders");
+}
+```
+
+2 つの項目は役割が異なります。
+
+- **`SUPER_PARTITION_NAME`** は、この型をキーとするすべてのイベントを運ぶ Iggy の**トピック**名です。wakuwaku はこれをキー型の *スーパーパーティション* と呼びます。キー型ごとに 1 つのトピックがあり、それがキーによって Iggy のパーティションに分割されます。ストリームはキーに含まれず、パブリッシャーとコンシューマの設定から決まります。
+- **`PartitionMerge`** は、[`key_hash`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/fn.key_hash.html) でキーを 64 ビットのキーハッシュに変換する `Hasher` です（`Default` も必要です）。このハッシュが Iggy のメッセージキーになるのでパーティションを決め、コンシューマがイベントをグループ化するキーにもなるので順序の範囲を決めます。等しいキーは常に同じパーティションに入ります。異なるキーのハッシュが衝突した場合は 1 つのキーとして扱われます。つまり一緒に順序づけられ、一緒にリトライされます。安全ではありますが、並行性は下がります。
+
+<Callout type="warn" title="すべてのパブリッシャーで同じハッシュを使う">
+  2 つのサービスが同じキーを異なる方法でハッシュすると、1 つの注文のイベントが別々のパーティションに入り、順序が失われます。Rust 標準ライブラリのドキュメントには、`DefaultHasher` のアルゴリズムは規定されておらず、Rust のリリース間で変わりうると書かれています。すべてのパブリッシャーを同じツールチェーンでビルドしているうちは問題ありません。異なるツールチェーンでビルドしたサービスが混在する場合や、他の言語からも発行する場合は、仕様が固定されたハッシャーを使ってください。
+</Callout>
+
+アルゴリズムが固定されたハッシャーは数行で書けます。次は 64 ビットの FNV-1a です。
+
+```rust title="src/hasher.rs"
+use std::hash::Hasher;
+use wakuwaku::iggy::{IggySuperPartitionName, PartitionKey};
+
+/// 64 ビット FNV-1a。アルゴリズムが固定・文書化されているので、
+/// どの Rust バージョンでビルドしたパブリッシャーでも結果が一致する。
+pub struct Fnv1a(u64);
+
+impl Default for Fnv1a {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for Fnv1a {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Hash)]
+pub struct CustomerId(pub u64);
+
+impl PartitionKey for CustomerId {
+    type PartitionMerge = Fnv1a;
+    const SUPER_PARTITION_NAME: IggySuperPartitionName = IggySuperPartitionName("customers");
+}
+```
+
+### キー型の選び方 [#choosing-the-key-type]
+
+キー型は細部ではなく設計上の判断です。
+
+- **互いに順序づける必要があるイベント型は、同じキー型を使う必要があります。** 順序は 1 つのキーの中にしか存在せず、1 つのキー型は 1 つのトピックに対応します。`OrderPlaced` と `PaymentReceived` はどちらも `OrderId` をキーとするので `orders` トピックを共有し、コンシューマは支払いを対応する注文の後ろに保てます。
+- **キーが並行処理の単位を決めます。** 異なるキーは並行に処理され、失敗したキーは単独で隔離されます。粗いキー（テナント全体で 1 つのキーなど）は、細かいキー（注文ごとに 1 つのキー）よりはるかに多くの処理を直列化します。
+- **1 つのコンシューマは 1 つのトピックを読みます。** コンシューマのハンドラはすべて 1 つのキー型に属している必要があります。[1 つのコンシューマにメイントピックは 1 つ](/ja/docs/events/consuming#one-main-topic-per-consumer) を参照してください。
+
+## イベント型 [#event-types]
+
+イベント型は `Event` を実装します。1 つ目は次のとおりです。
+
+```rust title="src/events.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::iggy::{Event, EventAtomicOrdering, EventBody, EventTypeTag, NonAssociative};
+
+/// 注文が作成された。その注文の他のどのイベントよりも先に処理する必要がある。
+#[derive(Debug, Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct OrderPlaced {
+    pub order_id: u64,
+    pub customer: String,
+    pub total_cents: i64,
+}
+
+impl EventBody for OrderPlaced {}
+
+impl Event for OrderPlaced {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = OrderId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> OrderId {
+        OrderId(self.order_id)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Acquire
+    }
+}
+```
+
+### `TYPE_TAG` [#type_tag]
+
+すべてのレコードには、その型の [`EventTypeTag`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/struct.EventTypeTag.html)（`u32`）が付きます。コンシューマはこのタグでレコードをハンドラに振り分けるので、タグは**トピックを共有するイベント型の間で一意**でなければなりません。一意である必要があるのはトピック内だけです。`OrderPlaced`（トピック `orders`）と無関係な `CustomerChanged`（トピック `customers`）は、どちらもタグ `1` を使えます。
+
+この制約の一部はコンシューマが検査します。登録した 2 つのハンドラが同じタグを使っていると、`start` は `Error::DuplicateEventType` で失敗します。ただし発行されるだけのイベント型はコンシューマからは見えないので、1 つのトピックのタグはキー型のそばなど 1 か所にまとめて管理してください。
+
+<Callout type="warn" title="タグはログ形式の一部です">
+  ログにすでにあるレコードは、書き込まれたときのタグを保持し続けます。タグの番号を振り直したり、廃止したイベント型のタグを新しい型に再利用したりしないでください。コンシューマは、対応するハンドラがないタグのレコードをログに記録したうえで破棄します。
+</Callout>
+
+### `Key` [#key]
+
+`type Key` はキー型を指定し、`fn key(&self)` は 1 つのイベントからキーを取り出します。キー型がこのイベント型のすべてのイベントのトピックを決め、キーの値が各イベントのパーティションを決めます。
+
+### `Algebra` [#algebra]
+
+`type Algebra` は 5 つのマーカー型のいずれかで、*ラン* をハンドラに渡す前にどう縮約してよいかを表します。ランとは、ポーリングした 1 バッチの 1 つの順序セグメントの中にある、このイベント型・1 つのキーのイベントすべてを、ログ順に並べたものです（ログ上では他の型のイベントが間に挟まっていてもかまいません）。
+
+| マーカー | ランへの効果 | ボディに必要なもの |
+|---|---|---|
+| `NonAssociative` | なし | 制約なし |
+| `Commutative` | なし。任意の順で適用してよい | 制約なし |
+| `Idempotent` | 隣り合う等しいイベントを 1 つにまとめる | `Eq` |
+| `IdempotentCommutative` | 等しいイベントをすべて 1 つにまとめる | `Ord` |
+| `Associative` | 1 つのイベントに畳み込む | `EventSemigroup` |
+
+この制約はコンパイル時に検査されます。`EventSemigroup` を実装していないボディに `Associative` を選ぶとコンパイルできません。迷ったら `NonAssociative` を選んでください。各マーカーが約束する法則と選び方は [代数](/ja/docs/events/algebra) で説明します。
+
+例の 2 つ目のイベントは畳み込めます。1 つの注文の支払いは合算できるからです。
+
+```rust title="src/events.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::iggy::{
+    Associative, Event, EventAtomicOrdering, EventBody, EventSemigroup, EventTypeTag,
+};
+
+/// 支払いを受け取った。1 つの注文の支払いは合算できる。
+#[derive(Debug, Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct PaymentReceived {
+    pub order_id: u64,
+    pub amount_cents: i64,
+}
+
+impl EventBody for PaymentReceived {}
+
+impl EventSemigroup for PaymentReceived {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            order_id: self.order_id,
+            amount_cents: self.amount_cents + other.amount_cents,
+        }
+    }
+}
+
+impl Event for PaymentReceived {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(2);
+    type Key = OrderId;
+    type Algebra = Associative;
+
+    fn key(&self) -> OrderId {
+        OrderId(self.order_id)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+### `atomic_ordering` [#atomic_ordering]
+
+`atomic_ordering` は、同じキーの他のイベントに対する 1 つのメッセージの [`EventAtomicOrdering`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/enum.EventAtomicOrdering.html) を返します。`Algebra` と違ってメソッドなので、イベントの内容に応じて変えられます。何を返しても、同じ型・同じキーのイベントは常にログ順を保ちます。この値が制御するのは *他の型* のイベントを追い越せるかどうかだけです。
+
+| 順序 | キーの中での効果 |
+|---|---|
+| `Relaxed` | 他の型のイベントと順序が入れ替わってよい |
+| `Acquire` | これより後のイベントは、これより先に処理されない |
+| `Release` | これより前のイベントは、これより後に処理されない |
+| `AcqRel` | その両方 |
+
+例では `OrderPlaced` が `Acquire` なので、注文が存在する前にその注文の後続の支払いが適用されることはありません。`PaymentReceived` は `Relaxed` です。セグメントとフェンスの詳細は [順序](/ja/docs/events/ordering) で説明します。
+
+## ボディのシリアライズ [#serializing-the-body]
+
+ログに格納されるバイト列がイベントの *ボディ* です。ボディ型は `EventBody` を実装します。これは [`kanau::message`](https://docs.rs/kanau/latest/kanau/message/index.html) の 2 つのトレイトに対するマーカーです。
+
+```rust title="wakuwaku::iggy (宣言)"
+pub trait EventBody: kanau::message::MessageDe + kanau::message::MessageSer {}
+```
+
+`MessageSer::to_bytes(self) -> Result<Box<[u8]>, Self::SerError>` がエンコードし、`MessageDe::from_bytes(&[u8]) -> Result<Self, Self::DeError>` がデコードします。wakuwaku はフォーマットを決めません。ボディのフォーマットは、そのトピックを読む他のすべてのサービスとの契約です。
+
+### JSON の derive を使う（推奨） [#with-the-json-derives-recommended]
+
+kanau にはこれらのトレイトの derive マクロがあります。wakuwaku は kanau の `message` フィーチャーを有効にしていますが、コーデックは有効にしていません。そこで `serde_json` フィーチャー付きの kanau と serde を自分で追加します。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["iggy"] }
+kanau = { version = "0.6", features = ["serde_json"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+あとは serde の `Serialize`・`Deserialize` と並べて `JsonMessageSer` と `JsonMessageDe` を derive し、型をボディとしてマークします。
+
+```rust
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::iggy::EventBody;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct OrderPlaced {
+    pub order_id: u64,
+    pub customer: String,
+    pub total_cents: i64,
+}
+
+impl EventBody for OrderPlaced {}
+```
+
+<Callout type="info" title="なぜ kanau を直接依存に加えるのか">
+  これらの derive は `::kanau` で始まるパスに展開されるので、`kanau` は自分のクレートの依存である必要があります。`wakuwaku::deps::kanau` だけでは足りません。`kanau` 0.6 を指定すると wakuwaku が使っているものと同じクレートに解決され、Cargo がフィーチャーを統合します。そのため wakuwaku の `MessageSer` と derive が実装する `MessageSer` は同じトレイトになります。JSON コーデック本体（`serde_json`）は kanau 経由で参照されるので、`serde_json` を直接依存に加える必要はありません。
+</Callout>
+
+イベントには JSON が無難な既定の選択です。人が読める形式で、他の言語からも生成・消費でき、`#[serde(default)]` などの serde 属性を使えば、ログにすでにあるレコードを壊さずにフィールドを追加できます。コンパクトなバイナリ形式が必要なら、kanau には `bincode`、`rkyv`、`prost`、`musli-wire` のフィーチャーと、対応する derive（`BincodeMessageSer`/`BincodeMessageDe` など）もあります。
+
+### 手で実装する [#by-hand]
+
+derive を使わない場合は、2 つのトレイトを直接実装します。エラー型は kanau の `SerializeError` と `DeserializeError` に変換できればよいので、それらの型自体を使うのが最も簡単です。どちらも `anyhow::Error` を包んでおり、標準のエラー型は `.into()` でそれに変換できます。
+
+```rust title="src/manual.rs"
+use wakuwaku::deps::kanau::message::{DeserializeError, MessageDe, MessageSer, SerializeError};
+use wakuwaku::iggy::EventBody;
+
+/// 手書きのボディ。顧客 ID の 8 バイト（リトルエンディアン）。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CustomerTouched {
+    pub customer: u64,
+}
+
+impl MessageSer for CustomerTouched {
+    type SerError = SerializeError;
+
+    fn to_bytes(self) -> Result<Box<[u8]>, SerializeError> {
+        Ok(Box::new(self.customer.to_le_bytes()))
+    }
+}
+
+impl MessageDe for CustomerTouched {
+    type DeError = DeserializeError;
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
+        let bytes: [u8; 8] = bytes
+            .try_into()
+            .map_err(|error: std::array::TryFromSliceError| DeserializeError(error.into()))?;
+        Ok(Self {
+            customer: u64::from_le_bytes(bytes),
+        })
+    }
+}
+
+impl EventBody for CustomerTouched {}
+```
+
+この方法なら `wakuwaku` 以外の依存は要りません。小さく安定したペイロードには十分見合いますが、フィールドが複数あるなら derive のほうがコードも少なく、間違いも起きにくくなります。
+
+<Callout type="warn" title="デコードできないレコードは破棄されます">
+  コンシューマはレコードをデコードできないと、そのエラーを `tracing` でログに記録してレコードを破棄します。リトライはされません。ボディのフォーマット変更はデータベースのマイグレーションと同じように扱い、トピックにまだ保持されているすべてのレコードをデコーダが読めるようにしておいてください。
+</Callout>
+
+## イベントとボディが別の型の場合 [#when-the-event-is-not-the-body]
+
+ここまでは、どのイベント型も自分自身がボディでした。すべての `EventBody` は、自分自身を `Target` とする [`IntoEventBody`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/trait.IntoEventBody.html) を自動的に実装しています。発行する値がそのままワイヤに載せるべきでないドメイン型である場合は、代わりに `IntoEventBody` を実装し、別のボディ型に変換します。
+
+```rust title="src/manual.rs"
+use wakuwaku::iggy::{
+    Event, EventAtomicOrdering, EventTypeTag, IdempotentCommutative, IntoEventBody,
+};
+
+/// 別のワイヤ用ボディとして発行されるドメイン型。
+pub struct Customer {
+    pub id: u64,
+    pub name: String,
+    pub password_hash: String,
+}
+
+/// イベント「この顧客が変更された」。ワイヤに載るのは ID だけ。
+pub struct CustomerChanged(pub Customer);
+
+impl IntoEventBody for CustomerChanged {
+    type Target = CustomerTouched;
+
+    fn into_event_body(self) -> CustomerTouched {
+        CustomerTouched { customer: self.0.id }
+    }
+}
+
+impl Event for CustomerChanged {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = CustomerId;
+    type Algebra = IdempotentCommutative;
+
+    fn key(&self) -> CustomerId {
+        CustomerId(self.0.id)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+パブリッシャーは `into_event_body` を呼び、その結果をシリアライズします。購読側にはもう `CustomerChanged` は存在しません。コンシューマはレコードを `Target` にデコードし、代数を `Target` に適用します（ここでは `IdempotentCommutative` なので、`CustomerTouched` は `Ord` を derive しています）。`CustomerChanged` のハンドラは `&[CustomerTouched]` を受け取ります。
+
+```rust title="src/manual.rs"
+/// `CustomerChanged` のハンドラはデコード済みのボディ型を受け取る。
+pub struct Reindex;
+
+impl wakuwaku::iggy::EventHandler<CustomerChanged> for Reindex {
+    const MAX_BATCH: std::num::NonZeroUsize = std::num::NonZeroUsize::new(50).unwrap();
+
+    async fn handle(
+        &self,
+        run: &[CustomerTouched],
+    ) -> Result<(), wakuwaku::iggy::error::HandleError> {
+        for touched in run {
+            println!("reindex customer {}", touched.customer);
+        }
+        Ok(())
+    }
+}
+```
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="イベントの発行" href="/ja/docs/events/publishing" description="OrderPlaced と PaymentReceived を Iggy に送ります。" />
+  <Card title="イベントの購読" href="/ja/docs/events/consuming" description="それらのハンドラを書き、コンシューマを起動します。" />
+  <Card title="順序" href="/ja/docs/events/ordering" description="atomic_ordering がキーのイベントをセグメントに分ける仕組み。" />
+  <Card title="代数" href="/ja/docs/events/algebra" description="各 Algebra マーカーの背後にある法則。" />
+</Cards>

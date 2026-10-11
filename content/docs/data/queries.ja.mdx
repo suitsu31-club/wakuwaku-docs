@@ -1,0 +1,380 @@
+---
+title: クエリとハンドル
+description: エンティティとクエリを定義し、ケイパビリティ型付きの Db ハンドルで実行して、読み取りをレプリカへ振り分け、ハンドルをコンポーネントに注入します。
+---
+
+このページでは、PostgreSQL を使う小さなユーザーサービスのデータアクセスを組み立てます。クエリを定義し、プライマリ用とレプリカ用の 2 つのハンドルを作り、各クエリを適切なハンドルで実行して、ハンドルを [`ServiceBuilder`](/ja/docs/core/service-builder) に登録します。背景にある考え方（エンティティ、ケイパビリティ、エフェクト）は[概要](/ja/docs/data)で説明しています。
+
+## セットアップ
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+`sqlx-pg` を有効にすると、PostgreSQL のデータソースを含む `wakuwaku::entity` が使えるようになり、sqlx が `wakuwaku::deps::sqlx` として再エクスポートされます。
+
+## エンティティを定義する
+
+```rust title="src/entities.rs"
+use wakuwaku::entity::Entity;
+
+/// `users` テーブル
+pub struct User;
+impl Entity for User {}
+
+/// `posts` テーブル
+pub struct Post;
+impl Entity for Post {}
+```
+
+## クエリを定義する
+
+クエリは 2 つのトレイトを実装します。
+
+- [`Query`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Query.html) は**何に触れるか**、つまり `Effect` を表します。どこで実行されるかには依存しないので、ケイパビリティ検査や[フック](/ja/docs/data/hooks)はどのデータソースでも同じように働きます。
+- [`Execute<S>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html) はデータソース `S` で**どう実行するか**、つまり `Output` と、コネクション上で動くコードを表します。移植性のある SQL で書いたクエリなら、複数のデータソースに対して実装できます。
+
+```rust title="src/queries.rs"
+use crate::entities::{Post, User};
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Execute, Query, Read, Write};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+/// ID でユーザーを 1 件読み込む
+pub struct FindUser {
+    pub id: i64,
+}
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+impl Execute<PgSource> for FindUser {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
+        let row: Option<(i64, String)> = sqlx::query_as("SELECT id, name FROM users WHERE id = $1")
+            .bind(self.id)
+            .fetch_optional(conn)
+            .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+```
+
+`execute` は普通の `&mut PgConnection` を受け取り、データソースのエラー型（sqlx のデータソースなら `sqlx::Error`）を返します。クエリを単独で実行すると、コネクションはプールから取得され、自動コミットで動きます。[トランザクション](/ja/docs/data/transactions)の中では、そのトランザクションのコネクションが渡されます。同じクエリをどちらでも使えます。
+
+複数のエンティティに触れるクエリでは、そのすべてを列挙します。タプルは要素のエフェクトの和集合です。
+
+```rust title="src/queries.rs"
+/// アクティブな著者の投稿タイトル
+pub struct PostsByAuthor {
+    pub author: i64,
+}
+
+impl Query for PostsByAuthor {
+    // 2 つのテーブルを読む。タプルはエフェクトの和集合
+    type Effect = (Read<User>, Read<Post>);
+}
+
+impl Execute<PgSource> for PostsByAuthor {
+    type Output = Vec<String>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT p.title FROM posts p JOIN users u ON u.id = p.author_id \
+             WHERE u.id = $1 AND u.active ORDER BY p.created_at DESC",
+        )
+        .bind(self.author)
+        .fetch_all(conn)
+        .await
+    }
+}
+```
+
+書き込みには `Write<E>` を宣言します。`E` に書き込めるケイパビリティは `E` を読むこともできるので、`users` で絞り込む `UPDATE` でも `Write<User>` だけで足ります。
+
+```rust title="src/queries.rs"
+/// ユーザーの表示名を変更する
+pub struct RenameUser {
+    pub id: i64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<PgSource> for RenameUser {
+    /// 影響を受けた行数
+    type Output = u64;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+        let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
+            .bind(self.id)
+            .bind(self.name)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected())
+    }
+}
+```
+
+<Callout type="info" title="エフェクトは正直に宣言する">
+コンパイラが検査するのは、書いた SQL ではなく宣言したエフェクトです。`Read<User>` と宣言したクエリで `UPDATE` を実行してもコンパイルは通ります。`Effect` の行は関数シグネチャと同じように扱い、SQL 文と一緒にレビューしてください。
+</Callout>
+
+## データソース
+
+[`DataSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.DataSource.html) は、コネクションプールや多重化クライアントなど、クエリを実行できるものです。クエリが受け取るコネクションの型と、返すエラーの型を決めます。
+
+```rust
+pub trait DataSource: Send + Sync + Sized {
+    type Connection: Send;
+    type Error: Send;
+
+    fn run<Q: Execute<Self>>(
+        &self,
+        query: Q,
+    ) -> impl Future<Output = Result<Q::Output, Self::Error>> + Send;
+}
+```
+
+自分で実装することはまずありません。バックエンドごとに用意されています。
+
+| データソース | フィーチャー | コネクション | エラー |
+|---|---|---|---|
+| `entity::sqlx::backend::PgSource` | `sqlx-pg` | `PgConnection` | `sqlx::Error` |
+| `entity::sqlx::backend::MySqlSource` | `sqlx-mysql` | `MySqlConnection` | `sqlx::Error` |
+| `entity::redis::RedisSource` | `redis` | [Redis](/ja/docs/data/redis) を参照 | |
+| `entity::meilisearch::MeiliSource` | `meilisearch` | [Meilisearch](/ja/docs/data/meilisearch) を参照 | |
+
+`PgSource` は `SqlxSource<Postgres>` の別名です。単独で実行されるクエリは、それぞれプールからコネクションを取得します。
+
+## ハンドルを作る
+
+`Db<S, C>` はデータソース `S` を所有し、ケイパビリティ `C` を持ちます。ケイパビリティは型パラメータにすぎないので、ハンドルを作るときに選びます。プライマリとリードレプリカを持つサービスでは、ハンドルを 2 つ作ります。
+
+```rust title="src/wiring.rs"
+use crate::queries::{DeactivateUsers, DormantUsers, FindUser, PostsByAuthor, RenameUser, UserRow};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
+use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+
+/// サービスの 2 つのハンドル。書き込みはプライマリへ、
+/// レプリケーション遅延を許容できる読み取りはレプリカへ送る
+#[derive(Clone)]
+pub struct Databases {
+    pub primary: Db<PgSource, ReadWrite>,
+    pub replica: Db<PgSource, ReadOnly>,
+}
+
+impl Databases {
+    pub async fn connect(primary_url: &str, replica_url: &str) -> Result<Self, sqlx::Error> {
+        let primary = PgPoolOptions::new().max_connections(10).connect(primary_url).await?;
+        let replica = PgPoolOptions::new().max_connections(20).connect(replica_url).await?;
+        Ok(Self {
+            primary: Db::new(SqlxSource::new(primary)),
+            replica: Db::new(SqlxSource::new(replica)),
+        })
+    }
+}
+```
+
+<Callout type="warn" title="型が約束になる">
+`Db::new` には、プールがどのサーバーにつながっているかが分かりません。レプリカのプールから `Db<PgSource, ReadWrite>` を作ってもコンパイルは通り、書き込みがレプリカに送られてしまいます。書き込めるケイパビリティは書き込み可能なデータベースに接続したデータソースからだけ作り、この組み立ては 1 か所にまとめてください。
+</Callout>
+
+一度ラップしたプールは、ハンドルから取り出せません。これがケイパビリティの健全性を支えています。マイグレーションなどの準備は `SqlxSource::new` を呼ぶ前にプールに対して行ってください。`Db` を clone するとデータソースも clone されますが、sqlx の場合はプールのハンドルを clone するだけなので軽量です。
+
+## クエリを実行する
+
+`Db` は kanau の [`Processor`](https://docs.rs/kanau/latest/kanau/processor/trait.Processor.html) を実装しています。トレイトをスコープに入れて `process` を呼びます。
+
+```rust title="src/wiring.rs"
+pub async fn run_one(dbs: &Databases) -> Result<(), sqlx::Error> {
+    let user: Option<UserRow> = dbs.replica.process(FindUser { id: 7 }).await?;
+    let renamed: u64 = dbs.primary.process(RenameUser { id: 7, name: "Haruki".into() }).await?;
+    println!("{user:?}, {renamed} row(s) updated");
+    Ok(())
+}
+```
+
+`process` はクエリの `Output` か、データソースの `Error` を返します。
+
+## ハンドラはハンドルに対してジェネリックにする
+
+ハンドラの中で `Db<PgSource, ReadOnly>` という型を書かないでください。代わりに、必要なクエリを `Processor` 境界として列挙します。
+
+```rust title="src/wiring.rs"
+pub struct Profile {
+    pub user: UserRow,
+    pub posts: Vec<String>,
+}
+
+/// 両方のクエリを実行できるハンドルなら何でも受け取る
+pub async fn load_profile<D>(db: &D, id: i64) -> Result<Option<Profile>, sqlx::Error>
+where
+    D: Processor<FindUser, Output = Option<UserRow>, Error = sqlx::Error>
+        + Processor<PostsByAuthor, Output = Vec<String>, Error = sqlx::Error>,
+{
+    let Some(user) = db.process(FindUser { id }).await? else {
+        return Ok(None);
+    };
+    let posts = db.process(PostsByAuthor { author: id }).await?;
+    Ok(Some(Profile { user, posts }))
+}
+
+pub async fn rename_user<D>(db: &D, id: i64, name: String) -> Result<bool, sqlx::Error>
+where
+    D: Processor<RenameUser, Output = u64, Error = sqlx::Error>,
+{
+    Ok(db.process(RenameUser { id, name }).await? == 1)
+}
+```
+
+こうすると、ケイパビリティはハンドルを渡す場所で一度だけ検査されます。さらに次の利点があります。
+
+- ハンドラは、そのクエリを処理できるものなら何でも受け取ります。`Db`、[書き込みフック](/ja/docs/data/hooks)でラップした `Db`、[ユニットテスト](/ja/docs/core/testing)用のフェイクのどれでも構いません。
+- `Processor` 境界が複数あるときは、上の例のように各境界で `Output` と `Error` を固定します。そうすると `db.process(...)` の結果の型が一意に決まります。
+
+## 読み取りはレプリカへ、書き込みはプライマリへ
+
+呼び出し側でハンドルを選びます。
+
+```rust title="src/wiring.rs"
+pub async fn handle_requests(dbs: &Databases) -> Result<(), sqlx::Error> {
+    // プロフィールページ。多少古いデータでも構わない
+    let _profile = load_profile(&dbs.replica, 7).await?;
+
+    // 書き込みはプライマリへ
+    rename_user(&dbs.primary, 7, "Haruki".into()).await?;
+
+    // 自分の書き込みを読む。プライマリでも読み取れる
+    let _fresh = load_profile(&dbs.primary, 7).await?;
+    Ok(())
+}
+```
+
+`ReadWrite` はすべての読み取りを網羅するので、プライマリのハンドルでも読み取りクエリを実行できます。レプリカはプライマリより遅れることがあるため、直前の書き込みを確実に反映した読み取りが必要な場合はプライマリを使ってください。
+
+## 書き込みが読み取り専用ハンドルに届いたとき
+
+書き込むハンドラにレプリカを渡してみます。
+
+```rust
+pub async fn oops(dbs: &Databases) -> Result<bool, sqlx::Error> {
+    rename_user(&dbs.replica, 7, "Haruki".into()).await
+}
+```
+
+コンパイルは通りません。
+
+```text
+error[E0277]: the trait bound `ReadOnly: CanWrite<User>` is not satisfied
+  --> src/fails.rs:18:17
+   |
+18 |     rename_user(&dbs.replica, 7, "Haruki".into()).await
+   |     ----------- ^^^^^^^^^^^^ the trait `CanWrite<User>` is not implemented for `ReadOnly`
+   |     |
+   |     required by a bound introduced by this call
+   |
+   = note: required for `ReadOnly` to implement `Covers<wakuwaku::wakuwaku_entity::Write<User>>`
+   = note: required for `Db<SqlxSource<Postgres>, ReadOnly>` to implement `Processor<RenameUser>`
+note: required by a bound in `rename_user`
+```
+
+note は下から読みます。`rename_user` には `Processor<RenameUser>` が必要です。`Db` がそれを実装するのはケイパビリティが `Write<User>` を網羅する場合だけで、`ReadOnly` には `CanWrite<User>` がありません。`dbs.replica.process(RenameUser { .. })` と直接呼んでも同じエラーになります。
+
+一部のエンティティにだけ書き込ませたいコンポーネントには、`ReadWrite` ではなく[独自のケイパビリティ](/ja/docs/data#capabilities)を渡してください。
+
+## ハンドルをコンポーネントに注入する
+
+ハンドルは普通の値なので、ほかの共有依存と同じように [`ServiceBuilder`](/ja/docs/core/service-builder) に登録できます。コンポーネントは [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装し、`Dep` 型を 1 つだけ持ちます。両方のハンドルが必要なコンポーネントは、`Databases` 構造体を依存として使います（`Dep` には `Clone` が必要なので、`Databases` は `Clone` を derive しています）。
+
+次の [cron ジョブ](/ja/docs/services/cron-jobs)は、休眠ユーザーをレプリカで探し、プライマリで無効化します。
+
+```rust title="src/wiring.rs"
+/// 1 年間サインインしていないユーザーを無効化する
+pub struct DeactivateDormantUsers {
+    dbs: Databases,
+}
+
+impl ServiceCreation for DeactivateDormantUsers {
+    type Dep = Databases;
+
+    fn create_service(dbs: Databases) -> Self {
+        Self { dbs }
+    }
+}
+
+impl Processor<CronTick> for DeactivateDormantUsers {
+    type Output = ();
+    type Error = sqlx::Error;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), sqlx::Error> {
+        let ids = self.dbs.replica.process(DormantUsers { days: 365 }).await?;
+        if !ids.is_empty() {
+            self.dbs.primary.process(DeactivateUsers { ids }).await?;
+        }
+        Ok(())
+    }
+}
+
+impl CronJob for DeactivateDormantUsers {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+}
+```
+
+`DormantUsers`（`Read<User>`）と `DeactivateUsers`（`Write<User>`）は、上のクエリと同じように定義します。ハンドルとジョブを登録します。
+
+```rust title="src/wiring.rs"
+pub async fn start() -> Result<(), sqlx::Error> {
+    let dbs = Databases::connect(
+        "postgres://app@db-primary/app",
+        "postgres://app@db-replica/app",
+    )
+    .await?;
+
+    let (services, cron) = ServiceBuilder::new(dbs)
+        .cron_job::<DeactivateDormantUsers, _>()
+        .start();
+
+    // ほかのコンポーネントもビルダーからハンドルを受け取る
+    let dbs: &Databases = services.provide::<Databases, _>();
+    handle_requests(dbs).await?;
+
+    cron.shutdown().await;
+    Ok(())
+}
+```
+
+`ServiceBuilder::cron_job` はビルダーから `Databases` を clone し、`create_service` を呼びます。gRPC サービスも `grpc_service` で同じように組み立てます（[gRPC サービス](/ja/docs/services/grpc)を参照）。`Db<PgSource, ReadOnly>` と `Db<PgSource, ReadWrite>` は別の型なので、2 つを別々に登録し、それぞれ型で取り出すこともできます。
+
+<Accordions>
+  <Accordion title="なぜクエリはリポジトリのメソッドではなく値なのか">
+    値なら実行前に扱えます。型にはコンパイラが検査する `Effect` が乗り、フックはそれを変更として記述でき、トランザクションは次のステップとして保持できます。`D: Processor<FindUser>` を受け取るハンドラは実際に使う操作だけに依存するので、テストではリポジトリ全体をモックせずに、小さなフェイクに差し替えられます。
+  </Accordion>
+  <Accordion title="なぜケイパビリティは実行時のフラグではなく型パラメータなのか">
+    実行時のフラグは、書き込みが振り分けられた後、実行時にしか失敗できません。型パラメータなら、誤ったハンドルを渡したまさにその呼び出しがコンパイルエラーになります。実行時のコストもありません。`Db<S, C>` が保持するのは `S` だけです。
+  </Accordion>
+</Accordions>
+
+## 次のステップ
+
+<Cards>
+  <Card title="書き込みフック" href="/ja/docs/data/hooks" description="すべての書き込みの前後で、監査・キャッシュ・検索の更新を行います。" />
+  <Card title="sqlx" href="/ja/docs/data/sqlx" description="PostgreSQL と MySQL のデータソースの詳細。" />
+  <Card title="トランザクション" href="/ja/docs/data/transactions" description="複数のクエリをアトミックに実行します。" />
+</Cards>

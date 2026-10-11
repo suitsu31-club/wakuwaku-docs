@@ -1,0 +1,363 @@
+---
+title: Consuming events
+description: Write event handlers, register them through ServiceBuilder or IggyConsumerRegisterCenter, and configure partitions, delivery mode and shutdown.
+icon: Inbox
+---
+
+A consumer is a list of event handlers that all read one Iggy topic. You write one handler per event type, register them, and call `start`; wakuwaku spawns one task per partition and runs the pipeline described on the [overview](/en/docs/events#what-the-consumer-does).
+
+## Event handlers
+
+A handler implements [`EventHandler<E>`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/trait.EventHandler.html) for an event type `E`:
+
+```rust title="wakuwaku::iggy (declaration)"
+pub trait EventHandler<E: Event>: Send + Sync + 'static {
+    const MAX_BATCH: NonZeroUsize;
+
+    fn handle(&self, run: &[E::Target]) -> impl Future<Output = Result<(), HandleError>> + Send;
+}
+```
+
+- **`run`** holds events of **one key**, in the order they must be applied, already reduced with `E`'s algebra. The element type is `E::Target`, the decoded body; for an event that is its own body (the usual case) that is simply `E`.
+- **`MAX_BATCH`** caps the length of `run`. Longer runs are passed in consecutive chunks of at most `MAX_BATCH` events, in order. Use `NonZeroUsize::MIN` (1) to get one event per call.
+- **The return value** decides what happens on failure, through the [`ErrorClass`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.ErrorClass.html) of the [`HandleError`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/struct.HandleError.html); see [below](#when-a-handler-fails).
+
+You can write `handle` as an `async fn`. Its future must be `Send`, because handlers of different keys run concurrently on Tokio, so do not hold a `std::sync::MutexGuard` across an `.await`.
+
+Here are the two handlers for the events from [Defining events](/en/docs/events/defining-events). Both are built from an `OrderStore`, a stand-in for your database pool:
+
+```rust title="src/handlers.rs"
+/// Writes new orders.
+pub struct RecordOrder {
+    store: OrderStore,
+}
+
+impl ServiceCreation for RecordOrder {
+    type Dep = OrderStore;
+    fn create_service(store: OrderStore) -> Self {
+        Self { store }
+    }
+}
+
+impl EventHandler<OrderPlaced> for RecordOrder {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+    async fn handle(&self, run: &[OrderPlaced]) -> Result<(), HandleError> {
+        for order in run {
+            self.store.insert(order.order_id, order.total_cents).await;
+        }
+        Ok(())
+    }
+}
+
+/// Applies payments. A run arrives already folded into one payment.
+pub struct ApplyPayment {
+    store: OrderStore,
+}
+
+impl ServiceCreation for ApplyPayment {
+    type Dep = OrderStore;
+    fn create_service(store: OrderStore) -> Self {
+        Self { store }
+    }
+}
+
+impl EventHandler<PaymentReceived> for ApplyPayment {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::MIN;
+
+    async fn handle(&self, run: &[PaymentReceived]) -> Result<(), HandleError> {
+        for payment in run {
+            self.store
+                .pay(payment.order_id, payment.amount_cents)
+                .await
+                .map_err(HandleError::retryable)?;
+        }
+        Ok(())
+    }
+}
+```
+
+`PaymentReceived` is `Associative`, so the payments of one order that fall into the same run reach `ApplyPayment` as a single, summed event. Because `OrderPlaced` is `Acquire`, a payment published after its order is never applied before it.
+
+Handlers are plain values, so a unit test calls `handle` directly, without Iggy:
+
+```rust title="src/handlers.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wakuwaku::iggy::error::ErrorClass;
+
+    #[tokio::test]
+    async fn payment_for_unknown_order_is_retryable() {
+        let handler = ApplyPayment::create_service(OrderStore::default());
+        let payment = PaymentReceived { order_id: 7, amount_cents: 500 };
+        let error = handler.handle(&[payment]).await.unwrap_err();
+        assert_eq!(error.class(), ErrorClass::Retryable);
+    }
+}
+```
+
+## Registering through the service builder
+
+Handlers usually need shared dependencies: a database pool, an HTTP client, a `Publisher`. Implement [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) for the handler, as above, and let [`ServiceBuilder::iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/iggy_consumer/index.html) build it from a dependency already registered in the [service builder](/en/docs/core/service-builder):
+
+```rust title="src/main.rs"
+use std::sync::Arc;
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::iggy::prelude::{Client, IggyClient};
+use wakuwaku::iggy::ConsumerConfig;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Arc::new(IggyClient::from_connection_string(
+        "iggy://iggy:iggy@localhost:8090",
+    )?);
+    client.connect().await?;
+
+    // Consume both event types of the `orders` topic with one consumer.
+    let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
+        .iggy_consumer::<RecordOrder, _, _>()
+        .iggy_consumer::<ApplyPayment, _, _>()
+        .start(
+            client,
+            ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]),
+        )
+        .await?;
+
+    tokio::signal::ctrl_c().await?;
+    consumers.shutdown().await;
+    Ok(())
+}
+```
+
+The three type parameters are `<Handler, Event, Position>`:
+
+- **`Handler`** is the handler type to build.
+- **`Event`** can be `_` when the handler implements `EventHandler` for exactly one event. Name it when one handler type handles several events: `.iggy_consumer::<MyHandler, MyEvent, _>()`.
+- **`Position`** is where the handler's `Dep` sits in the builder. `_` works when that type is registered once; otherwise name it with `Here` / `There`, as for any [`provide`](/en/docs/core/service-builder) call. A dependency that was never registered is a compile error.
+
+Each `iggy_consumer` call builds its handler immediately: it clones the `Dep` out of the builder, calls `create_service`, and wraps the handler in an `Arc`. The chain ends with either:
+
+- **`start(client, config)`**, which starts consuming and returns the service builder together with the running [`ConsumerRuntime`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html), so you can keep building the rest of the service; or
+- **`into_parts()`**, which returns the service builder and the unstarted `IggyConsumerRegisterCenter`, to start later or to extend with handlers built by hand.
+
+## Registering directly
+
+`ServiceBuilder::iggy_consumer` is a convenience over [`IggyConsumerRegisterCenter`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/struct.IggyConsumerRegisterCenter.html), a type-level list of handlers. You can use it directly, for example when the handlers do not come from the service builder:
+
+```rust title="src/direct.rs"
+pub async fn start_by_hand(
+    client: Arc<IggyClient>,
+    store: OrderStore,
+) -> Result<ConsumerRuntime, Error> {
+    IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::new(store.clone())))
+        .push(Arc::new(ApplyPayment::new(store)))
+        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+        .await
+}
+```
+
+`new` starts the list with its first handler and every `push` adds one. Handlers are passed as `Arc`, so one handler value can serve several event types. When the handler type implements `EventHandler` for more than one event, name the event. Here `Audit` is a dependency-free handler that implements `EventHandler<OrderPlaced>` and `EventHandler<PaymentReceived>`:
+
+```rust title="src/direct.rs"
+pub async fn audit_only(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
+    let audit = Arc::new(Audit);
+    IggyConsumerRegisterCenter::<_, OrderPlaced>::new(audit.clone())
+        .push::<_, PaymentReceived>(audit)
+        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
+        .await
+}
+```
+
+Both styles mix through `into_parts`:
+
+```rust title="src/direct.rs"
+pub async fn mixed(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
+    let (services, orders) = ServiceBuilder::new(OrderStore::default())
+        .iggy_consumer::<RecordOrder, _, _>()
+        .into_parts();
+
+    let _store: &OrderStore = services.provide::<OrderStore, _>();
+
+    // `orders` is a plain `IggyConsumerRegisterCenter`: push hand-built handlers.
+    orders
+        .push::<Audit, PaymentReceived>(Arc::new(Audit))
+        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
+        .await
+}
+```
+
+## One main topic per consumer
+
+A consumer reads exactly one main topic: the `SUPER_PARTITION_NAME` of its events' key type. Every handler in one list must therefore handle events keyed by key types with the same topic name. `start` checks this, together with the rest of the setup, and returns an error instead of consuming:
+
+| Error | Cause |
+|---|---|
+| `Error::MixedTopics` | the registered events belong to different topics |
+| `Error::DuplicateEventType` | two handlers are registered for the same `TYPE_TAG` |
+| `Error::InvalidConfig` | `partitions` is empty, `retry_delays` is empty, or `poll_count` is `0` |
+| `Error::TopicNotFound` | the main topic does not exist in the stream |
+| `Error::PartitionNotFound` | a configured partition does not exist in the main topic |
+| `Error::PartitionCountMismatch` | `retry_<topic>` exists with a different partition count than the main topic |
+| `Error::Iggy` | an Iggy call failed (for example the server is unreachable or the retry topic cannot be created), or the stream or consumer name is not a valid identifier |
+
+To consume events of another key type, start a second consumer. Records whose tag no registered handler matches are dropped and logged, and the offset moves past them. A consumer that registers only some of a topic's event types therefore simply skips the others, which is fine on purpose but a silent loss by mistake: when you add an event type to a topic, also register it in every consumer that needs it.
+
+## Configuration
+
+[`ConsumerConfig::new(stream, consumer_name, partitions)`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/struct.ConsumerConfig.html) sets the three required fields and defaults the rest. All fields are public:
+
+<TypeTable
+  type={{
+    stream: {
+      type: 'String',
+      description: 'Stream holding the main topic and its retry topic.',
+      required: true,
+    },
+    consumer_name: {
+      type: 'String',
+      description: 'Name of the Iggy consumer that stores the offsets. Offsets are stored per consumer name and partition, so a new name starts from the first retained record.',
+      required: true,
+    },
+    partitions: {
+      type: 'Vec<u32>',
+      description: 'Partitions of the main topic to consume. Each gets its own task. Iggy partition ids start at 0. Must not be empty.',
+      required: true,
+    },
+    mode: {
+      type: 'DeliveryMode',
+      description: 'When offsets are stored: NoEventLose (at least once) or NoDoubleConsume (at most once).',
+      default: 'DeliveryMode::NoEventLose',
+    },
+    retry_delays: {
+      type: "&'static [Duration]",
+      description: 'Delays between retry attempts of a failed key, also used between attempts of transient failures and failed Iggy calls. The last delay repeats for transient failures. Must not be empty.',
+      default: 'DEFAULT_RETRY_DELAYS (2 s, 4 s, 8 s, 16 s)',
+    },
+    poll_count: {
+      type: 'u32',
+      description: 'Messages fetched per poll, i.e. the maximum batch size the planner works on. Must not be 0.',
+      default: '1000',
+    },
+    poll_interval: {
+      type: 'Duration',
+      description: 'Sleep after an empty poll of the main topic (shortened when a retry is due sooner).',
+      default: '100 ms',
+    },
+    max_pending_retry: {
+      type: 'usize',
+      description: 'Maximum number of records of one partition waiting in its retry partition. New failing keys beyond it are dropped.',
+      default: '100000',
+    },
+  }}
+/>
+
+Override fields with struct update syntax. `retry_delays` is a `&'static` slice, so declare custom delays as a `const`:
+
+```rust title="src/config.rs"
+use std::time::Duration;
+use wakuwaku::iggy::{ConsumerConfig, DeliveryMode};
+
+const RETRY_DELAYS: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
+pub fn config(partitions: Vec<u32>) -> ConsumerConfig {
+    ConsumerConfig {
+        mode: DeliveryMode::NoEventLose,
+        retry_delays: RETRY_DELAYS,
+        poll_count: 500,
+        poll_interval: Duration::from_millis(250),
+        ..ConsumerConfig::new("shop", "order-projection", partitions)
+    }
+}
+```
+
+## Partitions and tasks
+
+`start` spawns **one Tokio task per entry in `partitions`**. Partitions are processed in parallel with each other; inside a partition, the keys of one polled batch are processed concurrently, and the next batch is polled only when every key of the current one is done, failed over to the retry topic, or dropped.
+
+To consume every partition, read the ids from the topic instead of hard-coding them:
+
+```rust title="src/setup.rs"
+/// Every partition id of the main topic (ids are zero-based).
+pub async fn all_partitions(client: &IggyClient) -> Result<Vec<u32>, IggyError> {
+    let stream = Identifier::named("shop")?;
+    let topic = Identifier::named(OrderId::SUPER_PARTITION_NAME.0)?;
+    let details = client
+        .get_topic(&stream, &topic)
+        .await?
+        .ok_or_else(|| IggyError::TopicIdNotFound(topic.clone(), stream.clone()))?;
+    Ok(details.partitions.iter().map(|partition| partition.id).collect())
+}
+```
+
+<Callout type="warn" title="Replicas need disjoint partitions">
+  The consumer reads explicit partitions with a named Iggy consumer; it does not join an Iggy consumer group, so there is no automatic rebalancing. If you run several replicas with the same `consumer_name`, give each a disjoint set of `partitions` (for example, replica `i` of `n` takes the partitions with `id % n == i`). Two replicas reading the same partition both process its records.
+</Callout>
+
+## The pipeline of one partition
+
+<ConsumerPipelineDiagram lang="en" />
+
+Each partition task repeats:
+
+1. **Drain the retry partition.** Read partition *p* of `retry_<topic>` to its end and queue the records by key.
+2. **Run due retries.** Re-plan and re-run every quarantined key whose next retry delay has elapsed.
+3. **Poll.** Fetch up to `poll_count` records of partition *p* of the main topic, starting after the stored offset. If none arrive, sleep for `poll_interval` and start over.
+4. **Plan.** Parse the headers, group the records by key hash, split each key into segments at its ordering fences and group segments into runs by type. See [Ordering](/en/docs/events/ordering).
+5. **Divert quarantined keys.** A key that still has records waiting in the retry topic is not executed; its new records are appended to the retry topic behind the old ones, so they stay in order.
+6. **Execute.** Run the other keys concurrently. For each run: decode the bodies, reduce them with the [algebra](/en/docs/events/algebra), and call the handler chunk by chunk.
+7. **Write failures to retry.** Keys that failed with a retryable error are written to the retry topic from where they failed, and become quarantined.
+8. **Commit.** Store the main offset as the delivery mode requires.
+
+Failures of Iggy itself (polling, storing an offset, writing to the retry topic) do not stop the task: each call is retried with `retry_delays` until it succeeds, with a warning logged through `tracing`.
+
+## Delivery modes
+
+[`DeliveryMode`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/enum.DeliveryMode.html) decides when offsets are stored, and therefore what a crash costs:
+
+| Mode | Guarantee | Offsets stored | After a crash |
+|---|---|---|---|
+| `NoEventLose` (default) | at least once | the main offset after every key of the batch is done, dropped, or acknowledged by the retry topic; the retry offset never passes a record that is still pending | nothing is lost, but events processed since the last stored offset are processed again |
+| `NoDoubleConsume` | at most once | right after polling, before processing (also for the retry topic) | every event polled but not yet processed is lost; nothing is processed twice |
+
+With `NoEventLose`, write handlers to be **idempotent**: applying the same event twice must be harmless. Also note that a retry attempt that fails after some chunks of a run succeeded applies those chunks again on the next attempt. Choose `NoDoubleConsume` only when losing events is cheaper than repeating them, such as for best-effort notifications.
+
+## When a handler fails
+
+Return a `HandleError` built with one of three constructors; its class decides what happens:
+
+| Constructor | Class | Effect |
+|---|---|---|
+| `HandleError::transient(e)` | `Transient` | the same chunk is retried in place, with `retry_delays`, until it succeeds; the partition makes no progress meanwhile |
+| `HandleError::retryable(e)` | `Retryable` | the key's unfinished work moves to the retry topic and the key is quarantined; other keys continue |
+| `HandleError::unrecoverable(e)` | `Unrecoverable` | the chunk is dropped and logged; the rest of the run continues |
+
+Any error convertible into `anyhow::Error` can be wrapped, which includes every `std::error::Error + Send + Sync + 'static`. Retry scheduling, quarantine and the retry topic are covered in [Error handling](/en/docs/events/error-handling).
+
+## Shutdown
+
+[`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) aborts every partition task and waits for them to stop:
+
+```rust
+tokio::signal::ctrl_c().await?;
+consumers.shutdown().await;
+```
+
+This is an abort, not a drain: handler calls in flight are cancelled at their next `.await`. With `NoEventLose` that loses nothing, because the work that was not committed is read again by the next consumer with the same `consumer_name`. With `NoDoubleConsume`, the events of the batch in flight are lost.
+
+<Callout type="error" title="Keep the runtime alive">
+  Dropping the `ConsumerRuntime` also aborts every partition task. Bind it to a named variable for as long as the service runs; `let _ = … .start(…).await?;` drops it immediately and stops consuming before a single batch is processed.
+</Callout>
+
+## Next steps
+
+<Cards>
+  <Card title="Error handling" href="/en/docs/events/error-handling" description="Transient, retryable and unrecoverable failures in depth." />
+  <Card title="Ordering" href="/en/docs/events/ordering" description="How segments and runs are planned within one key." />
+  <Card title="Algebra" href="/en/docs/events/algebra" description="How runs are collapsed or folded before your handler sees them." />
+  <Card title="Service builder" href="/en/docs/core/service-builder" description="Registering the dependencies your handlers are built from." />
+</Cards>

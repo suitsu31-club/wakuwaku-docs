@@ -1,0 +1,181 @@
+---
+title: イベントの発行
+description: Publisher で型付きイベントを Iggy に送り、書き込まれるヘッダーと、必要なストリーム・トピックの準備を理解します。
+icon: Send
+---
+
+発行に必要なのは 1 つの型と 1 つのメソッド、[`Publisher`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/publisher/struct.Publisher.html) と `publish` だけです。トピック、パーティション、ヘッダー、エンコードといったそれ以外のことは、[イベントの定義](/ja/docs/events/defining-events) で定義したイベント型から決まります。
+
+## パブリッシャーを作って発行する [#create-a-publisher-and-publish]
+
+パブリッシャーは、接続済みの `IggyClient` と 1 つのストリーム名を包みます。そのストリームに対して、どのキー型をキーとする、どの型のイベントでも発行できます。
+
+```rust title="src/main.rs"
+use std::sync::Arc;
+use wakuwaku::deps::iggy::prelude::{Client, IggyClient};
+use wakuwaku::iggy::Publisher;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Arc::new(IggyClient::from_connection_string(
+        "iggy://iggy:iggy@localhost:8090",
+    )?);
+    client.connect().await?;
+
+    // 注文 42 のイベントを 2 つ発行する。どちらもトピック `orders` の同じパーティションに入る。
+    let publisher = Publisher::new(client.clone(), "shop")?;
+    publisher
+        .publish(OrderPlaced {
+            order_id: 42,
+            customer: "alice".into(),
+            total_cents: 12_000,
+        })
+        .await?;
+    publisher
+        .publish(PaymentReceived {
+            order_id: 42,
+            amount_cents: 12_000,
+        })
+        .await?;
+
+    Ok(())
+}
+```
+
+`Publisher::new` はサーバーと通信しません。ストリーム名が Iggy の識別子として有効かどうかを確認するだけです。`publish(event)` は次の処理を行います。
+
+1. キー型の `PartitionMerge` ハッシャーを使い、`key_hash(&event.key())` でキーハッシュを計算します。
+2. イベントをボディに変換し（`IntoEventBody::into_event_body`）、`MessageSer::to_bytes` でシリアライズします。
+3. ボディをペイロードとし、[wakuwaku のヘッダー](#headers-on-the-wire) を付けた Iggy メッセージを 1 つ組み立てます。
+4. そのメッセージを、ストリーム内の、キー型の `SUPER_PARTITION_NAME` という名前のトピックへ、キーハッシュを Iggy のメッセージキーとしてパーティショニングして送信します。
+
+したがって 1 つのキーのイベントはすべて同じパーティションに、発行した順で入ります。`publish` の 1 回の呼び出しで送るメッセージはちょうど 1 つで、クライアント側でのバッチ処理はありません。
+
+## パブリッシャーを共有する [#sharing-a-publisher]
+
+`Publisher` は `Send + Sync` ですが `Clone` ではありません。起動時に 1 回だけ作って `Arc` で包み、[`ServiceBuilder`](/ja/docs/core/service-builder) に登録すれば、各コンポーネントがそれを依存として受け取れます。
+
+```rust title="src/checkout.rs"
+use std::sync::Arc;
+use wakuwaku::ServiceCreation;
+use wakuwaku::iggy::Publisher;
+use wakuwaku::iggy::error::Error;
+
+/// イベントを発行するコンポーネント。依存は `Arc<Publisher>`。
+pub struct Checkout {
+    publisher: Arc<Publisher>,
+}
+
+impl ServiceCreation for Checkout {
+    type Dep = Arc<Publisher>;
+    fn create_service(publisher: Arc<Publisher>) -> Self {
+        Self { publisher }
+    }
+}
+
+impl Checkout {
+    pub async fn place_order(&self, order_id: u64, customer: String) -> Result<(), Error> {
+        // ... 注文を保存してから、それを通知する。
+        self.publisher
+            .publish(OrderPlaced {
+                order_id,
+                customer,
+                total_cents: 12_000,
+            })
+            .await
+    }
+}
+```
+
+```rust title="src/main.rs"
+let publisher = Arc::new(Publisher::new(client.clone(), "shop")?);
+let services = ServiceBuilder::new(client).push(publisher);
+```
+
+## ワイヤ上のヘッダー [#headers-on-the-wire]
+
+すべてのメッセージには 3 つのユーザーヘッダーが付きます。値はすべて生のバイト列です。コンシューマはこれを読み戻し、ボディをデコードせずにレコードの振り分け、順序づけ、縮約を行います。この表が必要になるのは、別のプログラム（他の言語、ブリッジ、リプレイツールなど）が wakuwaku のコンシューマに読ませるイベントを書き込む場合だけです。定数は [`wakuwaku::iggy::events::headers`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/headers/index.html) にあります。
+
+| ヘッダー | 内容 |
+|---|---|
+| `wakuwaku-tag` | イベントの `TYPE_TAG`。`u32` リトルエンディアン |
+| `wakuwaku-key` | キーハッシュ。`u64` リトルエンディアン |
+| `wakuwaku-props` | 3 バイト。バージョン `1`、メッセージの順序、型の結合性 (associativity) |
+| `wakuwaku-retry` | リトライトピックのレコードにのみ付く。バージョン `1` に続いて、失敗時刻（Unix エポックからのミリ秒、`u64` リトルエンディアン） |
+
+`wakuwaku-props` の中のワイヤ上の値は次のとおりです。
+
+| 順序 | バイト値 | | 代数マーカー | バイト値 |
+|---|---|---|---|---|
+| `Relaxed` | `1` | | `NonAssociative` | `0` |
+| `Acquire` | `2` | | `Associative` | `1` |
+| `Release` | `4` | | `Idempotent` | `2` |
+| `AcqRel` | `6` | | `Commutative` | `3` |
+| | | | `IdempotentCommutative` | `4` |
+
+外部のプロデューサーは、パーティショニングも同じ方法で行う必要があります。キーハッシュのリトルエンディアン 8 バイトを Iggy のメッセージキーとして使えば、Iggy クライアントが `Publisher` とまったく同じパーティションを選びます。
+
+<Callout type="info" title="コンシューマは代数を二重に確認します">
+  結合性のバイト値が、ハンドラのイベント型の代数と一致しないレコードは、ログに記録されたうえで破棄されます。誤ったルールで縮約されることはありません。
+</Callout>
+
+## サーバーに必要なもの [#what-must-exist-on-the-server]
+
+wakuwaku が Iggy サーバー上に作成するものは最小限です。
+
+| リソース | wakuwaku が作成するか |
+|---|---|
+| ストリーム（例: `shop`） | 作成しません。自分で作成してください。 |
+| メイントピック（`SUPER_PARTITION_NAME`、例: `orders`）とそのパーティション | 作成しません。必要なパーティション数で自分で作成してください。 |
+| リトライトピック `retry_<topic>` | 作成します。存在しなければ、コンシューマの `start` がメイントピックと同じパーティション数で作成します。 |
+
+存在しないトピックへの `publish` は Iggy のエラーで失敗し、メイントピックがなければコンシューマは起動を拒否します（`Error::TopicNotFound`）。どちらもデプロイの一環として作成してください。たとえば、`wakuwaku::deps::iggy` として再エクスポートされている Iggy クライアントを使い、起動時に冪等なセットアップ処理を実行します。
+
+```rust title="src/setup.rs"
+use wakuwaku::deps::iggy::prelude::{
+    Identifier, IggyClient, IggyError, StreamClient, TopicClient, TopicCreateOptions,
+};
+use wakuwaku::iggy::PartitionKey;
+
+/// ストリームとメイントピックがなければ作成する。
+pub async fn ensure_topology(client: &IggyClient) -> Result<(), IggyError> {
+    let stream = Identifier::named("shop")?;
+    if client.get_stream(&stream).await?.is_none() {
+        client.create_stream("shop").await?;
+    }
+
+    let topic = OrderId::SUPER_PARTITION_NAME.0; // "orders"
+    if client.get_topic(&stream, &Identifier::named(topic)?).await?.is_none() {
+        let options = TopicCreateOptions {
+            partitions_count: Some(4),
+            ..Default::default()
+        };
+        client.create_topic(&stream, topic, &options).await?;
+    }
+    Ok(())
+}
+```
+
+トピック名を `SUPER_PARTITION_NAME` から読めば、セットアップとイベント型の食い違いを防げます。`partitions_count` を指定しない場合、Iggy SDK の既定値はパーティション 1 つです。
+
+<Callout type="warn" title="パーティション数は最初に決める">
+  キーのパーティションは、キーのハッシュとトピックのパーティション数から決まります。後からパーティションを追加するとキーが別のパーティションへ移るので、変更の前後に発行された 1 つのキーのイベントが順不同で処理されることがあります。また、リトライトピックのパーティション数がメイントピックと一致しなくなると、コンシューマは起動を拒否します（`Error::PartitionCountMismatch`）。将来必要になる並行度に合わせてトピックのサイズを決めてください。
+</Callout>
+
+## エラー [#errors]
+
+`Publisher::new` と `publish` は [`wakuwaku::iggy::error::Error`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.Error.html) を返します。発行で起こりうるバリアントは次のとおりです。
+
+| バリアント | 原因 |
+|---|---|
+| `Error::Iggy` | ストリーム名やトピック名が有効な識別子でない、メッセージを組み立てられない、または送信に失敗した（サーバーに到達できない、トピックがない、権限がない、など） |
+| `Error::Serialize` | ボディの `MessageSer::to_bytes` が失敗した |
+
+送信は**リトライされません**。`publish` がエラーを返した場合、wakuwaku が知る限りイベントは書き込まれていません。リトライするか、リクエストを失敗させるか、エラーを呼び出し元に返すかはアプリケーションが決めます。`publish` が行うのは Iggy へのメッセージ 1 件の書き込みだけです。データベースのトランザクションのコミットと同時にイベントを発行する必要がある場合、その調整はアプリケーションのコードの責任です。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="イベントの購読" href="/ja/docs/events/consuming" description="発行したイベントを処理します。" />
+  <Card title="順序" href="/ja/docs/events/ordering" description="ヘッダーの順序バイトがコンシューマにとって何を意味するか。" />
+</Cards>

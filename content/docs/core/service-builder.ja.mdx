@@ -1,0 +1,296 @@
+---
+title: サービスビルダー
+description: 共有する依存を型レベルのレジストリに登録し、そこからすべてのコンポーネントを組み立て、登録漏れがないことをコンパイラに検査させます。
+icon: Boxes
+---
+
+wakuwaku のサービスは、すべて [`ServiceBuilder`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html) から始まります。データベースハンドル、クライアント、設定など、コンポーネント間で共有する依存を登録しておくレジストリです。cron ジョブ、イベントハンドラ、gRPC サービスはここから組み立てられます。
+
+Spring でいえばアプリケーションコンテキストにあたりますが、違いが二つあります。依存はアプリケーションの起動時ではなく **コンパイル時** に型で解決されます。また、コンポーネントスキャンもアノテーションもプロキシもありません。値は明示的に登録し、各コンポーネントは自分がどの値から作られるかを宣言します。
+
+<ServiceBuilderDiagram lang="ja" />
+
+## 登録と取得 [#registering-and-looking-up]
+
+`ServiceBuilder::new` で最初の値を登録し、`push` で値を追加し、`provide` で登録済みの値を型によって借用します。
+
+```rust title="src/main.rs"
+use wakuwaku::ServiceBuilder;
+
+#[derive(Clone)]
+pub struct AppConfig {
+    pub grpc_addr: SocketAddr,
+}
+
+pub fn basics() {
+    let services = ServiceBuilder::new(AppConfig { grpc_addr: "[::]:50051".parse().unwrap() })
+        .push(AccountStore::default())
+        .push(Mailer::default());
+
+    let config: &AppConfig = services.provide::<AppConfig, _>();
+    let mailer: &Mailer = services.provide::<Mailer, _>();
+    let _ = (config, mailer);
+}
+```
+
+`provide` の二つ目の型パラメータは、ビルダー内での値の *位置* です。その型が一度だけ登録されていれば、`_` を渡すとコンパイラが推論します。
+
+### 仕組み [#how-it-works]
+
+`push` するたびにビルダーは新しいノードで包まれます。上のビルダーの型は次のとおりです。
+
+```rust
+ServiceBuilder<Mailer, ServiceBuilder<AccountStore, ServiceBuilder<AppConfig>>>
+```
+
+レジストリは型レベルの連結リストです。位置は最後に `push` したものから数えます。[`Here`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.Here.html) が先頭 (`Mailer`)、`There<Here>` が一つ前 (`AccountStore`)、`There<There<Here>>` が `AppConfig` です。取得はトレイト境界 [`ProvideAt<T, Position>`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/trait.ProvideAt.html) で表され、これは `T` が格納されている位置にだけ実装されます。解決するのはトレイトソルバーです。実行時には `Any` もダウンキャストもハッシュマップもなく、`provide` はフィールドアクセスにコンパイルされます。
+
+重要なのはその帰結です。登録されていない型を要求すると **コンパイルが通りません** ([後述](#reading-the-compile-errors))。
+
+## コンポーネントの組み立て: `ServiceCreation` [#building-components-servicecreation]
+
+コンポーネントは自分で依存を探しに行きません。[`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装して、自分が作られる元になる登録済みの型を一つ宣言します。
+
+```rust
+pub trait ServiceCreation {
+    type Dep: Clone;
+
+    fn create_service(dep: Self::Dep) -> Self;
+}
+```
+
+```rust title="src/components.rs"
+pub struct ExpireSessions {
+    sessions: SessionStore,
+}
+
+impl ServiceCreation for ExpireSessions {
+    type Dep = SessionStore;
+    fn create_service(sessions: SessionStore) -> Self {
+        Self { sessions }
+    }
+}
+```
+
+コンポーネントを登録すると、ビルダーは `Dep` を型で探して clone し、その clone を `create_service` に渡します。そのため `Dep` は `Clone` でなければならず、clone は **安価** であるべきです。リソースそのものではなく、リソースを共有するハンドルを `Dep` にしてください。適した `Dep` の例は次のとおりです。
+
+- `wakuwaku::entity` の `Db<S, C>` ハンドル (ソースがプールや多重化コネクションを包んでいます)
+- `sqlx::Pool`、`redis::aio::MultiplexedConnection`、`Arc<IggyClient>` などのプールやクライアントのハンドル
+- このページで使っている `SessionStore` のように、`Arc` の裏に置いた独自の状態
+
+```rust title="src/components.rs"
+/// Login sessions and when they expire.
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    expires_at: Arc<Mutex<HashMap<String, SystemTime>>>,
+}
+```
+
+<Callout type="info" title="コンポーネントごとに別の clone を受け取ります">
+同じ `Dep` から作られるコンポーネントは、それぞれ登録時に一度だけ取られた別々の clone を受け取ります。共有したい状態は、すべての clone から見えるようにハンドル (`Arc` やプール) の裏に置いてください。
+</Callout>
+
+### 複数の依存を一つの構造体にまとめる [#several-dependencies-in-one-struct]
+
+`Dep` は一つの型です。複数の依存が必要なコンポーネントには、それらをまとめた構造体 (またはタプル) を登録し、それを `Dep` にします。
+
+```rust title="src/billing.rs"
+/// Everything the billing components need, registered as one value.
+#[derive(Clone)]
+pub struct BillingDeps {
+    pub accounts: AccountStore,
+    pub mailer: Mailer,
+}
+
+pub struct SendInvoices {
+    deps: BillingDeps,
+}
+
+impl ServiceCreation for SendInvoices {
+    type Dep = BillingDeps;
+    fn create_service(deps: BillingDeps) -> Self {
+        Self { deps }
+    }
+}
+```
+
+```rust title="src/main.rs"
+let accounts = AccountStore::default();
+let mailer = Mailer::default();
+
+let (_services, cron) = ServiceBuilder::new(accounts.clone())
+    .push(mailer.clone())
+    .push(BillingDeps { accounts, mailer })
+    .cron_job::<SendInvoices, _>()
+    .start();
+```
+
+ここでは部品も個別に登録しているので、`AccountStore` だけ、あるいは `Mailer` だけから作られるコンポーネントも組み立てられます。部品はハンドルなので、`BillingDeps` はそれらと状態を共有します。
+
+## レジスタセンターはビルダーを受け取り、返す [#register-centers-take-the-builder-and-give-it-back]
+
+コンポーネントの種類ごとに *レジスタセンター* があります。ビルダーから埋めていく、コンポーネントの型レベルのリストです。`ServiceBuilder` のメソッドで開始し、登録をつなげ、ビルダーを返すメソッドで終了します。
+
+| コンポーネント | 開始 | 追加 | 終了 | 戻り値 |
+|---|---|---|---|---|
+| cron ジョブ | `.cron_job::<Job, _>()` | `.cron_job::<Job, _>()` | `.start()` | `(ServiceBuilder, CronRuntime)` |
+| イベントハンドラ | `.iggy_consumer::<Handler, _, _>()` | `.iggy_consumer::<Handler, _, _>()` | `.start(client, config).await?` | `(ServiceBuilder, ConsumerRuntime)` |
+| gRPC サービス | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)` | 同左 | `.into_router_fn()` | `(ServiceBuilder, impl FnOnce(Router<L>) -> Router<L>)` |
+| いずれも | | | `.into_parts()` | `(ServiceBuilder, 未起動のレジスタセンター)` |
+
+登録メソッドはどれもビルダーを **値で** 受け取り、返すレジスタセンタービルダーの中 (公開フィールド `builder`) に保持します。そのため、次の登録でも依存を探せます。終了メソッドがビルダーを返すので、それを次の種類のコンポーネントに渡していきます。
+
+```rust title="src/main.rs"
+let services = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .push(Mailer::default());
+
+let (services, consumers) = services
+    .iggy_consumer::<SendWelcomeMail, _, _>()
+    .start(iggy.clone(), ConsumerConfig::new("shop", "accounts", vec![0]))
+    .await?;
+
+let (services, add_grpc) = services
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .into_router_fn();
+
+let (_services, cron) = services.cron_job::<ExpireSessions, _>().start();
+```
+
+コンポーネントは登録メソッドを呼んだ時点で **即座に** 作られます。`Dep` が clone され、`create_service` が実行されるのはこのときです。各ステップを実行すべき順序や停止の方法を含めた完全なプログラムは [ライフサイクル](/ja/docs/core/lifecycle) にあります。各レジスタセンターの詳細は [cron ジョブ](/ja/docs/services/cron-jobs)、[gRPC](/ja/docs/services/grpc)、[イベントの消費](/ja/docs/events/consuming) を参照してください。
+
+`into_parts` は逃げ道です。ビルダーとレジスタセンターを別々に返すので、手で組み立てたコンポーネントを起動前にリストへ `push` できます。
+
+## 同じ型の重複 [#duplicate-types]
+
+同じ型の値を二つ登録することはできますが、`_` ではどちらか選べなくなります。`Here` と `There` で位置を指定してください。
+
+```rust
+use wakuwaku::services::builder::{Here, There};
+
+#[derive(Clone)]
+pub struct HttpClient {
+    pub base_url: &'static str,
+}
+
+let services = ServiceBuilder::new(HttpClient { base_url: "https://payments.example" })
+    .push(HttpClient { base_url: "https://mail.example" });
+
+// `Here` is the most recent push; each `There` steps one push back.
+let mail = services.provide::<HttpClient, Here>();
+let payments = services.provide::<HttpClient, There<Here>>();
+```
+
+登録メソッドも同じ位置パラメータを受け取ります。
+
+```rust
+let (_services, cron) = ServiceBuilder::new(HttpClient { base_url: "https://payments.example" })
+    .push(HttpClient { base_url: "https://mail.example" })
+    .cron_job::<PingPayments, There<Here>>() // the payments client
+    .start();
+```
+
+位置は `push` を足すたびにずれるので、アプリケーションのコードでは役割ごとに別の型を与えるほうがよいでしょう。newtype にはコストがかからず、`_` もそのまま使えます。
+
+```rust
+#[derive(Clone)]
+pub struct PaymentsClient(pub HttpClient);
+
+#[derive(Clone)]
+pub struct MailClient(pub HttpClient);
+
+let services = ServiceBuilder::new(PaymentsClient(HttpClient { base_url: "https://payments.example" }))
+    .push(MailClient(HttpClient { base_url: "https://mail.example" }));
+
+let payments = services.provide::<PaymentsClient, _>();
+```
+
+型パラメータが異なるハンドルは、もともと別の型です。レプリカ用の `Db<PgSource, ReadOnly>` とプライマリ用の `Db<PgSource, ReadWrite>` は両方登録でき、どちらも `_` で取得できます。
+
+## `ProvideAt` でジェネリックなコードを書く [#writing-generic-code-with-provideat]
+
+ある型を含む *何らかの* ビルダーがあればよい関数は、ビルダーについてジェネリックにできます。`ProvideAt` と位置パラメータで境界を付ければ、呼び出し側は位置を書く必要がありません。
+
+```rust title="src/config.rs"
+use wakuwaku::services::builder::{ProvideAt, ServiceBuilderPosition};
+
+/// Works with any builder that has exactly one `AppConfig` somewhere in it.
+pub fn grpc_addr<S, I>(services: &S) -> SocketAddr
+where
+    S: ProvideAt<AppConfig, I>,
+    I: ServiceBuilderPosition,
+{
+    services.provide_at().grpc_addr
+}
+```
+
+任意のビルダーの上に依存のまとまりを登録する関数も書けます。配線をモジュールに分けるのに便利です (Spring の `@Configuration` クラスに近い発想です)。
+
+```rust title="src/sessions.rs"
+/// Registers the session infrastructure on top of any builder.
+pub fn with_sessions<H, C>(
+    services: ServiceBuilder<H, C>,
+) -> ServiceBuilder<Mailer, ServiceBuilder<SessionStore, ServiceBuilder<H, C>>> {
+    services.push(SessionStore::default()).push(Mailer::default())
+}
+```
+
+```rust title="src/main.rs"
+let services = with_sessions(ServiceBuilder::new(AppConfig {
+    grpc_addr: "[::]:50051".parse().unwrap(),
+}));
+let addr = grpc_addr(&services);
+```
+
+## コンパイルエラーの読み方 [#reading-the-compile-errors]
+
+出会うエラーは主に二つで、意味が分かれば短いものです。以下はどちらも実際の出力で、パスと `help:` の一覧を省略しています。
+
+**登録されていない依存。** `ExpireSessions` は `SessionStore` を必要としますが、登録されているのは `Mailer` だけです。
+
+```rust
+let (_services, cron) = ServiceBuilder::new(Mailer) // no SessionStore registered
+    .cron_job::<ExpireSessions, _>()
+    .start();
+```
+
+```text
+error[E0277]: the trait bound `(): ProvideAt<SessionStore, _>` is not satisfied
+   |
+37 |         .cron_job::<ExpireSessions, _>()
+   |          ^^^^^^^^ the trait `ProvideAt<SessionStore, _>` is not implemented for `()`
+   |
+   = note: required for `ServiceBuilder<Mailer>` to implement `ProvideAt<SessionStore, There<_>>`
+note: required by a bound in `ServiceBuilder::<Head, Chain>::cron_job`
+```
+
+「`SessionStore` を探してリストの終端 `()` まで到達した」と読んでください。`ProvideAt<…>` の最初の型が、足りない依存です。`Mailer` のないビルダーで `provide::<Mailer, _>()` を呼んでも同じエラーになります。
+
+**曖昧な取得。** 同じ型の値が二つ登録されていて、`_` を使っています。
+
+```rust
+#[derive(Clone)]
+struct Db(&'static str);
+
+let services = ServiceBuilder::new(Db("primary")).push(Db("replica"));
+let _db: &Db = services.provide::<Db, _>();
+```
+
+```text
+error[E0283]: type annotations needed
+  |
+8 |     let _db: &Db = services.provide::<Db, _>();
+  |                             -------       ^ cannot infer type of the type parameter `I` declared on the method `provide`
+  |
+  = note: multiple `impl`s satisfying `ServiceBuilder<Db, ServiceBuilder<Db>>: ProvideAt<Db, _>` found in the `wakuwaku` crate:
+          - impl<Head, T, Chain, I> ProvideAt<T, There<I>> for ServiceBuilder<Head, Chain>
+          - impl<T, Chain> ProvideAt<T, Here> for ServiceBuilder<T, Chain>;
+```
+
+位置を明示するか、より良い方法として [newtype](#duplicate-types) を使って解決してください。
+
+<Cards>
+  <Card title="ライフサイクル" href="/ja/docs/core/lifecycle" description="main で一つのビルダーから cron ジョブ、コンシューマー、gRPC サーバーを組み立てる。" />
+  <Card title="テスト" href="/ja/docs/core/testing" description="create_service でコンポーネントを作り、直接テストする。" />
+  <Card title="証明駆動プログラミング" href="/ja/docs/core/proof-driven" description="コンパイラが他に何を検査してくれるか。" />
+</Cards>

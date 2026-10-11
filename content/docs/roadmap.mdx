@@ -1,0 +1,58 @@
+---
+title: Roadmap
+description: Where wakuwaku stands today, what 1.0.0 and 2.0.0 mean, and which Spring modules already have a wakuwaku counterpart.
+icon: Map
+---
+
+wakuwaku aims to be a powerful, robust microservice framework for Rust, in the way Spring is for Java. The version numbers mark how close it is to that goal.
+
+## Milestones
+
+### 1.0.0-rc1 (current)
+
+The current release is a release candidate. It contains the service builder, gRPC registration, cron jobs, typed events on Apache Iggy, capability-typed data access to PostgreSQL, MySQL, Redis, and Meilisearch, and proof-carrying validation. Everything listed as available in the table below ships in this release.
+
+### 1.0.0
+
+1.0.0 will be released once end-to-end tests on real-world projects pass. Until then, the release candidate can still change where those tests show it has to.
+
+### 2.0.0
+
+2.0.0 is the milestone at which every meaningful Spring module has a wakuwaku counterpart. The rows marked "not yet" below are the gap between today and 2.0.0.
+
+No dates are attached to these milestones.
+
+## Spring modules and their counterparts
+
+"Available" means the counterpart exists in 1.0.0-rc1. It does not mean that wakuwaku copies the Spring API. The counterparts are designed so that the compiler checks as much as possible, so they often work differently. [Coming from Spring](/en/docs/guides/coming-from-spring) explains the differences.
+
+| Spring                                                    | wakuwaku                                                                                | Status    |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------- | --------- |
+| Spring Framework core: IoC container, dependency injection | [`ServiceBuilder`, `ServiceCreation`](/en/docs/core/service-builder)                   | Available |
+| Spring Boot starters                                      | One `wakuwaku` dependency with [feature flags](/en/docs/getting-started/installation)  | Available |
+| Spring Boot auto-configuration, `@ConfigurationProperties`, profiles | none                                                                         | Not yet   |
+| Task scheduling (`@Scheduled(fixedRate = ...)`)           | [Cron jobs](/en/docs/services/cron-jobs) (fixed interval only, no cron expressions)    | Available |
+| gRPC (Spring gRPC, grpc-spring-boot-starter)              | [gRPC services](/en/docs/services/grpc)                                                 | Available |
+| Spring for Apache Kafka, Spring Cloud Stream, Spring AMQP | [Events on Apache Iggy](/en/docs/events)                                                | Available |
+| Spring Data JDBC / JPA repositories                       | [Queries](/en/docs/data/queries) and [sqlx](/en/docs/data/sqlx) (explicit SQL, no ORM) | Available |
+| Spring transaction management                             | [Transactions](/en/docs/data/transactions)                                              | Available |
+| Spring Data Redis                                         | [Redis](/en/docs/data/redis)                                                            | Available |
+| Spring Cache abstraction (Redis)                          | [Redis](/en/docs/data/redis) caches (explicit calls, no annotations)                    | Available |
+| Distributed locks (ShedLock, Spring Integration `RedisLockRegistry`) | [Redis](/en/docs/data/redis) locks                                           | Available |
+| Rate limiting (Spring Cloud Gateway `RedisRateLimiter`)   | [Redis](/en/docs/data/redis) token-bucket limiter                                       | Available |
+| Spring Data Elasticsearch (full-text search)              | [Meilisearch](/en/docs/data/meilisearch)                                                | Available |
+| Bean Validation (`@Valid`, Hibernate Validator)           | [Validation](/en/docs/validation)                                                       | Available |
+| Spring Boot Test                                          | [Testing](/en/docs/core/testing): components are unit-tested directly                   | Available |
+| Spring Web MVC / WebFlux (HTTP, REST)                     | none                                                                                    | Not yet   |
+| Spring Security                                           | none                                                                                    | Not yet   |
+| Spring Boot Actuator (health checks, metrics)             | none                                                                                    | Not yet   |
+| Micrometer metrics and tracing                            | none (wakuwaku logs errors through `tracing`)                                           | Not yet   |
+| Spring Cloud Config, service discovery, gateway, circuit breakers | none                                                                            | Not yet   |
+| Spring Batch                                              | none                                                                                    | Not yet   |
+| Spring Integration                                        | none                                                                                    | Not yet   |
+
+A "not yet" row means that wakuwaku has nothing for it today. Until a counterpart exists, use a Rust crate for that job next to wakuwaku. Components built with `ServiceCreation` can depend on any value you register, including clients from other crates.
+
+## Changes since 0.3
+
+0.3 was a set of utilities around RabbitMQ, Redis, and sqlx. 1.0.0-rc1 replaces most of them. See [Migrating from 0.3](/en/docs/guides/migrating-from-0.3).

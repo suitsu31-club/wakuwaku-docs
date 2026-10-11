@@ -1,0 +1,209 @@
+---
+title: Meilisearch
+description: Model Meilisearch indexes as entities, so searches, writes and tenant tokens are checked against capabilities like any other query.
+icon: Search
+---
+
+wakuwaku treats [Meilisearch](https://www.meilisearch.com) as one more data source behind the same [`Db<S, C>`](/en/docs/data/queries) handle you use for PostgreSQL and Redis. Three things set a search engine apart from a database, and the Meilisearch module is shaped around them:
+
+- **Queries may come straight from end users**, even from a browser that talks to Meilisearch directly. Filters and sorts are therefore typed and safe to deserialize from client JSON.
+- **An index is never the source of truth.** It holds a *projection* of data that lives elsewhere (usually a SQL table), so the important writes are the ones to that source, not to the index.
+- **An index has to be kept in sync** with that source, and the ways this can go wrong are well known. The [sync](/en/docs/data/meilisearch/sync) helpers handle the parts that are the same in every project.
+
+| Page | What it covers |
+|---|---|
+| This page | Enabling the feature, describing an index, capabilities and API keys |
+| [Search](/en/docs/data/meilisearch/search) | Typed filters and sorts, running a client's search under a server-enforced scope |
+| [Writes](/en/docs/data/meilisearch/writes) | Upserting and deleting documents, applying settings, waiting for tasks |
+| [Tenant tokens](/en/docs/data/meilisearch/tenant-tokens) | Letting a frontend query Meilisearch directly, safely |
+| [Sync](/en/docs/data/meilisearch/sync) | Keeping an index in sync with its source: write hooks, transaction hooks, full rebuilds |
+
+## Enabling the feature
+
+Meilisearch support is behind the `meilisearch` feature of `wakuwaku`. Your documents and filter fields are (de)serialized with serde, so add `serde` with its derive macros, and `serde_json` if you parse client requests yourself:
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["meilisearch"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+The feature enables [`wakuwaku::entity::meilisearch`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/index.html) (the `wakuwaku-entity` crate, re-exported as `wakuwaku::entity`) and re-exports the SDK it is built on (`meilisearch-sdk` 0.33) as `wakuwaku::deps::meilisearch_sdk`. Use that path for `Client`, `Settings` and the error type, so the versions always match.
+
+## Describing an index
+
+An index is described once, by a marker type implementing [`SearchIndex`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/trait.SearchIndex.html). That type is also an [`Entity`](/en/docs/data/queries), so everything you know about capabilities applies to it. A description has three parts: the document, the fields, and the index itself.
+
+### The document
+
+The document is what a search may return. Keep it a separate type from the row it is built from, and put only data every searcher may see in it: a frontend holding a [tenant token](/en/docs/data/meilisearch/tenant-tokens) can read every displayed attribute of every document its scope allows.
+
+```rust title="src/search/posts.rs"
+use serde::{Deserialize, Serialize};
+
+/// What a search may return. Only data every searcher may see goes here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostDocument {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub author_id: i64,
+    pub title: String,
+    pub summary: String,
+    pub tags: Vec<String>,
+    pub published_at: i64,
+}
+```
+
+### The filterable and sortable fields
+
+Each index lists the attributes searches may filter on, and those they may sort on, as fieldless enums implementing [`Field`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/trait.Field.html). `ALL` lists every variant; `name` gives the attribute name in the documents (use dots for nested attributes, such as `author.id`). Derive `Deserialize` so clients can name the fields in JSON.
+
+```rust title="src/search/posts.rs"
+use wakuwaku::entity::meilisearch::filter::Field;
+
+/// Attributes searches may filter and facet on.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostFilter {
+    WorkspaceId,
+    AuthorId,
+    Tags,
+    PublishedAt,
+}
+
+impl Field for PostFilter {
+    const ALL: &'static [Self] = &[
+        Self::WorkspaceId,
+        Self::AuthorId,
+        Self::Tags,
+        Self::PublishedAt,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::WorkspaceId => "workspace_id",
+            Self::AuthorId => "author_id",
+            Self::Tags => "tags",
+            Self::PublishedAt => "published_at",
+        }
+    }
+}
+
+/// Attributes searches may sort on.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostSort {
+    PublishedAt,
+}
+
+impl Field for PostSort {
+    const ALL: &'static [Self] = &[Self::PublishedAt];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::PublishedAt => "published_at",
+        }
+    }
+}
+```
+
+These enums are the single source of truth for what is filterable. When the settings are applied, the index gets exactly these filterable and sortable attributes, and a filter or sort naming anything else can't be built in Rust or deserialized from JSON. An index with nothing to filter or sort on uses [`NoField`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/enum.NoField.html).
+
+<Callout type="warn" title="Keep the serde names and `name()` in step">
+  The serde name is what clients send; `name()` is what Meilisearch receives. They are separate on purpose (a client-facing name may differ from the stored attribute), but nothing checks they agree. `#[serde(rename_all = "snake_case")]` with matching `name()` strings is the simplest way to keep them aligned.
+</Callout>
+
+### The index itself
+
+```rust title="src/search/posts.rs"
+use wakuwaku::deps::meilisearch_sdk::settings::{PaginationSetting, Settings};
+use wakuwaku::entity::Entity;
+use wakuwaku::entity::meilisearch::SearchIndex;
+
+/// The `posts` index: a projection of the `post` table.
+pub struct PostIndex;
+impl Entity for PostIndex {}
+
+impl SearchIndex for PostIndex {
+    const UID: &'static str = "posts";
+    const PRIMARY_KEY: &'static str = "id";
+    type Key = i64;
+    type Document = PostDocument;
+    type Filterable = PostFilter;
+    type Sortable = PostSort;
+
+    fn settings() -> Settings {
+        Settings::new()
+            .with_searchable_attributes(["title", "summary", "tags"])
+            .with_displayed_attributes([
+                "id",
+                "workspace_id",
+                "author_id",
+                "title",
+                "summary",
+                "tags",
+                "published_at",
+            ])
+            .with_pagination(PaginationSetting { max_total_hits: 1000 })
+    }
+}
+```
+
+| Item | Meaning |
+|---|---|
+| `UID` | The index uid in Meilisearch. |
+| `PRIMARY_KEY` | The attribute holding each document's primary key. |
+| `Key` | The type of that key: used to delete documents and to reindex them from the source. |
+| `Document` | What a search returns; results are deserialized as this type. |
+| `Filterable` / `Sortable` | The field enums above. |
+| `settings()` | Every other setting. Settings left unset keep their current value on the index. Filterable and sortable attributes are filled in from the enums, so don't set them here. |
+
+`settings()` is only written to Meilisearch when you run [`ApplySettings`](/en/docs/data/meilisearch/writes#applying-settings), typically once per deployment.
+
+## Indexes, entities and capabilities
+
+Because each index is its own entity, a query that searches `PostIndex` has the effect `Read<PostIndex>`, and a write to it has the effect `Write<PostIndex>`. Note what this does *not* say: searching the projection is not `Read<Post>`, and writing the index does not grant write access to the `post` table. A search service can read the index without any access to the database, and an indexer service can write the index without being able to write anything else.
+
+Map capabilities to Meilisearch API keys when you wire handles:
+
+| Handle | Capability | API key |
+|---|---|---|
+| Search on behalf of users | `ReadOnly` (or a narrower custom capability) | A key with the `search` action |
+| Indexer / sync worker | A custom capability writing only its indexes (see [Writes](/en/docs/data/meilisearch/writes#a-capability-for-the-indexer)) | A key with `documents.*`, `settings.*` and `tasks.get` on those indexes |
+| Signing tenant tokens | Any capability; it limits which indexes a token may list | A key with the `search` action and nothing else |
+
+The type system proves routing: code wired to a `Db<MeiliSource, ReadOnly>` never issues a write. The API key is what makes Meilisearch itself refuse. Use both, as you would keep a replica read-only in PostgreSQL.
+
+```rust title="src/search/handles.rs"
+use wakuwaku::deps::meilisearch_sdk::client::Client;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::entity::meilisearch::MeiliSource;
+use wakuwaku::entity::{Db, ReadOnly};
+
+/// A handle that may search every index and write none.
+pub fn search_handle(url: &str, search_key: &str) -> Result<Db<MeiliSource, ReadOnly>, Error> {
+    let client = Client::new(url, Some(search_key))?;
+    Ok(Db::new(MeiliSource::new(client)))
+}
+```
+
+`MeiliSource` wraps the client in an `Arc`, so cloning a handle is cheap.
+
+## Index settings are security settings
+
+Once a frontend talks to Meilisearch, or clients choose facets and sorts through your server, the index settings decide what they can learn. Review them like access rules:
+
+- **`displayedAttributes` defaults to every attribute.** Keep secrets out of the document type, and list the displayed attributes anyway.
+- **Every filterable attribute is also a facet.** A facet reveals value counts among the documents the client may see.
+- **`pagination.maxTotalHits`** bounds how deep a client can page.
+- **Any embedder configured on the index** can be triggered by any client allowed to search it.
+
+## Next steps
+
+<Cards>
+  <Card title="Search" href="/en/docs/data/meilisearch/search" description="Typed filters and scoped searches built from client JSON." />
+  <Card title="Writes" href="/en/docs/data/meilisearch/writes" description="Upserts, deletes, settings and asynchronous tasks." />
+  <Card title="Tenant tokens" href="/en/docs/data/meilisearch/tenant-tokens" description="Let a frontend search Meilisearch directly." />
+  <Card title="Sync" href="/en/docs/data/meilisearch/sync" description="Keep an index in sync with its source of truth." />
+</Cards>

@@ -1,0 +1,146 @@
+---
+title: データアクセス
+description: すべてのクエリが読み書きする対象を宣言し、それを実行するハンドルに権限があるかをコンパイラが検査する、ケイパビリティ型付きのデータアクセスです。
+icon: Database
+---
+
+wakuwaku のデータ層は `wakuwaku::entity`（`wakuwaku-entity` クレート）にあります。sqlx 経由の PostgreSQL / MySQL、Redis、Meilisearch を扱えますが、どのデータソースでも考え方は次の 3 つで共通です。
+
+1. **クエリは値です。** クエリは `FindUser { id: 7 }` のような 1 つの操作を表す普通の構造体です。リポジトリオブジェクトのメソッドではありません。
+2. **ハンドルはプロセッサです。** [`Db<S, C>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html) ハンドルは、実行してよいすべてのクエリ `Q` について kanau の `Processor<Q>` を実装します。クエリの実行は `db.process(query).await` です。cron ジョブやイベントハンドラも同じトレイトを使い、フック・トランザクション・テストダブルもこの上に組み立てられています。
+3. **ケイパビリティ型がエフェクトを網羅しなければなりません。** 各クエリは読み書きするエンティティを `Effect` として宣言し、各ハンドルはケイパビリティ型 `C` を持ちます。`Db<S, C>` が `Processor<Q>` を実装するのは `C: Covers<Q::Effect>` が成り立つときだけです。書き込みクエリを読み取り専用ハンドルに渡すと、プログラムはコンパイルできません。
+
+<CapabilityDiagram lang="ja" />
+
+Spring では、読み取りと書き込みの振り分けを `@Transactional(readOnly = true)` と、実行時にレプリカを選ぶルーティング用の `DataSource` で行うのが一般的です。振り分けを誤ると、レプリカが返すエラーで初めて気づきます。wakuwaku は振り分けの判断をハンドルの型に持たせるため、レプリカ用ハンドルを渡されたハンドラはそもそも書き込みクエリを発行できません。
+
+## エンティティ
+
+[`Entity`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/markers/trait.Entity.html) は、クエリが読み書きできる対象（テーブル、Redis のキー空間、検索インデックスなど）に型レベルで付けた名前です。
+
+```rust title="src/entities.rs"
+use wakuwaku::entity::Entity;
+
+/// `users` テーブル
+pub struct User;
+impl Entity for User {}
+
+/// `posts` テーブル
+pub struct Post;
+impl Entity for Post {}
+```
+
+エンティティ型は値として生成されることがなく、データソースにも結び付いていません。同じ `User` が PostgreSQL に保存され、Redis にキャッシュされていても構いません。粒度は、コンパイラに検査させたい単位で決めてください。最初は 1 テーブルにつき 1 エンティティにするのがよいでしょう。
+
+## ケイパビリティ [#capabilities]
+
+ケイパビリティも値として生成されることのない型です。ハンドルに何が許されるかを、2 つのマーカートレイトで表します。
+
+| トレイト | 意味 |
+|---|---|
+| `CanRead<E>` | `E` を読むクエリを実行できる |
+| `CanWrite<E>` | `E` に書き込むクエリを実行できる。書き込みは読み取りを含むため `CanRead<E>` が前提 |
+
+クレートには、すべてのエンティティを対象とするケイパビリティが 2 つ用意されています。
+
+| ケイパビリティ | 読み取り | 書き込み | 主な用途 |
+|---|---|---|---|
+| `ReadOnly` | すべて | なし | リードレプリカに接続したハンドル |
+| `ReadWrite` | すべて | すべて | プライマリに接続したハンドル |
+
+一部のエンティティにだけ書き込めるコンポーネントには、マーカーを実装して独自のケイパビリティを定義します。
+
+```rust title="src/overview.rs"
+use wakuwaku::entity::{CanRead, CanWrite, Covers, Entity, Read, ReadOnly, ReadWrite, Write};
+
+pub struct Order;
+impl Entity for Order {}
+
+pub struct AuditLog;
+impl Entity for AuditLog {}
+
+/// すべてを読み、監査ログにだけ書き込む
+pub enum Auditor {}
+impl<E: Entity> CanRead<E> for Auditor {}
+impl CanWrite<AuditLog> for Auditor {}
+```
+
+`Db<_, Auditor>` ハンドルは、読み取りクエリと `AuditLog` にだけ書き込むクエリを実行できます。`Order` に書き込むクエリを渡すとコンパイルエラーになります。
+
+## エフェクト [#effects]
+
+クエリの `Effect` は、エンティティへのアクセスの集合を型で表したものです。
+
+| エフェクト | 意味 | Kind |
+|---|---|---|
+| `Read<E>` | `E` を読む | `ReadKind` |
+| `Write<E>` | `E` に書き込む | `WriteKind` |
+| `()` | 何にも触れない（`SELECT 1`、`PING`） | `ReadKind` |
+| `(A, B, …)` | 要素の和集合。最大 12 要素で、入れ子にできる | いずれかの要素が書き込むなら `WriteKind` |
+
+すべてのエフェクトには [`Kind`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/io/trait.Kind.html) があり、何かに書き込むなら `WriteKind`、そうでなければ `ReadKind` です。Kind によって、そのクエリで[書き込みフック](/ja/docs/data/hooks)が動くかどうかと、[トランザクション](/ja/docs/data/transactions)を読み取り専用で開始するかどうかが決まります。
+
+`C: Covers<X>` は、ケイパビリティ `C` が `X` に含まれるすべてのアクセスについて `CanRead` / `CanWrite` マーカーを持つときに成り立ちます。マーカーから自動的に実装されるので、手で実装しないでください。これを使うと、ケイパビリティについての事実をコンパイル時のアサーションとして書けます。
+
+```rust title="src/overview.rs"
+// どのケイパビリティがどのエフェクトを網羅するかをコンパイル時に検査する
+fn covers<C: Covers<X>, X>() {}
+
+pub fn checks() {
+    covers::<ReadOnly, (Read<Order>, Read<AuditLog>)>();
+    covers::<ReadWrite, (Read<Order>, Write<Order>)>();
+    covers::<Auditor, (Read<Order>, Write<AuditLog>)>();
+    covers::<ReadOnly, ()>();
+    // 入れ子のタプルも和集合になる
+    covers::<Auditor, ((Read<Order>,), (Read<AuditLog>, Write<AuditLog>))>();
+}
+```
+
+ここに `covers::<ReadOnly, Write<Order>>()` を加えると、コンパイルできなくなります。
+
+## 型が証明すること、しないこと
+
+ケイパビリティ検査が証明するのは**振り分け**です。`Db<_, ReadOnly>` を渡されたコードは、書き込みと*宣言された*クエリを決して発行しません。ただし、次の点はコンパイラからは見えません。
+
+- **宣言そのもの。** クエリ内の SQL が `Effect` と一致しているかは検査されません。`Read<User>` と宣言したクエリで `UPDATE` を実行してもコンパイルは通ります。文が触れるエンティティはすべて宣言してください。
+- **接続先。** `Db::new` は、書かれた型からケイパビリティを決めるだけです。背後のプールがプライマリとレプリカのどちらにつながっているかは分かりません。書き込めるケイパビリティは書き込み可能なデータベースに接続したデータソースからだけ作り、組み立ては 1 か所にまとめてください。
+
+<Callout type="warn" title="レプリカ側のデータベースの保護は残す">
+読み取りと宣言したクエリが実際には書き込む可能性があるので、データベース自身の保護は残しておきます。PostgreSQL のホットスタンバイは書き込みを拒否します。プライマリでも、読み取り専用で使うロールには同じ保護を設定できます。
+
+```sql
+ALTER ROLE app_reader SET default_transaction_read_only = on;
+```
+</Callout>
+
+ハンドルを経由してこの検査を迂回することはできません。`Db` はデータソースを、sqlx のデータソースはプールを外に公開しないので、何かを実行する手段は、ケイパビリティが網羅するエフェクトを持つクエリだけです。マイグレーションなどの準備は、プールをラップする*前に*行ってください。
+
+## フィーチャー
+
+必要なデータソースを `wakuwaku` のフィーチャーで有効にします。どれを有効にしても `entity` モジュールが使えるようになります。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+```
+
+| フィーチャー | データソース | サードパーティクレート | ガイド |
+|---|---|---|---|
+| `entity` | なし（エンティティ、エフェクト、クエリ、`Db`、フック） | | このセクション |
+| `sqlx-pg` | `entity::sqlx::backend::PgSource` | `wakuwaku::deps::sqlx` | [sqlx](/ja/docs/data/sqlx)、[トランザクション](/ja/docs/data/transactions) |
+| `sqlx-mysql` | `entity::sqlx::backend::MySqlSource` | `wakuwaku::deps::sqlx` | [sqlx](/ja/docs/data/sqlx)、[トランザクション](/ja/docs/data/transactions) |
+| `redis` | `entity::redis::RedisSource` | `wakuwaku::deps::redis` | [Redis](/ja/docs/data/redis) |
+| `meilisearch` | `entity::meilisearch::MeiliSource` | `wakuwaku::deps::meilisearch_sdk` | [Meilisearch](/ja/docs/data/meilisearch) |
+
+`entity` だけを有効にするのは、エンティティとクエリの定義だけを置くクレートや、独自の `DataSource` を実装する場合です。サードパーティクレートは `wakuwaku::deps` から import してください。そうすれば、wakuwaku がビルドされたときと常に同じバージョンを使えます。
+
+## このセクションの内容
+
+<Cards>
+  <Card title="クエリとハンドル" href="/ja/docs/data/queries" description="クエリを定義し、Db ハンドルを作り、読み取りをレプリカへ振り分け、コンポーネントに注入します。" />
+  <Card title="書き込みフック" href="/ja/docs/data/hooks" description="すべての書き込みの前後で、監査・キャッシュ無効化・検索インデックス同期を行います。" />
+  <Card title="sqlx" href="/ja/docs/data/sqlx" description="PostgreSQL と MySQL のデータソース。" />
+  <Card title="トランザクション" href="/ja/docs/data/transactions" description="純粋な状態機械として書くトランザクション。" />
+  <Card title="Redis" href="/ja/docs/data/redis" description="キャッシュ、ロック、レートリミッター、変化を追える構造。" />
+  <Card title="Meilisearch" href="/ja/docs/data/meilisearch" description="検索インデックスをエンティティとして扱い、元データと同期させます。" />
+</Cards>

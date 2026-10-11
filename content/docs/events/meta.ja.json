@@ -1,0 +1,13 @@
+{
+  "title": "イベント (Iggy)",
+  "icon": "Radio",
+  "pages": [
+    "index",
+    "defining-events",
+    "publishing",
+    "consuming",
+    "ordering",
+    "algebra",
+    "error-handling"
+  ]
+}

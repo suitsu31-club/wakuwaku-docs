@@ -1,0 +1,117 @@
+---
+title: レートリミッター
+description: Redis に置いたトークンバケットをサーバーの時刻で連続的に補充し、呼び出し側が行動できる頻度を制限します。
+icon: Gauge
+---
+
+[`TokenBucket`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/token_bucket_limiter/struct.TokenBucket.html) は、名前ごとに何かが起こる頻度を制限します。IP アドレスごとのログイン試行、テナントごとの API 呼び出し、アカウントごとのエクスポート行数などです。状態は Redis にあるので、制限はサービスのすべてのレプリカにまたがって効きます。
+
+## モデル
+
+各名前は最大 `capacity` 個のトークンを持つバケットを持ち、`period` あたり `tokens` 個という一定の `Rate` で連続的に補充されます。リクエストは `cost` 個のトークンを取り、バケットの残りがそれより少なければ拒否されます。拒否されたリクエストは何も取りません。
+
+- **バースト** は `capacity` で上限が決まります。満杯のバケットはその数のリクエストを一度に通します。
+- **持続的なスループット** はレートで上限が決まります。バケットが空になると、トークンが戻る速さでしかリクエストは通りません。
+- バケットは **満杯から始まる** ので、初めて見る名前はバースト分をまるごと得ます。
+
+### 計算
+
+各リクエストでは、サーバー時刻 `now` において、保存された状態 `tokens` と `ts`（最終更新時刻）から次のように計算します。
+
+```text
+refill   = tokens_per_period / period
+tokens   = min(capacity, tokens + (now - ts) × refill)
+
+if cost > capacity:   Denied { retry_after: None }        // 決して成功しない
+if tokens >= cost:    tokens -= cost; Allowed { remaining: floor(tokens) }
+else:                 Denied { retry_after: ceil((cost - tokens) / refill) }
+
+store tokens, ts = now
+expire the key after ceil((capacity - tokens) / refill)   // 再び満杯になる時刻
+```
+
+`retry_after` は、*他に誰もトークンを取らなければ* バケットに十分なトークンが貯まるまでの時間で、ミリ秒単位に切り上げられます。内部ではトークンは小数として扱われるので、遅いレートでも滑らかに補充されます。`remaining` は整数のトークン数を報告します。
+
+たとえば `capacity = 20`、`Rate::new(1, 3 s)` の場合、連続した 20 回のリクエストは許可され、21 回目は `retry_after` が 3 秒で拒否されます。60 秒放置された名前は再び満杯になり、その時点でキーは失効しています。アイドルな名前は Redis のメモリを消費しません。
+
+## 使い方
+
+```rust title="src/login.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::token_bucket_limiter::{Admission, Rate, TokenBucket};
+
+/// アドレスごとに最大 20 回のバースト、3 秒ごとに 1 回分を補充。
+pub const LOGINS: TokenBucket<str> =
+    TokenBucket::new("login", 20, Rate::new(1, Duration::from_secs(3)));
+
+pub enum Verdict {
+    Proceed,
+    TooManyRequests { retry_after_secs: Option<u64> },
+}
+
+pub async fn check_login(redis: &Redis, address: &str) -> RedisResult<Verdict> {
+    Ok(match redis.process(LOGINS.acquire(address, 1)).await? {
+        Admission::Allowed { remaining } => Verdict::Proceed,
+        Admission::Denied { retry_after } => Verdict::TooManyRequests {
+            // `Retry-After` ヘッダーのために切り上げる。
+            retry_after_secs: retry_after.map(|wait| wait.as_millis().div_ceil(1000) as u64),
+        },
+    })
+}
+
+pub async fn on_login_success(redis: &Redis, address: &str) -> RedisResult<()> {
+    redis.process(LOGINS.reset(address)).await?;
+    Ok(())
+}
+```
+
+- `acquire(name, cost)` は `Admission` を出力します。`Allowed { remaining }` か `Denied { retry_after }` です。
+- `reset(name)` はバケットを削除し、次のリクエストが満杯のバケットを見るようにします。バケットが使われていたかどうかを出力します。
+
+`Rate::per_second(n)` は `Rate::new(n, Duration::from_secs(1))` の短縮形です。`period` はマイクロ秒単位の整数で扱われます。
+
+### 重み付きリクエスト
+
+`cost` は 1 である必要はありません。作業の大きさに応じて課金すれば、呼び出し回数ではなく単位量でクォータを課せます。
+
+```rust
+/// テナントごとに 10 000 トークンのクォータ、毎秒 50 補充。
+pub const EXPORT_QUOTA: TokenBucket<u64> =
+    TokenBucket::new("export-rows", 10_000, Rate::per_second(50));
+
+pub async fn export_rows(redis: &Redis, tenant: u64, rows: u64) -> RedisResult<Admission> {
+    redis.process(EXPORT_QUOTA.acquire(&tenant, rows)).await
+}
+```
+
+`capacity` を超えるコストのリクエストは決して許可されず、`retry_after: None` で拒否されます。リトライすべきものではなく、クライアントのエラー（リクエストを分割すべき）として扱ってください。
+
+## 保証
+
+- **アトミック。** 計算全体が 1 つの Lua スクリプトで実行されるので、何台のレプリカから同時にリクエストが来ても、同じトークンが二重に使われることはありません。
+- **時計は 1 つ。** スクリプトは呼び出し側の時計ではなく Redis の `TIME` で時刻を読むため、レプリカ間の時計のずれでレートが歪むことはありません。これにはスクリプトの effects replication が必要で、Redis 5 以降はこれがデフォルトです。
+- **メモリは有界。** 各キーは、そのバケットが再び満杯になる時点で失効します。
+
+## コンパイラが捕まえるミス
+
+レートは少なくとも 1 トークンを補充しなければなりません。`Rate::new` はそうでない場合に panic する `const fn` なので、リミッターを `const` として宣言すれば、このミスはビルドエラーになります。
+
+```rust
+const BROKEN: TokenBucket<str> = TokenBucket::new("broken", 10, Rate::new(0, Duration::from_secs(1)));
+// error[E0080]: evaluation panicked: a rate must refill at least one token
+```
+
+## 落とし穴
+
+- **容量 0** はコスト 0 のリクエストしか通しません。`cost >= 1` のリクエストはすべて `retry_after: None` で拒否されます。
+- **acquire は常に書き込む。** `acquire` は拒否する場合でもバケットを更新するので、エフェクトは `Write<TokenBucket<N>>` です。`Db<_, ReadOnly>` ではリミッターを使えません。
+- **名前は慎重に選ぶ。** プロキシの背後で IP アドレスごとに制限すると、プロキシを制限することになります。ユーザー ID ごとの制限では、まだユーザーが分からないログインのエンドポイントは守れません。
+
+## 次のステップ
+
+<Cards>
+  <Card title="ロック" href="/ja/docs/data/redis/lock" description="頻度ではなく、同時にいくつかを制限します。" />
+  <Card title="パイプ" href="/ja/docs/data/redis/pipe" description="クラスターのどこにいる受信者にもメッセージを送ります。" />
+</Cards>

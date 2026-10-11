@@ -1,0 +1,117 @@
+---
+title: Rate limiter
+description: Limit how often a caller may act with token buckets kept in Redis and refilled continuously by the server clock.
+icon: Gauge
+---
+
+[`TokenBucket`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/token_bucket_limiter/struct.TokenBucket.html) limits how often something happens per name: login attempts per IP address, API calls per tenant, exported rows per account. Because the state lives in Redis, the limit holds across every replica of your service.
+
+## The model
+
+Each name has a bucket holding up to `capacity` tokens, refilled continuously at a fixed `Rate` of `tokens` per `period`. A request takes `cost` tokens and is denied if the bucket holds fewer; a denied request takes nothing.
+
+- **Bursts** are bounded by `capacity`: a full bucket admits that many requests at once.
+- **Sustained throughput** is bounded by the rate: once the bucket is empty, requests are admitted only as fast as tokens come back.
+- A bucket **starts full**, so a name that was never seen gets the whole burst.
+
+### The math
+
+On each request, at server time `now`, with the stored state `tokens` and `ts` (time of the last update):
+
+```text
+refill   = tokens_per_period / period
+tokens   = min(capacity, tokens + (now - ts) × refill)
+
+if cost > capacity:   Denied { retry_after: None }        // can never succeed
+if tokens >= cost:    tokens -= cost; Allowed { remaining: floor(tokens) }
+else:                 Denied { retry_after: ceil((cost - tokens) / refill) }
+
+store tokens, ts = now
+expire the key after ceil((capacity - tokens) / refill)   // when it would be full again
+```
+
+`retry_after` is how long until the bucket holds enough tokens *if nothing else takes any*, rounded up to the millisecond. Tokens are fractional internally, so a slow rate still refills smoothly; `remaining` reports whole tokens.
+
+For example, with `capacity = 20` and `Rate::new(1, 3 s)`: 20 rapid requests are allowed, the 21st is denied with `retry_after` of 3 s, and a name left alone for 60 s is full again, at which point its key has expired. Idle names cost nothing in Redis.
+
+## Usage
+
+```rust title="src/login.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::token_bucket_limiter::{Admission, Rate, TokenBucket};
+
+/// Bursts of up to 20 attempts per address, refilled at 1 every 3 seconds.
+pub const LOGINS: TokenBucket<str> =
+    TokenBucket::new("login", 20, Rate::new(1, Duration::from_secs(3)));
+
+pub enum Verdict {
+    Proceed,
+    TooManyRequests { retry_after_secs: Option<u64> },
+}
+
+pub async fn check_login(redis: &Redis, address: &str) -> RedisResult<Verdict> {
+    Ok(match redis.process(LOGINS.acquire(address, 1)).await? {
+        Admission::Allowed { remaining } => Verdict::Proceed,
+        Admission::Denied { retry_after } => Verdict::TooManyRequests {
+            // Round up for the `Retry-After` header.
+            retry_after_secs: retry_after.map(|wait| wait.as_millis().div_ceil(1000) as u64),
+        },
+    })
+}
+
+pub async fn on_login_success(redis: &Redis, address: &str) -> RedisResult<()> {
+    redis.process(LOGINS.reset(address)).await?;
+    Ok(())
+}
+```
+
+- `acquire(name, cost)` outputs an `Admission`: `Allowed { remaining }` or `Denied { retry_after }`.
+- `reset(name)` deletes the bucket, so the next request finds it full. It outputs whether the bucket had been used.
+
+`Rate::per_second(n)` is shorthand for `Rate::new(n, Duration::from_secs(1))`. `period` is measured in whole microseconds.
+
+### Weighted requests
+
+`cost` doesn't have to be 1. Charge by the size of the work to enforce a quota in units rather than calls:
+
+```rust
+/// 10 000 tokens of quota per tenant, 50 per second.
+pub const EXPORT_QUOTA: TokenBucket<u64> =
+    TokenBucket::new("export-rows", 10_000, Rate::per_second(50));
+
+pub async fn export_rows(redis: &Redis, tenant: u64, rows: u64) -> RedisResult<Admission> {
+    redis.process(EXPORT_QUOTA.acquire(&tenant, rows)).await
+}
+```
+
+A request costing more than `capacity` can never be admitted; it is denied with `retry_after: None`. Treat that as a client error (split the request) rather than something to retry.
+
+## Guarantees
+
+- **Atomic.** The whole computation runs in one Lua script, so concurrent requests from any number of replicas never spend the same token twice.
+- **One clock.** The script reads the time with Redis' `TIME`, not the caller's clock, so clock skew between replicas doesn't distort the rate. This needs effects replication of scripts, the default since Redis 5.
+- **Bounded memory.** Each key expires once its bucket would be full again.
+
+## Mistakes the compiler catches
+
+A rate must refill at least one token. `Rate::new` is a `const fn` that panics otherwise, so declaring the limiter as a `const` turns the mistake into a build error:
+
+```rust
+const BROKEN: TokenBucket<str> = TokenBucket::new("broken", 10, Rate::new(0, Duration::from_secs(1)));
+// error[E0080]: evaluation panicked: a rate must refill at least one token
+```
+
+## Pitfalls
+
+- **Capacity of zero** admits only zero-cost requests: every request with `cost >= 1` is denied with `retry_after: None`.
+- **Every acquire writes.** `acquire` updates the bucket even when it denies, so its effect is `Write<TokenBucket<N>>`, and a `Db<_, ReadOnly>` can't use the limiter.
+- **Choose the name carefully.** Limiting by IP address behind a proxy limits the proxy; limiting by user ID doesn't protect the login endpoint, where the user is not known yet.
+
+## Next steps
+
+<Cards>
+  <Card title="Locks" href="/en/docs/data/redis/lock" description="Limit how many at once rather than how often." />
+  <Card title="Pipes" href="/en/docs/data/redis/pipe" description="Send messages to one receiver anywhere in the cluster." />
+</Cards>

@@ -1,0 +1,225 @@
+---
+title: Spring から来た方へ
+description: Bean、コンストラクタインジェクション、@Scheduled、@KafkaListener、@Transactional といった Spring の概念が wakuwaku の何に対応し、どこが違うのか。
+icon: Coffee
+---
+
+Spring Boot でサービスを作ったことがあれば、wakuwaku の多くの概念には見覚えがあるはずです。共有コンポーネントのレジストリ、依存から組み立てられるコンポーネント、スケジュールされたジョブ、メッセージリスナー、リポジトリ、バリデーションなどです。違うのは、*いつ* 検査されるかです。Spring は起動時にリフレクションでアプリケーションを組み立てます。wakuwaku は型によって組み立てるため、Spring がアプリケーションの起動時に報告するミスの多くは、wakuwaku ではコンパイルエラーになります。
+
+このページの Java のコードは説明用です。比較対象となる Spring の書き方を示すもので、完全なプログラムではありません。
+
+## 概念の対応表
+
+| Spring                                                    | wakuwaku                                                                 | 補足 |
+| --------------------------------------------------------- | ------------------------------------------------------------------------ | ---- |
+| `ApplicationContext`、`@Configuration` + `@Bean`          | [`ServiceBuilder::new(..).push(..)`](/ja/docs/core/service-builder)      | レジストリは `main` で自分で組み立てます。型による解決をコンパイラが行います。 |
+| コンストラクタインジェクション                            | [`ServiceCreation::Dep`](/ja/docs/core/service-builder)                  | 1 つのコンポーネントにつき依存はちょうど 1 つです。複数必要なら構造体にまとめて登録します。 |
+| `@Component` のスキャン                                   | なし                                                                     | すべてのコンポーネントを明示的に登録します。 |
+| `@Value`、`@ConfigurationProperties`                      | なし                                                                     | 設定用の構造体を自分で作り、他の依存と同じように登録します。 |
+| `@Scheduled(fixedRate = ...)`                             | [`CronJob::INTERVAL`](/ja/docs/services/cron-jobs)                       | 同じジョブの実行は重なりません。間隔を超えた実行は、その間のティックをスキップします。cron 式はありません。 |
+| `@KafkaListener`                                          | [`EventHandler`](/ja/docs/events/consuming) + `ServiceBuilder::iggy_consumer` | ブローカーは Kafka ではなく Apache Iggy です。ハンドラーは 1 つのキーのイベントをバッチで受け取ります。 |
+| `KafkaTemplate.send`                                      | [`Publisher::publish`](/ja/docs/events/publishing)                       | イベントのキーがトピックとパーティションを決めます。 |
+| Spring Data のリポジトリメソッド                          | `Query` + `Execute` を実装した [クエリの値](/ja/docs/data/queries)       | 各クエリは、読み書きするエンティティを宣言する構造体です。ORM やメソッド名からのクエリ導出はありません。 |
+| `@Transactional(readOnly = true)`                         | [`Db<S, ReadOnly>`](/ja/docs/data/queries)                               | ハンドルが持つケイパビリティで、コンパイル時に検査されます。後述します。 |
+| `@Transactional`                                          | [`Transaction` + `TxFlow`](/ja/docs/data/transactions)                   | トランザクションは値です。メソッドを包むプロキシではなく、ドライバーが実行するステートマシンです。 |
+| JPA のエンティティリスナー、`@TransactionalEventListener` | [`BeforeWrite` / `AfterWrite` フック](/ja/docs/data/hooks)              | フックはハンドルを包み、書き込みクエリの前後で動きます。 |
+| Bean Validation (`@Valid`、`@NotBlank`)                   | [`wakuwaku::proof`](/ja/docs/validation)                                 | 検査が成功すると `Proven<T, P>` が返り、正しい入力を必要とする関数はこの型を受け取ります。 |
+| `@Cacheable`                                              | [Redis の `Cache`](/ja/docs/data/redis)                                  | アノテーション駆動ではありません。Spring の `Cache` や `RedisTemplate` を直接使うときのように、`get` と `put` を自分で呼びます。 |
+| ShedLock (`@SchedulerLock`)                               | [Redis の `Lock`](/ja/docs/data/redis)                                   | リースに基づき、待機しません。取得はトークンか `None` を返します。ジョブの実行の中で取得します。 |
+| grpc-spring-boot-starter (`@GrpcService`)                 | [`ServiceBuilder::grpc_service`](/ja/docs/services/grpc)                 | レジストリから tonic のサーバーを組み立てます。tonic のサーバーの起動は自分で行います。 |
+| `SpringApplication.run`                                   | 自分で書く `#[tokio::main]` 関数                                         | コンポーネントの起動と停止は明示的です。[ライフサイクル](/ja/docs/core/lifecycle) を参照してください。 |
+
+まだ対応物がない Spring のモジュールについては [ロードマップ](/ja/docs/roadmap) を参照してください。
+
+## Bean、インジェクション、スケジューリング
+
+Spring では、コンテナが `DigestJob` を見つけ、コンストラクタの引数に合う Bean を探し、スケジュールされたメソッドを起動します。
+
+```java tab="Spring"
+@Component
+class DigestJob {
+    private final JdbcTemplate jdbc;
+    private final Mailer mailer;
+
+    DigestJob(JdbcTemplate jdbc, Mailer mailer) {
+        this.jdbc = jdbc;
+        this.mailer = mailer;
+    }
+
+    @Scheduled(fixedRate = 60 * 60 * 1000)
+    void run() {
+        // Query `jdbc`, send mail with `mailer`.
+    }
+}
+```
+
+```rust tab="wakuwaku"
+use std::convert::Infallible;
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::PgPool;
+use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+
+#[derive(Clone)]
+struct Mailer;
+
+/// Everything `DigestJob` needs, registered as one value.
+#[derive(Clone)]
+struct DigestDeps {
+    pool: PgPool,
+    mailer: Mailer,
+}
+
+struct DigestJob {
+    deps: DigestDeps,
+}
+
+impl ServiceCreation for DigestJob {
+    type Dep = DigestDeps;
+    fn create_service(deps: DigestDeps) -> Self {
+        Self { deps }
+    }
+}
+
+impl Processor<CronTick> for DigestJob {
+    type Output = ();
+    type Error = Infallible;
+    async fn process(&self, _tick: CronTick) -> Result<(), Infallible> {
+        // Query `self.deps.pool`, send mail with `self.deps.mailer`.
+        Ok(())
+    }
+}
+
+impl CronJob for DigestJob {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+}
+
+async fn run(pool: PgPool) {
+    let mailer = Mailer;
+    let (services, cron) = ServiceBuilder::new(pool.clone())
+        .push(mailer.clone())
+        .push(DigestDeps { pool, mailer })
+        .cron_job::<DigestJob, _>()
+        .start();
+
+    tokio::signal::ctrl_c().await.ok();
+    cron.shutdown().await;
+}
+```
+
+注目すべき点は次のとおりです。
+
+- **登録は明示的です。** `ServiceBuilder::new(..).push(..)` が `@Bean` メソッドの役割を果たします。クラスパスから自動で見つかるものはありません。
+- **1 つのコンポーネントにつき依存は 1 つです。** 引数が複数あるコンストラクタの代わりに、コンポーネントは `Dep` 型を 1 つ指定します。複数のものが必要なら、`DigestDeps` のようにそれらをまとめた構造体を登録します。依存はコンポーネントへクローンされるので、安価にクローンできるもの (プール、ハンドル、`Arc`) にしてください。
+- **スケジュールは定数です。** `INTERVAL` はジョブの型の一部です。間隔が 0 だとビルドできません。
+- **シャットダウンは自分で行います。** `start()` は `CronRuntime` を返します。`shutdown().await` を呼ぶと、実行中の処理を完了させてから停止します。
+
+## 主な違い
+
+### 配線はコンパイル時に検査される
+
+Spring はコンテキストの起動時に Bean を解決します。Bean が足りなければ、起動時、あるいはコンテキストを読み込む最初の統合テストで `NoSuchBeanDefinitionException` になります。
+
+`ServiceBuilder` は型レベルのリストで、依存を探すことはトレイト境界そのものです。次の例では、`ExpireSessions` は `Dep` が `SessionStore` の cron ジョブですが、登録されているのは `Config` だけです。
+
+```rust
+// `SessionStore` was never registered.
+let (_services, cron) = ServiceBuilder::new(Config)
+    .cron_job::<ExpireSessions, _>()
+    .start();
+```
+
+これはコンパイルできません。
+
+```text
+error[E0277]: the trait bound `(): ProvideAt<SessionStore, _>` is not satisfied
+   --> src/main.rs:38:10
+    |
+ 38 |         .cron_job::<ExpireSessions, _>()
+    |          ^^^^^^^^ the trait `ProvideAt<SessionStore, _>` is not implemented for `()`
+```
+
+ビルダーには実行時のマップも `Any` もありません。配線のミスが本番に出ることはありません。依存解決の仕組みは [サービスビルダー](/ja/docs/core/service-builder) で説明しています。
+
+### クラスパススキャン、プロキシ、AOP はない
+
+Spring の `@Transactional`、`@Cacheable`、`@Async` は、コンテナが Bean のまわりに生成するプロキシによって機能します。同じクラスの中からアノテーション付きのメソッドを呼ぶとプロキシを経由しないため、アノテーションは何も言わずに無視されます。
+
+wakuwaku にプロキシはありません。コードのまわりで動くものはすべて、型に現れる値です。
+
+- トランザクションは、データベースハンドルで処理する `Transaction` という値です。
+- 書き込みクエリのまわりのフックは、`AfterWrite<Db<..>, ..>` のようなラッパー型です。
+- キャッシュの読み取りは `Cache::get` の呼び出しです。
+
+コードに書いてあるものが、そのまま実行されます。
+
+### 読み取り専用はヒントではなく型
+
+`@Transactional(readOnly = true)` は、トランザクションマネージャーと JDBC ドライバーへのヒントで、実行時にメソッド単位で適用されます。wakuwaku では、読み取り専用はデータベースハンドルのケイパビリティです。`Db<PgSource, ReadOnly>` を持つコードは、宣言された効果が読み取りであるクエリしか実行できません。
+
+```rust
+/// Wired to a replica: only queries whose effect `ReadOnly` covers compile.
+struct UserStats {
+    db: Db<PgSource, ReadOnly>,
+}
+
+impl UserStats {
+    async fn total(&self) -> Result<i64, sqlx::Error> {
+        self.db.process(CountUsers).await
+    }
+}
+```
+
+`Write<User>` と宣言されたクエリをこのハンドルに渡すと、コンパイルエラーになります。
+
+```text
+error[E0277]: the trait bound `ReadOnly: CanWrite<User>` is not satisfied
+  --> src/main.rs:25:8
+   |
+25 |     db.process(DeleteUser(1)).await
+   |        ^^^^^^^ the trait `CanWrite<User>` is not implemented for `ReadOnly`
+```
+
+<Callout type="warn" title="型が証明すること">
+ケイパビリティが証明するのはルーティングです。読み取り専用のハンドルにつながったコードは、書き込みと *宣言された* クエリを決して送りません。しかし、読み取りと宣言されたクエリの中の SQL が書き込まないことまでは証明できません。レプリカでは、ホットスタンバイや `default_transaction_read_only` など、データベース側の防御も残してください。
+</Callout>
+
+### バリデーションの結果が型になる
+
+Bean Validation はアノテーションの付いたフィールドを検査し、制約を満たさなければ例外を投げます。検証済みのオブジェクトの型には、検査されたという事実は何も残りません。`wakuwaku::proof` では、検査が成功すると `Proven<T, P>` が返り、正しい入力を必要とする関数はこの型を要求します。
+
+```java tab="Spring"
+record SignUp(@NotBlank String username) {}
+
+@PostMapping("/sign-up")
+void signUp(@Valid @RequestBody SignUp request) {
+    register(request.username()); // register(String) accepts anything
+}
+```
+
+```rust tab="wakuwaku"
+// Cannot be called with a plain `String`.
+fn register(name: Proven<String, NonEmpty>) {
+    println!("registering {}", name.subject());
+}
+
+async fn sign_up(raw: String) -> Result<(), ValidateError<Infallible>> {
+    let name = prove::<_, NonEmpty>(raw, &NoContext, CheckOrder::Sequential).await?;
+    register(name);
+    Ok(())
+}
+```
+
+述語 (predicate) は非同期で、I/O を行えます。たとえばユーザー名が使用済みでないかを確認できます。`And` や `Or` で組み合わせることもできます。[バリデーション](/ja/docs/validation) を参照してください。
+
+### コンテキストなしでテストする
+
+本物の Bean が必要な Spring のテストでは、たいてい `@SpringBootTest` でアプリケーションコンテキストを起動します。wakuwaku のコンポーネントはただの値です。`create_service` で生成し、`process` や `handle` を呼び、結果を確認します。配線はコンパイラがすでに検査しているので、ユニットテストは振る舞いに集中できます。完全な例は [クイックスタート](/ja/docs/getting-started/quick-start#test-the-job) に、その他のパターンは [テスト](/ja/docs/core/testing) にあります。
+
+## 次のステップ
+
+<Cards>
+  <Card title="証明駆動プログラミング" href="/ja/docs/core/proof-driven" description="配線をコンパイル時に、振る舞いをユニットテストで検査する考え方。" />
+  <Card title="サービスビルダー" href="/ja/docs/core/service-builder" description="依存を登録し、そこからコンポーネントを組み立てる方法。" />
+  <Card title="ロードマップ" href="/ja/docs/roadmap" description="現時点で対応物がある Spring のモジュール。" />
+</Cards>

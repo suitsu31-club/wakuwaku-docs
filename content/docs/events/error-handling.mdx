@@ -1,0 +1,247 @@
+---
+title: Error handling
+description: Classify handler failures as Transient, Retryable or Unrecoverable, and understand the retry topic, key quarantine and what is dropped.
+icon: ShieldAlert
+---
+
+A consumer in production meets three very different kinds of failure: the database is down, one particular key hit a conflict, or an event can never be applied. wakuwaku makes you say which one happened, and reacts accordingly. Your handler returns a [`HandleError`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/struct.HandleError.html), and its [`ErrorClass`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.ErrorClass.html) decides what the consumer does next.
+
+## `HandleError` [#handle-error]
+
+`HandleError` wraps any error that converts into `anyhow::Error` (every `std::error::Error + Send + Sync + 'static` does) together with a class. Build it with one of the constructors:
+
+```rust
+HandleError::transient(error)      // ErrorClass::Transient
+HandleError::retryable(error)      // ErrorClass::Retryable
+HandleError::unrecoverable(error)  // ErrorClass::Unrecoverable
+HandleError::new(ErrorClass::Retryable, error)
+```
+
+Both types live in `wakuwaku::iggy::error`. `HandleError::class` and `HandleError::source` give the class and the wrapped error back, which is handy in tests.
+
+## The three classes [#classes]
+
+| Class           | Scope of the failure     | What the consumer does                                                   | Partition progress | Events lost                         |
+|-----------------|--------------------------|--------------------------------------------------------------------------|--------------------|-------------------------------------|
+| `Transient`     | infrastructure           | retries the same chunk in place until it succeeds                        | blocked            | none                                |
+| `Retryable`     | this key                 | moves the key's unfinished work to `retry_<topic>` and quarantines the key | continues         | only if every retry attempt fails   |
+| `Unrecoverable` | this chunk               | drops the chunk, logs it, continues with the rest of the run             | continues          | the chunk                           |
+
+<RetryDiagram lang="en" />
+
+### Transient [#transient]
+
+Use `Transient` when **nothing would succeed right now**: the database or a required service is unreachable. The consumer calls your handler again with the *same chunk*, sleeping between attempts according to [`ConsumerConfig::retry_delays`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/struct.ConsumerConfig.html#structfield.retry_delays): `retry_delays[0]` after the first failure, `retry_delays[1]` after the second, and so on; once the list is exhausted its last delay repeats forever. With the defaults that is 2 s, 4 s, 8 s, 16 s, 16 s, 16 s, …
+
+There is no limit on the number of attempts. While the chunk is retried, its key cannot advance, the batch cannot finish, and the partition task polls neither the main topic nor the retry topic. Other keys of the same batch still finish their current work, then wait. This is deliberate: when the database is down, moving on would only fail every other key too.
+
+The consumer's own Iggy calls (polling, storing offsets, writing retry records) are retried the same way, with the same delays.
+
+<Callout type="warn" title="Never return Transient for a bad event">
+  A `Transient` error caused by the event itself (bad data, a missing row) retries forever and stalls the whole partition. Only use it for failures that are independent of the event.
+</Callout>
+
+### Retryable [#retryable]
+
+Use `Retryable` when **this key failed but others are fine**, and a later attempt may succeed: a deadlock, a serialization failure, a row that another stream has not created yet.
+
+When a run fails with `Retryable` while the consumer processes the main topic:
+
+1. **The key stops.** Its other runs in the same stage still finish (body runs are concurrent), but later stages and segments of the key are not started.
+2. **Unfinished work goes to the retry topic.** The consumer writes to partition *p* of `retry_<topic>` (for main partition *p*):
+   - the failed chunk and every later chunk of the failed run;
+   - every run of the later stages of the failed segment, and every later segment of the key.
+
+   Runs that completed are not written again. Everything is written already [reduced](/en/docs/events/algebra), with orderings rewritten so that planning the records again keeps every order the original plan enforced.
+3. **The key is quarantined.** While a key has records pending in the retry topic, its new events from the main topic are not executed; they are diverted to the retry topic behind the failed ones. The per-key order from [Ordering](/en/docs/events/ordering) is therefore preserved.
+4. **The key is retried.** Before each poll of the main topic, the partition task runs one attempt for every retry key that is due. An attempt plans and executes all of the key's pending records, as if they were a fresh batch.
+
+The schedule comes from `retry_delays` again: the first attempt is due `retry_delays[0]` after the failure, and after each failed attempt the next one is due after the next delay. A key is therefore retried once after each delay. With the default [`DEFAULT_RETRY_DELAYS`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/constant.DEFAULT_RETRY_DELAYS.html) of 2, 4, 8 and 16 seconds:
+
+| Attempt | Due after the previous one | Time since the failure |
+|---------|----------------------------|------------------------|
+| 1       | 2 s                        | 2 s                    |
+| 2       | 4 s                        | 6 s                    |
+| 3       | 8 s                        | 14 s                   |
+| 4       | 16 s                       | 30 s                   |
+
+Attempts run no earlier than that, between polls of the main topic. If the fourth attempt fails, the consumer **gives up**: it drops the records of the runs that failed and logs `giving up retry` at error level. The key's remaining pending records (for example events diverted while it was quarantined) are not dropped: they are attempted right away, and the attempt counter starts over. Once a key has no pending records, its quarantine is lifted.
+
+A few details worth knowing:
+
+- The retry topic is created on `start` with the main topic's partition count. If it already exists with a different count, `start` fails with `Error::PartitionCountMismatch`.
+- The failure time is stored in each retry record's header, so after a restart the first attempt is still due `retry_delays[0]` after the original failure (immediately if that has passed). The attempt counter itself is kept in memory: after a restart, pending keys get the full schedule again.
+- [`ConsumerConfig::max_pending_retry`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/struct.ConsumerConfig.html#structfield.max_pending_retry) (default 100 000) caps the records waiting in one retry partition. When a newly failing key would exceed it, that key's failed events are dropped and logged (`retry backlog full`) instead of being written. Events of keys that are already quarantined are still diverted.
+
+### Unrecoverable [#unrecoverable]
+
+Use `Unrecoverable` when **retrying can never help**: the event is invalid, refers to something that will never exist, or hits a bug. The consumer drops the chunk, logs `dropping chunk after unrecoverable handler failure` at error level, and continues with the next chunk of the run. The key is not stopped.
+
+<Callout type="warn" title="The whole chunk is dropped">
+  The unit of failure is the chunk passed to one `handle` call, up to `MAX_BATCH` events. If one bad event in a chunk of 100 returns `Unrecoverable`, all 100 are dropped. Either use `MAX_BATCH = 1` for types whose events fail individually, or skip bad events inside your handler and only return an error for the chunk as a whole.
+</Callout>
+
+## Records that never reach your handler [#dropped-records]
+
+Some records are dropped by the consumer before any handler sees them. Each is logged with [`tracing`](https://docs.rs/tracing) at error level:
+
+- **Bad headers**: a missing or malformed type tag, key or properties header, or an unknown header version.
+- **Unknown type tag**: no handler is registered for the record's type.
+- **Algebra mismatch**: the algebra in the header differs from the marker of the registered type (see [Algebra pitfalls](/en/docs/events/algebra#pitfalls)).
+- **Undecodable body**: `MessageDe::from_bytes` fails. The rest of the run is still processed.
+- **Unserializable retry record**: an event that has to be written to the retry topic can't be serialized again.
+
+Since these are dropped rather than retried, test your bodies' (de)serialization and keep schema changes backward compatible (see [Defining events](/en/docs/events/defining-events#serializing-the-body)).
+
+## Classifying common errors [#classifying]
+
+| Failure                                                           | Class           | Reason                                                       |
+|-------------------------------------------------------------------|-----------------|--------------------------------------------------------------|
+| Connection refused, pool timeout, TLS/IO error                    | `Transient`     | Every key would fail the same way.                           |
+| Deadlock, serialization failure, lock timeout                     | `Retryable`     | This key lost a race; it will likely succeed shortly.        |
+| Row not found, but another stream will create it (projection lag) | `Retryable`     | It may appear later. Size `retry_delays` to cover the lag.   |
+| Row not found and it can never exist                              | `Unrecoverable` | Retrying cannot create it.                                   |
+| Validation failure on the event's data                            | `Unrecoverable` | The data won't change. Validate before publishing instead.   |
+| Downstream HTTP 429 / 503 for this request                        | `Retryable`     | Backs off without blocking other keys.                       |
+| Downstream service completely down                                | `Transient`     | Same as a database outage.                                   |
+| Downstream HTTP 400 / 422                                         | `Unrecoverable` | The request itself is wrong.                                 |
+
+Rows that "will exist later" deserve a remark: events of different keys are [never ordered](/en/docs/events/ordering#guarantees), and events of different topics even less so. If the stock row for a SKU is created by a `ProductCreated` event keyed by something else, a `StockAdjusted` event can arrive first. `Retryable` covers that gap, as long as it closes within the retry schedule.
+
+A classifier for `sqlx` errors on PostgreSQL might look like this:
+
+```rust title="src/handlers/errors.rs"
+/// Sort a database error into the class the consumer should react with.
+fn classify(error: sqlx::Error) -> HandleError {
+    match &error {
+        // The database is unreachable: every key would fail the same way.
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_) => HandleError::transient(error),
+        // Serialization failure, deadlock or lock timeout
+        // (PostgreSQL SQLSTATE 40001 / 40P01 / 55P03):
+        // this key lost a race and may well succeed later.
+        sqlx::Error::Database(db)
+            if matches!(db.code().as_deref(), Some("40001" | "40P01" | "55P03")) =>
+        {
+            HandleError::retryable(error)
+        }
+        // Anything else is a bug or bad data; retrying won't change it.
+        _ => HandleError::unrecoverable(error),
+    }
+}
+```
+
+And a handler that uses it, turning "no row updated" into a `Retryable` domain error (`StockAdjusted` is the event from the [Algebra](/en/docs/events/algebra#associative) page):
+
+```rust title="src/handlers/stock.rs"
+/// The event names a SKU that has no stock row (yet).
+#[derive(Debug)]
+struct UnknownSku(String);
+
+impl fmt::Display for UnknownSku {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no stock row for SKU {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownSku {}
+
+pub struct ApplyStock {
+    pool: PgPool,
+}
+
+impl EventHandler<StockAdjusted> for ApplyStock {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::MIN;
+
+    async fn handle(&self, run: &[StockAdjusted]) -> Result<(), HandleError> {
+        for adjustment in run {
+            let updated = sqlx::query("UPDATE stock SET quantity = quantity + $1 WHERE sku = $2")
+                .bind(adjustment.delta)
+                .bind(&adjustment.sku)
+                .execute(&self.pool)
+                .await
+                .map_err(classify)?;
+            if updated.rows_affected() == 0 {
+                // The `ProductCreated` projection may simply not have caught up.
+                return Err(HandleError::retryable(UnknownSku(adjustment.sku.clone())));
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+The imports used by the snippets on this page:
+
+```rust
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::time::Duration;
+use wakuwaku::deps::sqlx::{self, PgPool};
+use wakuwaku::iggy::error::{ErrorClass, HandleError};
+use wakuwaku::iggy::{ConsumerConfig, EventHandler};
+```
+
+(`sqlx` is available as `wakuwaku::deps::sqlx` with the `sqlx-pg` or `sqlx-mysql` feature; see [sqlx](/en/docs/data/sqlx).)
+
+## Tuning the retry schedule [#configuration]
+
+Both schedules, in-place `Transient` retries and `Retryable` attempts, come from the same list. Set it, and the backlog cap, on the [`ConsumerConfig`](/en/docs/events/consuming):
+
+```rust title="src/main.rs"
+const RETRY_DELAYS: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(10),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
+
+pub fn config() -> ConsumerConfig {
+    let mut config = ConsumerConfig::new("shop", "inventory", vec![0, 1, 2]);
+    config.retry_delays = RETRY_DELAYS;
+    config.max_pending_retry = 10_000;
+    config
+}
+```
+
+<TypeTable
+  type={{
+    retry_delays: {
+      type: "&'static [Duration]",
+      description: 'Delays between Retryable attempts of a key (one attempt per entry), also used between Transient attempts, where the last entry repeats forever. Must not be empty; start fails with Error::InvalidConfig otherwise.',
+      default: 'DEFAULT_RETRY_DELAYS: 2 s, 4 s, 8 s, 16 s',
+    },
+    max_pending_retry: {
+      type: 'usize',
+      description: 'Maximum number of records of one partition waiting in its retry partition. Newly failing keys beyond it are dropped.',
+      default: '100_000',
+    },
+  }}
+/>
+
+With the schedule above, a `Retryable` key gets four attempts over about six minutes, and a `Transient` outage is retried every five minutes once the first three delays have passed.
+
+## Design handlers to be idempotent [#idempotency]
+
+Even without bugs, a handler can see the same events more than once:
+
+- **Redelivery after a crash.** In the default [`DeliveryMode::NoEventLose`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/enum.DeliveryMode.html), offsets are stored after a batch is done, so events processed since the last stored offset are processed again after a crash.
+- **Transient retries.** The same chunk is passed again. Whatever your handler wrote before failing is written again.
+- **Retry attempts.** If a run fails in a retry attempt after some of its chunks succeeded, the next attempt applies those chunks again.
+
+So:
+
+- **Make each `handle` call all-or-nothing**, for example one database transaction per call. Then a failed call leaves nothing behind to repeat.
+- **Make the effect idempotent where you can**: upserts (`INSERT … ON CONFLICT DO NOTHING`), "set to" instead of "add", conditional updates on a version column.
+- **Where you can't** (counters, outgoing e-mails), carry a unique id in the event body and record processed ids in the same transaction. Note that a unique id makes no two events equal, which turns off `Idempotent` collapsing, and that an `Associative` `combine` must then decide which ids the folded event stands for.
+- If losing events on a crash is acceptable but duplicates are not, `DeliveryMode::NoDoubleConsume` stores offsets before processing instead. See [Consuming events](/en/docs/events/consuming).
+
+## Next steps [#next-steps]
+
+<Cards>
+  <Card title="Consuming events" href="/en/docs/events/consuming" description="ConsumerConfig, DeliveryMode and starting the consumer." />
+  <Card title="Ordering" href="/en/docs/events/ordering" description="Segments and runs, and why quarantine keeps them in order." />
+  <Card title="Algebra" href="/en/docs/events/algebra" description="How runs are reduced before they reach your handler." />
+</Cards>

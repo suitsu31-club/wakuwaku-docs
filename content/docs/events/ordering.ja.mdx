@@ -1,0 +1,264 @@
+---
+title: 順序保証
+description: wakuwaku が保つイベントの順序、EventAtomicOrdering によるフェンスの働き、そしてポーリングしたバッチを並行実行できるランへ分解する仕組みを説明します。
+icon: ListOrdered
+---
+
+Iggy のパーティションは全順序のログです。しかし、ほとんどの業務ロジックが気にするのは「ひとつの対象」、つまりひとつの口座・ひとつの注文・ひとりのユーザーに関するイベントの順序だけです。wakuwaku はまさにその順序だけを守り、それ以外は守りません。そのぶんコンシューマーは残りを自由に並行処理でき、イベントをまとめて少ない回数のハンドラー呼び出しにできます（[代数](/ja/docs/events/algebra) を参照）。
+
+このページでは、どの順序が保証されるのか、各イベントが `EventAtomicOrdering` でどのようにより強い順序を要求できるのか、そしてコンシューマーのプランナーがポーリングしたバッチをどのように実行計画へ変換するのかを説明します。
+
+## 保証される順序 [#guarantees]
+
+順序のスコープは常に **キー** です。キーとは `Event::key` が返す値で、`key_hash` でハッシュ化されます。キーが等しいイベントは必ず同じパーティションに入ります（[イベントの定義](/ja/docs/events/defining-events) を参照）。
+
+1. **異なるキーのイベント同士には一切順序がありません。** 同じ Iggy パーティションに入っていても同様です。コンシューマーはバッチ内のキーを並行に処理します。
+2. **同じキー・同じ型のイベントは、宣言した順序に関係なく常にログ順を保ちます。**
+3. **同じキーで型が異なるイベント** は、[`EventAtomicOrdering`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/enum.EventAtomicOrdering.html) が要求する順序を保ちます。
+
+コンシューマーはひとつのパーティションについて、ポーリングしたバッチをひとつずつ順に処理するので、これらの規則はバッチをまたいでも成り立ちます。あるキーが失敗してリトライトピックへ送られた場合も、そのキーの後続イベントは後ろに回されるため、失敗によって順序が崩れることはありません（[エラー処理](/ja/docs/events/error-handling#retryable) を参照）。
+
+<Callout type="info" title="キーはハッシュで比較されます">
+  プランナーはキーを 64 ビットの `key_hash` で比較します。異なるキーのハッシュが衝突した場合、それらのイベントは単にひとつのキーとして扱われます。衝突は順序制約を増やすことはあっても、減らすことはありません。ただし、キー *間* の順序に頼ってはいけません。そもそもそのような順序は存在しません。
+</Callout>
+
+## `EventAtomicOrdering` [#event-atomic-ordering]
+
+すべてのメッセージは `Event::atomic_ordering(&self)` で自身の順序を宣言します。名前は `std::sync::atomic::Ordering` に倣っていますが、ここでの「メモリ」はひとつのキーのイベント列です。
+
+| 順序      | キー内での約束                                                   |
+|-----------|------------------------------------------------------------------|
+| `Relaxed` | 他の型のイベントと入れ替わってもかまわない。                     |
+| `Acquire` | このキーの後続イベントは、このイベントより先に処理されない。     |
+| `Release` | このキーの先行イベントは、このイベントより後に処理されない。     |
+| `AcqRel`  | その両方。完全なバリアになる。                                   |
+
+`Acquire` は「このイベントが何かを始める（後続のイベントがこれに依存する）」、`Release` は「このイベントが何かを締めくくる（このイベントがそれまでのすべてに依存する）」と考えるとわかりやすいでしょう。
+
+<Callout type="info" title="フェンスは保守的に適用されます">
+  プランナーは上の表よりも厳しくフェンスを適用します。`Acquire` のイベントはこのキーの *先行* イベントもすべて自分より前に保ち、`Release` のイベントは *後続* イベントもすべて自分より後に保ちます。その結果、1.0.0-rc1 では `AcqRel` は `Acquire` とまったく同じ扱いになります。それでも、実際に必要な順序を宣言してください。より厳しい挙動はプランナーの実装上の選択であり、契約は上の表のほうです。
+</Callout>
+
+## 具体例: 銀行口座 [#worked-example]
+
+`AccountId` をキーとする口座のリードモデルと、4 つのイベント型を考えます。
+
+| タグ | イベント         | 順序      | 理由                                                         |
+|------|------------------|-----------|--------------------------------------------------------------|
+| 1    | `AccountOpened`  | `Acquire` | 他のイベントはすべて、このイベントが作る行を更新する。       |
+| 2    | `Deposited`      | `Relaxed` | 残高に加算するだけなので、出金と入れ替わってよい。           |
+| 3    | `Withdrawn`      | `Relaxed` | 残高から減算するだけなので、入金と入れ替わってよい。         |
+| 4    | `AccountClosed`  | `Release` | 解約時の残高は、それまでのすべての変更を含んでいる必要がある。 |
+
+入金と出金が入れ替わってよいのは、このプロジェクションが符号付きの金額を足し込むだけだからです。残高不足などの業務チェックは、イベントを発行する前にコマンド側で済んでいます。2 つのフェンスは次のように宣言します（ボディの derive については [イベントの定義](/ja/docs/events/defining-events#serializing-the-body) で説明しています）。
+
+```rust title="src/events.rs"
+#[derive(Hash)]
+pub struct AccountId(pub u64);
+
+impl PartitionKey for AccountId {
+    type PartitionMerge = DefaultHasher;
+    const SUPER_PARTITION_NAME: IggySuperPartitionName = IggySuperPartitionName("accounts");
+}
+
+#[derive(Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct AccountOpened {
+    pub account: u64,
+    pub owner: String,
+}
+
+impl EventBody for AccountOpened {}
+
+impl Event for AccountOpened {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = AccountId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> AccountId {
+        AccountId(self.account)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        // 口座が存在する前に、その口座への操作を適用してはならない。
+        EventAtomicOrdering::Acquire // [!code highlight]
+    }
+}
+```
+
+```rust title="src/events.rs"
+impl Event for AccountClosed {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(4);
+    type Key = AccountId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> AccountId {
+        AccountId(self.account)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        // それまでの入出金をすべて適用してから口座を閉じる。
+        EventAtomicOrdering::Release // [!code highlight]
+    }
+}
+```
+
+`Deposited` と `Withdrawn` は `EventAtomicOrdering::Relaxed` を返します（このページでは順序の話に集中するため `NonAssociative` にしています。入金をコンシューマーに合算させる方法は [代数](/ja/docs/events/algebra) で紹介します）。
+
+ここで、コンシューマーが次のバッチをこのログ順でポーリングしたとします。
+
+| オフセット | 口座 | イベント        | 順序      |
+|------------|------|-----------------|-----------|
+| 0          | 42   | `AccountOpened` | `Acquire` |
+| 1          | 42   | `Deposited`     | `Relaxed` |
+| 2          | 7    | `Deposited`     | `Relaxed` |
+| 3          | 42   | `Withdrawn`     | `Relaxed` |
+| 4          | 42   | `Deposited`     | `Relaxed` |
+| 5          | 42   | `AccountClosed` | `Release` |
+| 6          | 42   | `AccountOpened` | `Acquire` |
+| 7          | 42   | `Deposited`     | `Relaxed` |
+
+プランナーは次の計画を作ります。
+
+- **口座 7**: ランがひとつだけのセグメントがひとつ、`[2]`。口座 42 の処理とは並行に実行されます。
+- **口座 42、セグメント 1**: ヘッド `AccountOpened [0]`、続いてボディのラン `Deposited [1, 4]` と `Withdrawn [3]` を並行に、最後にテール `AccountClosed [5]`。
+- **口座 42、セグメント 2**（セグメント 1 の完了後）: ヘッド `AccountOpened [6]`、続いてボディのラン `Deposited [7]`。
+
+<OrderingDiagram lang="ja" />
+
+*保たれない* 順序にも注目してください。入金 4 は出金 3 より先に適用されることがあります。どちらも `Relaxed` で、型が異なるからです。一方、入金 1 と入金 4 は同じ型なので順序が保たれます。
+
+## プランナーが計画を作る仕組み [#planner]
+
+コンシューマーはポーリングしたバッチごとに、メッセージヘッダー（キーハッシュ・型タグ・順序）だけから [`Plan`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/plan/struct.Plan.html) を作ります。計画のためにボディをデコードすることはありません。計画は 3 層からなります。
+
+- **キー** は互いに独立しており、並行に処理されます。
+- 各キーは **セグメント** の列を持ち、セグメントは厳密にひとつずつ順に処理されます。
+- 各セグメントは、省略可能な **ヘッドのラン**、任意個の **ボディのラン**、省略可能な **テールのラン** を持ちます。**ラン** は、そのセグメント内にあるひとつの型のイベントすべてを、ログ順で保持します。
+
+セグメントは、キーのイベントをログ順にたどりながらフェンスの位置で区切られます。
+
+- `Acquire` または `AcqRel` のイベントは新しいセグメントを始め、その型のランがセグメントのヘッドになります。
+- `Release` のイベントは現在のセグメントを終わらせ、その型のランがセグメントのテールになります。
+- `Relaxed` のイベントは現在のセグメントに加わります。
+
+ひとつだけ例外があります。`Release` のイベントの型がすでに現在のセグメントの *ヘッド* であり、かつそのセグメントに他の型も含まれている場合、その `Release` のイベントは独立したセグメントになります。ひとつのランが最初と最後を同時に担うことはできないからです。
+
+ランはセグメント内のその型のイベントを *すべて* 集めるため、`Relaxed` のイベントが同じ型のヘッドやテールのランに加わることがあります。
+
+- `[B, A (Acquire), B, A]` では、2 つ目の `A` は `Relaxed` ですが、2 つ目のセグメントのヘッドのランに加わり、2 つ目の `B` より先に処理されます。
+- `[A, B, A (Release), B]` では、1 つ目の `A` がテールのランに加わり、1 つ目の `B` より後に処理されます。
+
+どちらも許されている動きです。`Relaxed` のイベントは他の型のイベントを追い越してよく、同じ型のイベント同士が入れ替わることはありません。
+
+### 実行 [#execution]
+
+コンシューマーはキーごとにセグメントを順にたどり、各セグメントの中で次の順に実行します。
+
+1. ヘッドのランを実行する。
+2. ボディのランをすべて並行に実行する。
+3. テールのランを実行する。
+
+各ランはデコードされ、その型の [代数](/ja/docs/events/algebra) で縮約されたうえで、最大 `MAX_BATCH` 件ずつのチャンクに分けて順番に `EventHandler` に渡されます。したがってハンドラーの 1 回の呼び出しが受け取るのは、常に **ひとつのキー・ひとつの型** のイベントだけです。あるステージが失敗すると、そのキーの処理はそこで止まります。その後の扱いは [エラーの分類](/ja/docs/events/error-handling) によって決まります。
+
+<Callout type="warn" title="同じキーのボディのランは同時に実行されます">
+  同じキーの `Relaxed` な 2 つの型は、並行にハンドリングされることがあります。両方のハンドラーが同じデータベースの行を更新するなら、アプリケーション側で読み取り・変更・書き込みをするのではなく、更新そのものをアトミックにしてください（例: `SET balance = balance + $1`）。あるいは、どちらかの型にフェンスを付けてください。
+</Callout>
+
+## 順序の選び方 [#choosing]
+
+まず `Relaxed` から始め、業務上必要な箇所にだけフェンスを追加します。
+
+| そのイベントは…                                          | 順序      | 例                                                |
+|----------------------------------------------------------|-----------|---------------------------------------------------|
+| キー内の他の型のイベントと独立している                   | `Relaxed` | `Deposited`、`TagAdded`、`PointsGranted`          |
+| 後続のイベントが依存するものを作る・（再）開始する       | `Acquire` | `AccountOpened`、`OrderPlaced`、`UserRegistered`  |
+| 何かを締めくくり、それまでのイベントをすべて見る必要がある | `Release` | `AccountClosed`、`InvoiceIssued`、`ExportRequested` |
+| 両方向のバリアである                                     | `AcqRel`  | `AccountFrozen`、`OwnershipTransferred`           |
+
+同じ型のイベントの順序を保つためだけにフェンスを付ける必要はありません。それは常に保証されています。
+
+フェンスを付けるたびに、キーのイベントはより多くのセグメントに分割されます。セグメントが小さくなるとランも小さくなり（[縮約](/ja/docs/events/algebra) の効果が減り）、並行度も下がります。つまりフェンスにはスループット上のコストがあります。
+
+### メッセージごとの順序 [#per-message]
+
+`atomic_ordering` は `&self` を受け取るので、ひとつのイベント型がメッセージごとに順序を選べます。ひとつの型で複数の状態遷移を表す場合に便利です。
+
+```rust title="src/events.rs"
+impl Event for AccountStatusChanged {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(5);
+    type Key = AccountId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> AccountId {
+        AccountId(self.account)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        match self.status {
+            // 再有効化は通知的なものなので、自由に動いてよい。
+            AccountStatus::Active => EventAtomicOrdering::Relaxed,
+            // 凍結は完全なバリア: どちら向きにも追い越しを許さない。
+            AccountStatus::Frozen => EventAtomicOrdering::AcqRel,
+            // 解約はそれまでのすべてを待つ。
+            AccountStatus::Closed => EventAtomicOrdering::Release,
+        }
+    }
+}
+```
+
+順序は [`Publisher`](/ja/docs/events/publishing) によって各メッセージのヘッダーに書き込まれ、コンシューマーはそのヘッダーから計画を立てます。
+
+## 順序のテスト [#testing]
+
+プランナーは純粋関数で、公開 API です。[`Plan::new`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/plan/struct.Plan.html) は `PlanRecord`（キー・タグ・順序）を受け取って計画を返します。そのため、頼りにしている挙動を Iggy なしでユニットテストに固定できます。次のテストは上の具体例を検証します。
+
+```rust title="src/events.rs"
+#[cfg(test)]
+mod tests {
+    use wakuwaku::iggy::EventAtomicOrdering::{Acquire, Relaxed, Release};
+    use wakuwaku::iggy::EventTypeTag;
+    use wakuwaku::iggy::partition::plan::{Plan, PlanRecord};
+
+    const OPENED: EventTypeTag = EventTypeTag::new(1);
+    const DEPOSITED: EventTypeTag = EventTypeTag::new(2);
+    const WITHDRAWN: EventTypeTag = EventTypeTag::new(3);
+    const CLOSED: EventTypeTag = EventTypeTag::new(4);
+
+    #[test]
+    fn closing_waits_for_every_earlier_event() {
+        let record = |key, tag, ordering| PlanRecord { key, tag, ordering };
+        let batch = [
+            record(42, OPENED, Acquire),   // 0
+            record(42, DEPOSITED, Relaxed), // 1
+            record(7, DEPOSITED, Relaxed),  // 2  別の口座
+            record(42, WITHDRAWN, Relaxed), // 3
+            record(42, DEPOSITED, Relaxed), // 4
+            record(42, CLOSED, Release),    // 5
+            record(42, OPENED, Acquire),    // 6  再開設
+            record(42, DEPOSITED, Relaxed), // 7
+        ];
+        let plan = Plan::new(&batch);
+
+        let [account_42, account_7] = plan.keys() else { panic!() };
+        assert_eq!(plan.segments(account_7).len(), 1);
+
+        let [first, second] = plan.segments(account_42) else { panic!() };
+        assert_eq!(plan.head(first).map(|run| plan.records(run)), Some(&[0][..]));
+        let body: Vec<_> = plan.body(first).iter().map(|run| plan.records(run)).collect();
+        assert_eq!(body, [&[1, 4][..], &[3][..]]); // 入金 ∥ 出金
+        assert_eq!(plan.tail(first).map(|run| plan.records(run)), Some(&[5][..]));
+        assert_eq!(plan.head(second).map(|run| plan.records(run)), Some(&[6][..]));
+        assert_eq!(plan.body(second).len(), 1);
+    }
+}
+```
+
+`Plan::keys` はキーを最初に現れた順に返し、`Plan::records` は入力スライスへのインデックスを返します。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="代数" href="/ja/docs/events/algebra" description="ハンドラーに渡す前に、コンシューマーにランをまとめさせる方法。" />
+  <Card title="エラー処理" href="/ja/docs/events/error-handling" description="ハンドラーが失敗したとき、キーとその順序がどうなるか。" />
+  <Card title="イベントの購読" href="/ja/docs/events/consuming" description="ハンドラーを登録し、コンシューマーを設定する。" />
+</Cards>

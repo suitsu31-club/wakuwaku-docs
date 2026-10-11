@@ -1,0 +1,195 @@
+---
+title: 証明駆動プログラミング
+description: wakuwaku は正しさを二つに分け、コンポーネント同士の組み合わせはコンパイラが、各コンポーネントの振る舞いはユニットテストが証明します。
+icon: ShieldCheck
+---
+
+wakuwaku は自らを *証明駆動 (proof-driven)* のマイクロサービスフレームワークと位置づけています。考え方は単純で、サービスの性質はそれぞれ、最も得意な道具によって、できるだけ早い段階で証明されるべきだというものです。具体的には、正しさを二つに分けて扱います。
+
+<CorrectnessDiagram lang="ja" />
+
+| | マクロな正しさ | ミクロな正しさ |
+|---|---|---|
+| 問い | コンポーネント同士が正しく組み合わさっているか | 各コンポーネントが正しく動くか |
+| 例 | すべての依存が登録されている。読み取り専用ハンドルが書き込みを実行しない。cron ジョブに実行間隔がある。検証済みの値を要求する関数に検証済みの値が渡る | 期限切れのセッションが削除される。新規ユーザーにウェルカムメールが届く。存在しない口座には `NOT_FOUND` を返す |
+| 証明するもの | トレイト (コンパイラが検査) | ユニットテスト |
+| 失敗するタイミング | `cargo build` | `cargo test` |
+
+## マクロな正しさ: 配線はコンパイラが証明する [#macro-correctness-the-compiler-proves-the-wiring]
+
+wakuwaku では「部品がどう組み合わさるか」をトレイト境界として表現します。境界は命題であり、それを満たす `impl` が証明です。トレイトソルバーが証明を見つけられなければ、プログラムはビルドされません。
+
+[`ServiceBuilder`](/ja/docs/core/service-builder) を例にとります。`SessionStore` から作られる cron ジョブを登録するには、次の境界が必要です。
+
+```rust
+ServiceBuilder<Head, Chain>: ProvideAt<SessionStore, Position>
+```
+
+これは「このビルダーのどこかの位置に `SessionStore` が登録されている」と読めます。ビルダーは型レベルのリストなので、コンパイラはこの命題を検査できます。実行時のマップも `Any` もダウンキャストもないため、依存の登録漏れによる起動時パニックも起こりません。誤りはバイナリになる前に止まります。
+
+Spring に慣れている方は、アプリケーションコンテキストと比べてみてください。Spring はコンテキスト起動時に Bean を解決するので、Bean の不足はアプリケーションの起動時 (`NoSuchBeanDefinitionException`) に報告されます。wakuwaku は同じ検査をコンパイル中に行うため、デプロイよりずっと前に `cargo build`、エディタ、CI が報告します。
+
+同じ手法はクレート全体で使われています。データアクセスハンドルのケイパビリティ、イベントの代数マーカー、検証済みの値を表す証明型は、いずれも実行時バグの一群を型エラーに変えます。[後述の一覧](#what-the-compiler-rejects) にまとめています。
+
+## ミクロな正しさ: 振る舞いはユニットテストが証明する [#micro-correctness-unit-tests-prove-the-behavior]
+
+型は、あるジョブが `SessionStore` を *持っている* ことは示せますが、正しいセッションを削除することまでは示せません。そこはテストの役割であり、wakuwaku はそのテストを安く書けるように設計されています。
+
+すべてのコンポーネントは普通の Rust の値です。[`ServiceCreation::create_service`](/ja/docs/core/service-builder#building-components-servicecreation) で依存から作られ、振る舞いは一つの async メソッドにまとまっています。
+
+- cron ジョブは `CronTick` の [`Processor`](https://docs.rs/kanau/latest/kanau/processor/trait.Processor.html) です。
+- イベントハンドラは同じ形をした `EventHandler::handle` を実装します。
+- gRPC サービスは tonic が生成したトレイトを実装します。
+- データアクセスハンドル (`Db`) はクエリの `Processor` です。
+- 述語は `prove` で検査します。
+
+テストは値を作り、メソッドを呼ぶだけです。Iggy サーバーも、開いたポートも、スケジューラも要りません。種類ごとのテスト例は [テスト](/ja/docs/core/testing) のページにあります。
+
+## `Processor` 抽象 [#the-processor-abstraction]
+
+共通の形は [`kanau`](https://docs.rs/kanau) クレートに由来します。wakuwaku はこれを `wakuwaku::deps::kanau` として再エクスポートしています。
+
+```rust title="kanau::processor (抜粋)"
+pub trait Processor<I: Send> {
+    type Output;
+    type Error;
+
+    fn process(&self, input: I) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
+}
+```
+
+Processor は *状態を持つ非同期関数* です。構造体が依存を保持し、`process` が入力を結果に変換します。実装は普通の `async fn` で書けます。
+
+```rust title="src/components.rs"
+impl Processor<CronTick> for ExpireSessions {
+    type Output = ();
+    type Error = std::convert::Infallible;
+    async fn process(&self, tick: CronTick) -> Result<(), Self::Error> {
+        let removed = self.sessions.remove_expired(tick.fired_at);
+        tracing::info!(removed, "expired sessions");
+        Ok(())
+    }
+}
+```
+
+`tower::Service` を知っている方向けに、意図的な違いをまとめます。
+
+| | `tower::Service` | `Processor` |
+|---|---|---|
+| レシーバ | `&mut self` | `&self` |
+| Future | 関連型 `Future` (Box 化されることが多い) | 戻り値位置の `impl Future` (RPITIT)。`async fn` で書ける |
+| 準備状態 / バックプレッシャー | `call` の前に毎回 `poll_ready` | なし。常に準備済み。制限が必要ならセマフォやチャネルを組み合わせる |
+| タスク間での共有 | サービスを clone するか、ロックする | 参照か `Arc` を共有する |
+
+`&self` を取るので、フレームワークは一つの値を複数の場所から同時に動かせます。コンシューマーはバッチ内の複数のキーを同じハンドラ (`Arc` で包まれたもの) で並行に処理しますし、テストは同じ値を何度でも呼べます。返される Future は `Send` でなければならないため、コンポーネントは Tokio のマルチスレッドランタイム上で動きます。
+
+`Processor` は合成もできます。`wakuwaku::entity` の [書き込みフック](/ja/docs/data/hooks) は、同じクエリを処理する別の Processor を包む Processor です。そのため、フック付きのハンドルは素のハンドルとそのまま置き換えられます。
+
+## コンパイラが拒否するもの [#what-the-compiler-rejects]
+
+次の表の各行は、ビルドが通らない誤りです。詳しい説明はリンク先を参照してください。
+
+| 誤り | 得られるエラー | 参照先 |
+|---|---|---|
+| `Dep` が登録されていないコンポーネントを作る | `E0277`: `(): ProvideAt<SessionStore, _>` is not satisfied | [サービスビルダー](/ja/docs/core/service-builder#reading-the-compile-errors) |
+| 2 回登録された型を、どちらか指定せずに要求する | `E0283`: type annotations needed | [サービスビルダー](/ja/docs/core/service-builder#duplicate-types) |
+| `INTERVAL = Duration::ZERO` の cron ジョブ | `E0080`: evaluation panicked: CronJob::INTERVAL must not be zero (`cargo build` のみ) | [cron ジョブ](/ja/docs/services/cron-jobs) |
+| 読み取り専用ハンドルで書き込みクエリを実行する | `E0277`: `ReadOnly: CanWrite<Post>` is not satisfied | [クエリ](/ja/docs/data/queries) |
+| 自身が失敗しうるフックのエラーハンドラ | `E0271`: type mismatch resolving `<LogError as Processor<String>>::Error == Infallible` | [フック](/ja/docs/data/hooks) |
+| `EventSemigroup` を実装しない `Associative` なイベント (`Eq` のない `Idempotent`、`Ord` のない `IdempotentCommutative` も同様) | `E0277`: `PointsGranted: EventSemigroup` is not satisfied | [イベントの代数](/ja/docs/events/algebra) |
+| `Proven<T, P>` が必要な場所に未検証の値を渡す | `E0308`: mismatched types | [バリデーション](/ja/docs/validation) |
+| `Proven` を手で組み立てる | フィールドが非公開。作れるのは `prove` と推論規則だけ | [バリデーション](/ja/docs/validation) |
+
+このうち四つについて、実際のコンパイラ出力を示します (パスと help の注記は省略しています)。
+
+### 登録されていない依存 [#a-dependency-that-was-never-registered]
+
+```rust
+let (_services, cron) = ServiceBuilder::new(Mailer) // no SessionStore registered
+    .cron_job::<ExpireSessions, _>()
+    .start();
+```
+
+```text
+error[E0277]: the trait bound `(): ProvideAt<SessionStore, _>` is not satisfied
+   |
+37 |         .cron_job::<ExpireSessions, _>()
+   |          ^^^^^^^^ the trait `ProvideAt<SessionStore, _>` is not implemented for `()`
+   |
+   = note: required for `ServiceBuilder<Mailer>` to implement `ProvideAt<SessionStore, There<_>>`
+note: required by a bound in `ServiceBuilder::<Head, Chain>::cron_job`
+```
+
+`()` はリストの終端です。コンパイラは登録済みのサービスをすべて探しましたが、`SessionStore` は見つかりませんでした。
+
+### 読み取り専用ハンドルでの書き込み [#a-write-through-a-read-only-handle]
+
+```rust
+async fn on_replica(db: &Db<Memory, ReadOnly>) {
+    db.process(DeletePost(1)).await.unwrap();
+}
+```
+
+```text
+error[E0277]: the trait bound `ReadOnly: Covers<Write<Post>>` is not satisfied
+   |
+32 |     db.process(DeletePost(1)).await.unwrap();
+   |        ^^^^^^^ the trait `CanWrite<Post>` is not implemented for `ReadOnly`
+   |
+   = note: required for `ReadOnly` to implement `Covers<Write<Post>>`
+   = note: required for `Db<Memory, ReadOnly>` to implement `Processor<DeletePost>`
+```
+
+### 未検証の値 [#an-unvalidated-value]
+
+```rust
+fn rename(name: Proven<String, NonEmpty>) -> String {
+    name.subject().clone()
+}
+
+fn main() {
+    let name = String::from("Ann");
+    rename(name);
+}
+```
+
+```text
+error[E0308]: mismatched types
+   |
+27 |     rename(name);
+   |     ------ ^^^^ expected `Proven<String, NonEmpty>`, found `String`
+```
+
+### 実行間隔のない cron ジョブ [#a-cron-job-with-no-interval]
+
+```rust
+impl CronJob for Busy {
+    const INTERVAL: Duration = Duration::ZERO;
+}
+
+let (_services, cron) = ServiceBuilder::new(SessionStore).cron_job::<Busy, _>().start();
+```
+
+```text
+error[E0080]: evaluation panicked: CronJob::INTERVAL must not be zero
+note: the above error was encountered while instantiating `fn CronRegisterCenter::<Busy>::new`
+```
+
+<Callout type="warn" title="これだけは cargo build が必要です">
+実行間隔は、登録処理が単相化 (instantiate) されるときに評価される `const` アサーションで検査されます。`cargo check` (と、それに依存する多くのエディタ) はこの段階まで進まないため検出できません。`cargo build` と `cargo test` は報告するので、CI ではどちらかを実行してください。
+</Callout>
+
+## 型が証明しないこと [#what-the-types-do-not-prove]
+
+保証と同じくらい、限界を正確に把握しておくことが大切です。
+
+- **外部の状態。** Iggy のトピックが存在するか、設定したパーティションが存在するか、二つのハンドラが同じイベント型タグを使っていないかは、コンパイル時ではなくコンシューマーの [起動時](/ja/docs/core/lifecycle#startup-failures) に検査されます。同じサービス名の gRPC サーバーを二つ登録すると、ルーターに追加する時点でパニックします。
+- **クエリが実際に何をするか。** ケイパビリティが証明するのは *ルーティング* です。`Db<_, ReadOnly>` に配線されたコードは、書き込みと *宣言された* クエリを発行しません。しかし、読み取りと宣言されたクエリが本当に書き込まないことまでは証明できないので、レプリカ側ではデータベース自身のガードも残してください。
+- **証明の時点。** `Proven` の値は、検査した時点で述語が成り立っていたことを記録するものです。述語がデータベースの行に依存するなら、その行はその後変わっているかもしれません。
+- **ビジネスロジック。** これはミクロな正しさであり、[テスト](/ja/docs/core/testing) の役割です。
+
+<Cards>
+  <Card title="サービスビルダー" href="/ja/docs/core/service-builder" description="すべてのコンポーネントの元になる型レベルのレジストリ。" />
+  <Card title="ライフサイクル" href="/ja/docs/core/lifecycle" description="一つの main から cron ジョブ、コンシューマー、gRPC サーバーを起動し、きれいに停止する。" />
+  <Card title="テスト" href="/ja/docs/core/testing" description="サービスを起動せずに、あらゆる種類のコンポーネントをユニットテストする。" />
+</Cards>

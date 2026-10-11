@@ -1,0 +1,395 @@
+---
+title: sqlx（PostgreSQL と MySQL）
+description: sqlx を通じて wakuwaku を PostgreSQL や MySQL に接続し、クエリを型付きの値として書き、読み取りをレプリカへ振り分ける構成をコンパイラに検査させます。
+icon: Database
+---
+
+wakuwaku はリレーショナルデータベースと [sqlx](https://github.com/launchbadge/sqlx) を通じて通信します。sqlx のコネクションプールは **データソース** `SqlxSource<DB>` になり、データソースは `Db<S, C>` ハンドルに格納されます。`Db` ハンドルがクエリを実行し、ケイパビリティ `C` がどのクエリを実行してよいかを決めます。クエリは普通の Rust の値です。構造体が、何に触れるか（`Query`）と sqlx 上でどう実行されるか（`Execute`）を記述します。
+
+`Query`、`Execute`、エンティティ、ケイパビリティにまだ馴染みがない場合は、先に [クエリとケイパビリティ](/ja/docs/data/queries) を読んでください。このページでは sqlx に固有の内容を扱います。
+
+## バックエンドを有効にする
+
+sqlx 連携は `wakuwaku::entity::sqlx` にあり、`wakuwaku` クレートの 2 つのフィーチャーのどちらかで有効になります。
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-mysql"] }
+```
+
+</Tab>
+</Tabs>
+
+どちらのフィーチャーも `entity` を有効にし、sqlx を `wakuwaku::deps::sqlx` として再エクスポートします。フィーチャーは加算的なので、両方のデータベースと通信するサービスは両方を有効にできます。
+
+| パス | 内容 |
+|------|------|
+| `wakuwaku::entity::sqlx::backend::SqlxSource<DB>` | sqlx の `Pool<DB>` をデータソースにしたもの |
+| `wakuwaku::entity::sqlx::backend::PgSource` | `SqlxSource<Postgres>`（フィーチャー `sqlx-pg`） |
+| `wakuwaku::entity::sqlx::backend::MySqlSource` | `SqlxSource<MySql>`（フィーチャー `sqlx-mysql`） |
+| `wakuwaku::entity::sqlx::transaction` | 純粋なステートマシンとして書くトランザクション。[トランザクション](/ja/docs/data/transactions) を参照 |
+| `wakuwaku::deps::sqlx` | sqlx クレートそのもの。wakuwaku がビルドに使うものと同じバージョン |
+
+## 有効になっている sqlx のフィーチャー
+
+wakuwaku は sqlx 0.9 に `default-features = false` で依存し、自分が必要とするものだけを有効にします。
+
+- `runtime-tokio`
+- `postgres`（`sqlx-pg` の場合）または `mysql`（`sqlx-mysql` の場合）
+
+それ以外はすべて無効です。特に `wakuwaku::deps::sqlx` には **TLS、derive マクロやクエリマクロ、マイグレーション、追加のカラム型がありません**。必要な場合は sqlx のフィーチャーを自分で有効にします。
+
+| 必要なもの | sqlx のフィーチャー |
+|------------|---------------------|
+| 暗号化された接続（`sslmode=require`、`verify-full`、MySQL の `ssl-mode=REQUIRED` など） | `tls-rustls` または `tls-native-tls` |
+| `#[derive(sqlx::FromRow)]` | `derive` |
+| `sqlx::query!`、`sqlx::query_as!`（`derive` を含む） | `macros` |
+| `sqlx::migrate!` | `migrate` と `macros` |
+| `Uuid`、`chrono` / `time` の日時、`Json<T>`、`Decimal` のカラム | `uuid`、`chrono` または `time`、`json`、`rust_decimal` |
+
+<Callout type="warn" title="TLS は明示しない限り無効">
+TLS フィーチャーがなくても sqlx は起動を拒否しません。デフォルトの `sslmode=prefer`（PostgreSQL）や `ssl-mode=PREFERRED`（MySQL）では **平文で** 接続します。TLS を必須にした接続文字列だけが `TLS upgrade required by connect options but SQLx was built without TLS support enabled` で失敗します。本番環境では TLS フィーチャーを有効にし、接続文字列でも TLS を必須にしてください。
+</Callout>
+
+これらのフィーチャーを `wakuwaku` 経由で有効にすることはできません。転送するフィーチャーがないためです。代わりに、同じ `0.9` のバージョン要件で sqlx を直接の依存関係として追加します。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "macros", "migrate"] }
+```
+
+Cargo は semver 互換のクレートを 1 回だけビルドし、依存元が要求するフィーチャーを統合します。ビルドに含まれる sqlx は 1 つのままで、あなたが指定したフィーチャーが有効になり、`wakuwaku::deps::sqlx::PgPool` と `sqlx::PgPool` は同じ型です。マクロにも直接の依存関係が必要です。`#[derive(FromRow)]` や `query!` は `::sqlx::` で始まるパスに展開されるので、クレートに `sqlx` という名前の依存関係がないと解決できません。
+
+<Callout type="info" title="バージョンを揃える">
+バージョン要件の最初の 0 でない桁が異なる場合（たとえば wakuwaku が 0.9 を使うのに `sqlx = "0.10"` と書いた場合）、Cargo は sqlx を 2 つビルドし、あなたのプールは `SqlxSource` に入らなくなります。`cargo tree -i sqlx` を実行し、`wakuwaku`、`wakuwaku-entity`、あなたのクレートが使う sqlx が 1 つだけ表示されることを確認してください。
+</Callout>
+
+このページの残りでは、`wakuwaku::deps::sqlx` に最初から含まれる機能だけを使います。
+
+## プールと `Db` ハンドルを作る
+
+いつも通り sqlx でプールを作り、`SqlxSource::new` で包み、`Db::new` でケイパビリティを与えます。
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```rust title="src/db.rs"
+use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn connect(url: &str) -> Result<Db<PgSource, ReadWrite>, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(url)
+        .await?;
+    Ok(Db::new(SqlxSource::new(pool)))
+}
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```rust title="src/db.rs"
+use wakuwaku::deps::sqlx::{self, mysql::MySqlPoolOptions};
+use wakuwaku::entity::sqlx::backend::{MySqlSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn connect(url: &str) -> Result<Db<MySqlSource, ReadWrite>, sqlx::Error> {
+    let pool = MySqlPoolOptions::new()
+        .max_connections(10)
+        .connect(url)
+        .await?;
+    Ok(Db::new(SqlxSource::new(pool)))
+}
+```
+
+</Tab>
+</Tabs>
+
+ハンドルについて知っておくべきこと:
+
+- **クエリごとにコネクションを取得します。** `Db` を通じて実行したクエリはプールからコネクションを 1 つ取り、オートコミットモードで実行されます。複数の文をアトミックに実行するには [トランザクション](/ja/docs/data/transactions) を書きます。
+- **プールは非公開のままです。** `SqlxSource` はプールを外に返さないので、プールに生の SQL を流してケイパビリティを迂回することはできません。マイグレーションなどの準備は、プールを包む **前に** 実行してください。
+- **ハンドルのクローンは安価です。** `SqlxSource` と `Db` は `Clone` で、クローンは同じプールを共有します。これは `ServiceCreation::Dep` が期待する性質です。[ServiceBuilder](/ja/docs/core/service-builder) を参照してください。
+
+前の節の追加フィーチャーを有効にすると、マイグレーション付きのセットアップは次のようになります。
+
+```rust title="src/db.rs"
+use wakuwaku::deps::sqlx::postgres::PgPoolOptions;
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn connect(url: &str) -> Result<Db<PgSource, ReadWrite>, Box<dyn std::error::Error>> {
+    let pool = PgPoolOptions::new().connect(url).await?;
+    // The pool is still yours here: run migrations and other setup first.
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    Ok(Db::new(SqlxSource::new(pool)))
+}
+```
+
+## クエリを書く
+
+sqlx 向けのクエリは 2 つのトレイトを実装します。
+
+- `wakuwaku::entity` の `Query` は **エフェクト**、つまりどのエンティティを読み書きするかを宣言します。
+- `Execute<SqlxSource<DB>>` は実行方法を記述します。`execute` は `&mut DB::Connection`（`&mut PgConnection` または `&mut MySqlConnection`）を受け取ります。これは sqlx の executor なので、本体は普通の sqlx の呼び出しで書けます。
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```rust title="src/queries.rs"
+use wakuwaku::deps::sqlx::{self, PgConnection, Postgres};
+use wakuwaku::entity::sqlx::backend::SqlxSource;
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+
+/// The `users` table, as a type.
+pub struct User;
+impl Entity for User {}
+
+/// A row of `users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Look a user up by id.
+pub struct FindUser {
+    pub id: i64,
+}
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+impl Execute<SqlxSource<Postgres>> for FindUser {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Self::Output, sqlx::Error> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, name FROM users WHERE id = $1")
+                .bind(self.id)
+                .fetch_optional(conn)
+                .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+
+/// Rename a user. Returns whether the user existed.
+pub struct RenameUser {
+    pub id: i64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<SqlxSource<Postgres>> for RenameUser {
+    type Output = bool;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
+            .bind(self.id)
+            .bind(self.name)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+}
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```rust title="src/queries.rs"
+use wakuwaku::deps::sqlx::{self, MySql, MySqlConnection};
+use wakuwaku::entity::sqlx::backend::SqlxSource;
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+
+/// The `users` table, as a type.
+pub struct User;
+impl Entity for User {}
+
+/// A row of `users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Look a user up by id.
+pub struct FindUser {
+    pub id: i64,
+}
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+impl Execute<SqlxSource<MySql>> for FindUser {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut MySqlConnection) -> Result<Self::Output, sqlx::Error> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, name FROM users WHERE id = ?")
+                .bind(self.id)
+                .fetch_optional(conn)
+                .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+
+/// Rename a user. Returns whether the user existed.
+pub struct RenameUser {
+    pub id: i64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<SqlxSource<MySql>> for RenameUser {
+    type Output = bool;
+
+    async fn execute(self, conn: &mut MySqlConnection) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("UPDATE users SET name = ? WHERE id = ?")
+            .bind(self.name)
+            .bind(self.id)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+}
+```
+
+</Tab>
+</Tabs>
+
+`Query` の部分は両方のデータベースで同じで、変わるのは `Execute` の部分（プレースホルダーとコネクション型）だけです。移植性のある SQL で書いたクエリは、両方のソースに対して `Execute` を実装できます。
+
+ここで行をタプルにデコードしているのは、タプルが `derive` フィーチャーなしで sqlx の `FromRow` を実装しているためです。`derive` を有効にすれば `#[derive(sqlx::FromRow)] struct UserRow { … }` と書いて、`sqlx::query_as::<_, UserRow>(…)` を使えます。
+
+`execute` の中の `conn` は、プールのコネクション（クエリを単独で実行する場合）か、開いているトランザクションのコネクション（クエリを [トランザクションのステップ](/ja/docs/data/transactions) として実行する場合）のどちらかです。同じクエリ型をどちらの場所でも使えます。
+
+<Callout type="info" title="コンパイル時に検査される SQL">
+`sqlx::query!` や `sqlx::query_as!` も `execute` の中で使えます。`macros` フィーチャーと、ビルド時に `DATABASE_URL` か sqlx のオフラインクエリデータが必要です。後述するケイパビリティ検査はこれらとは独立しており、SQL の文面ではなく、*どの* クエリがどこで実行されるかを検査します。
+</Callout>
+
+### クエリを実行する
+
+`Db<S, C>` は、`S` 上で実行でき、かつエフェクトを `C` がカバーするすべてのクエリ `Q` について kanau の `Processor<Q>` を実装します。クエリの実行は `process` の呼び出しで、エラー型は `sqlx::Error` です。
+
+```rust title="src/rename.rs"
+use crate::queries::{FindUser, RenameUser};
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx;
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn rename(db: &Db<PgSource, ReadWrite>) -> Result<(), sqlx::Error> {
+    if let Some(user) = db.process(FindUser { id: 1 }).await? {
+        let renamed = db.process(RenameUser { id: user.id, name: "Ada".into() }).await?;
+        assert!(renamed);
+    }
+    Ok(())
+}
+```
+
+## プライマリとレプリカ
+
+書き込みはプライマリへ、読み取りはレプリカへ送る構成はよくあります。wakuwaku では、プールごとに別のハンドルと別のケイパビリティを与えます。
+
+- プライマリ上の `Db<PgSource, ReadWrite>` はどんなクエリも実行できます。
+- レプリカ上の `Db<PgSource, ReadOnly>` は、エフェクトが読み取りだけのクエリしか実行できません。
+
+レプリカのハンドルに書き込みを送ると、データベースの実行時エラーではなくコンパイルエラーになります。
+
+```rust
+async fn on_replica(replica: &Db<PgSource, ReadOnly>) {
+    // error[E0277]: the trait bound `ReadOnly: CanWrite<User>` is not satisfied
+    let _ = replica.process(RenameUser { id: 1, name: "Ada".into() }).await;
+}
+```
+
+コンポーネントはケイパビリティの名前を出すべきではありません。ハンドルについてジェネリックにし、実行するクエリを `Processor` 境界として列挙します。こうするとケイパビリティは、コンポーネントを具体的なハンドルに結び付ける場所で 1 回だけ検査されます。
+
+```rust title="src/profiles.rs"
+use crate::queries::{FindUser, UserRow};
+use wakuwaku::ServiceBuilder;
+use wakuwaku::ServiceCreation;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
+
+/// Reads user profiles. Generic over the handle: it only lists the queries it runs.
+pub struct Profiles<D> {
+    db: D,
+}
+
+impl<D> Profiles<D>
+where
+    D: Processor<FindUser, Output = Option<UserRow>, Error = sqlx::Error>,
+{
+    pub async fn display_name(&self, id: i64) -> Result<Option<String>, sqlx::Error> {
+        Ok(self.db.process(FindUser { id }).await?.map(|user| user.name))
+    }
+}
+
+/// Wired to the replica: the capability is checked here, once.
+impl ServiceCreation for Profiles<Db<PgSource, ReadOnly>> {
+    type Dep = Db<PgSource, ReadOnly>;
+
+    fn create_service(db: Self::Dep) -> Self {
+        Self { db }
+    }
+}
+
+pub async fn build(primary_url: &str, replica_url: &str) -> Result<(), sqlx::Error> {
+    let primary = PgPoolOptions::new().connect(primary_url).await?;
+    let replica = PgPoolOptions::new().connect(replica_url).await?;
+
+    let services = ServiceBuilder::new(Db::<PgSource, ReadWrite>::new(SqlxSource::new(primary)))
+        .push(Db::<PgSource, ReadOnly>::new(SqlxSource::new(replica)));
+
+    let replica_db = services.provide::<Db<PgSource, ReadOnly>, _>().clone();
+    let profiles = Profiles::create_service(replica_db);
+    let _ = profiles.display_name(1).await?;
+    Ok(())
+}
+```
+
+2 つのハンドルは型が異なるので、`ServiceBuilder` は両方を保持でき、`provide` はそれぞれを型で見つけます。実際のサービスではビルダーを `grpc_service`、`cron_job`、`iggy_consumer` に渡し、それらが `create_service` を呼び出します。[ServiceBuilder](/ja/docs/core/service-builder) を参照してください。単体テストでは、`Profiles` は `Processor<FindUser>` を実装する任意のフェイクを受け取れるので、データベースはまったく不要です。[テスト](/ja/docs/core/testing) を参照してください。
+
+<Callout type="warn" title="型が証明すること、しないこと">
+ケイパビリティ検査が証明するのは **ルーティング** です。`Db<_, ReadOnly>` に結び付いたコードは、書き込みとして *宣言された* クエリを決して発行しません。`Read<User>` と宣言したクエリに `UPDATE` が含まれていないことまでは証明できません。レプリカ側でもデータベース自身のガードを維持してください。ホットスタンバイは書き込みを拒否し、プライマリでは `default_transaction_read_only = on`（PostgreSQL）や書き込み権限のないユーザーが同じ役割を果たします。
+</Callout>
+
+一部のエンティティだけを書き込めるサービスは、`ReadWrite` の代わりに独自のケイパビリティ（たとえば「すべて読めるが、書けるのは `Session` だけ」）を定義できます。[クエリとケイパビリティ](/ja/docs/data/queries) を参照してください。
+
+## API リファレンス
+
+- [`SqlxSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/backend/struct.SqlxSource.html)、[`SqlxBackend`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/backend/trait.SqlxBackend.html)
+- [`Db`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html)、[`Query`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Query.html)、[`Execute`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html)
+- [`wakuwaku::deps`](https://docs.rs/wakuwaku/latest/wakuwaku/deps/index.html)
+
+<Cards>
+  <Card title="トランザクション" href="/ja/docs/data/transactions" description="複数の文をアトミックに。純粋なステートマシンとして書きます。" />
+  <Card title="フック" href="/ja/docs/data/hooks" description="書き込みクエリの前後でコードを実行します。" />
+  <Card title="クエリとケイパビリティ" href="/ja/docs/data/queries" description="エンティティ、エフェクト、独自のケイパビリティ。" />
+</Cards>

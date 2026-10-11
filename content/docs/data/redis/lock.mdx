@@ -1,0 +1,214 @@
+---
+title: Locks
+description: Mutual exclusion and reader-writer locks across replicas, with leases that keep a crashed holder from blocking everyone.
+icon: Lock
+---
+
+When several replicas of a service may touch the same thing (finalize the same invoice, run the same cron job, rebuild the same index), they need to agree on who goes first. [`collection::lock`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/lock/index.html) provides two locks keyed by name:
+
+- `Lock<N>`: at most one holder per name.
+- `RwLock<N>`: either one writer or any number of readers per name.
+
+Both are leases: a holder keeps the lock until it releases it or the lock's TTL runs out. The lease is what keeps a crashed or partitioned holder from blocking everyone forever.
+
+## Acquiring never waits
+
+`try_lock` outputs `Some(token)` if the lock was free and `None` otherwise. There is no built-in waiting or retry loop: the caller decides whether to give up, retry later, or report "busy".
+
+```rust title="src/invoice.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::lock::Lock;
+
+pub const INVOICES: Lock<u64> = Lock::new("invoice", Duration::from_secs(30));
+
+pub async fn finalize_invoice(redis: &Redis, invoice: u64) -> RedisResult<bool> {
+    let Some(token) = redis.process(INVOICES.try_lock(&invoice)).await? else {
+        // Someone else is finalizing it.
+        return Ok(false);
+    };
+    write_final_totals(invoice).await;
+    if !redis.process(token.release()).await? {
+        // The lease ran out before the release: another holder may
+        // have run at the same time.
+    }
+    Ok(true)
+}
+```
+
+The token is a `LockToken<Lock<u64>>`. It is proof of holding the lock, and the only way to release or extend it:
+
+- `token.release()` outputs `true` if this token still held the lock, `false` if the lease had already run out (and someone else may hold it now).
+- `token.extend()` restarts the lease for another TTL, with the same `true` / `false` meaning.
+
+<Callout type="info" title="Dropping a token does not release the lock">
+  There is no `Drop` impl that talks to Redis. A token that is dropped, for example because the task panicked, leaves the lock held until its lease runs out. Choose the TTL with that in mind: it is the longest time a crashed holder blocks everyone.
+</Callout>
+
+### In Redis
+
+A `Lock` item is one string key, `@@wakuwaku-entity:Lock:<namespace>:<name>`, holding the holder's random 16-byte token:
+
+- Acquire is `SET key token NX PX ttl`, atomic by itself.
+- Release and extend are Lua scripts that act only if the key still holds *this* token. A holder whose lease ran out can't delete or extend the lock of the holder that overtook it.
+
+## Holding a lock longer than its TTL
+
+Work that may outlive the lease must extend it. A heartbeat next to the work does that, and stops the work as soon as an extension reports the lease was lost:
+
+```rust title="src/lease.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::lock::{Lock, LockToken};
+
+/// Run `work` while extending the lease of `token` every third of `lock`'s TTL.
+/// Outputs `None`, dropping `work`, if the lease was lost.
+pub async fn while_held<F: Future>(
+    redis: &Redis,
+    lock: Lock<str>,
+    token: &LockToken<Lock<str>>,
+    work: F,
+) -> RedisResult<Option<F::Output>> {
+    let mut work = std::pin::pin!(work);
+    let mut heartbeat = tokio::time::interval(lock.ttl() / 3);
+    heartbeat.tick().await; // The first tick completes at once.
+    loop {
+        tokio::select! {
+            output = &mut work => return Ok(Some(output)),
+            _ = heartbeat.tick() => {
+                if !redis.process(token.extend()).await? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+```
+
+This helper uses `tokio` directly; add it to `Cargo.toml` if your service doesn't already.
+
+## What a lease can't guarantee
+
+A lease bounds what the lock protects. A process that stalls (a blocked executor thread, a frozen VM, a network partition) may resume after its lease ran out and someone else took the lock, and then keep writing as if it still held it. Extending only narrows that window; it can't close it.
+
+When a stale holder writing must be impossible rather than unlikely, make the protected resource reject it, with a *fencing* value it checks itself. The lock token is random, not increasing, so it can't serve as a fencing token. Use a value from the resource instead, for example a version column checked by the write (`UPDATE … WHERE version = $expected`), or a [transaction](/en/docs/data/transactions) that re-reads the state it decided on.
+
+## Reader-writer locks
+
+`RwLock` lets any number of readers in at once, or one writer alone. `try_read` outputs a `ReadToken`; `try_write` outputs a `LockToken<RwLock<N>>`, the same token type as a `Lock`.
+
+```rust title="src/catalog.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::lock::RwLock;
+
+pub const CATALOG: RwLock<str> = RwLock::new("catalog", Duration::from_secs(10));
+
+pub async fn export(redis: &Redis, shop: &str) -> RedisResult<bool> {
+    let Some(read) = redis.process(CATALOG.try_read(shop)).await? else {
+        return Ok(false); // a writer holds it
+    };
+    // … read the catalog; other readers may do the same …
+    redis.process(read.release()).await?;
+    Ok(true)
+}
+
+pub async fn reprice(redis: &Redis, shop: &str) -> RedisResult<bool> {
+    let Some(write) = redis.process(CATALOG.try_write(shop)).await? else {
+        return Ok(false); // a writer or a reader holds it
+    };
+    // … rewrite the catalog alone …
+    redis.process(write.release()).await?;
+    Ok(true)
+}
+```
+
+Each name is two keys in one cluster hash slot: `…:RwLock:{<namespace>:<name>}:w`, a string holding the writer's token, and `…:r`, a sorted set of reader tokens scored by the end of their lease. Every reader has its own lease; expired readers are pruned by the scripts, so a crashed reader stops blocking writers once its lease ends.
+
+<Callout type="warn" title="Writers can starve">
+  Readers don't wait for a writer that is trying to acquire. Since `try_write` succeeds only when no reader lease is running, a steady stream of overlapping readers can keep a writer out indefinitely.
+</Callout>
+
+## Capabilities
+
+Every lock query, including `try_read`, writes to Redis, so its effect is `Write<Lock<N>>` or `Write<RwLock<N>>`. A `Db<_, ReadOnly>` can't take a lock. Because the lock type is the entity, a custom capability can allow one lock and not another.
+
+## Cron jobs on several replicas
+
+A [cron job](/en/docs/services/cron-jobs) runs in every replica that starts it, on each replica's own schedule. To run it once per interval across the whole deployment, take a lock whose lease covers most of the interval and *don't release it*: the first replica to tick takes it, the others find it held until the next interval.
+
+```rust title="src/report.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisError;
+use wakuwaku::entity::redis::collection::lock::Lock;
+use wakuwaku::{CronJob, CronTick, ServiceCreation};
+
+const HOUR: Duration = Duration::from_secs(60 * 60);
+
+/// Held for most of an interval and never released, so at most one
+/// replica runs the job per interval.
+const REPORT_LEASE: Lock<str> = Lock::new("cron", Duration::from_secs(55 * 60));
+
+pub struct HourlyReport {
+    redis: Redis,
+}
+
+impl ServiceCreation for HourlyReport {
+    type Dep = Redis;
+
+    fn create_service(redis: Redis) -> Self {
+        Self { redis }
+    }
+}
+
+impl Processor<CronTick> for HourlyReport {
+    type Output = ();
+    type Error = RedisError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), RedisError> {
+        let lease = self.redis.process(REPORT_LEASE.try_lock("hourly-report")).await?;
+        if lease.is_none() {
+            return Ok(()); // another replica ran it this hour
+        }
+        build_report().await;
+        Ok(())
+    }
+}
+
+impl CronJob for HourlyReport {
+    const INTERVAL: Duration = HOUR;
+}
+```
+
+Register it like any other job:
+
+```rust title="src/main.rs"
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::redis;
+
+pub async fn main_like() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let (services, cron) = ServiceBuilder::new(connect(&client).await?)
+        .cron_job::<HourlyReport, _>()
+        .start();
+    // … serve until shutdown …
+    cron.shutdown().await;
+    Ok(())
+}
+```
+
+Why not release the lock after the run? Releasing only prevents *overlapping* runs. Replicas start at different times, so their schedules are offset: with release, replica A runs at 12:00 and releases at 12:01, and replica B, whose grid falls at 12:20, takes the free lock and runs the same hour's report again.
+
+The lease must stay shorter than the interval: with a lease of an hour or more, even the replica that took it at 12:00 could find it still held at its 13:00 tick, and that hour would be skipped. If a run may take longer than the lease, wrap it in `while_held` from above so the lease keeps being extended while the run is in progress.
+
+A returned `RedisError` is logged by the cron runtime and the job keeps its schedule. Keep the job idempotent anyway: if Redis loses the key (a failover without persistence, an eviction), two replicas may both run in the same interval.
+
+## Next steps
+
+<Cards>
+  <Card title="Rate limiter" href="/en/docs/data/redis/rate-limiter" description="Limit how often, rather than how many at once." />
+  <Card title="Cron jobs" href="/en/docs/services/cron-jobs" description="Schedules, overlap rules and testing jobs." />
+</Cards>

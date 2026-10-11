@@ -1,0 +1,395 @@
+---
+title: sqlx (PostgreSQL and MySQL)
+description: Connect wakuwaku to PostgreSQL or MySQL through sqlx, write queries as typed values, and send reads to a replica with the split checked by the compiler.
+icon: Database
+---
+
+wakuwaku talks to relational databases through [sqlx](https://github.com/launchbadge/sqlx). An sqlx connection pool becomes a **data source**, `SqlxSource<DB>`, and the data source goes into a `Db<S, C>` handle. A `Db` handle runs your queries, and its capability `C` decides which queries it is allowed to run. Queries are ordinary Rust values: a struct describes what it touches (`Query`) and how it runs on sqlx (`Execute`).
+
+If you have not met `Query`, `Execute`, entities and capabilities yet, read [Queries and capabilities](/en/docs/data/queries) first. This page covers what is specific to sqlx.
+
+## Enabling a backend
+
+The sqlx integration lives in `wakuwaku::entity::sqlx` and is enabled by one of two features of the `wakuwaku` crate:
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-mysql"] }
+```
+
+</Tab>
+</Tabs>
+
+Both features turn on `entity` and re-export sqlx as `wakuwaku::deps::sqlx`. They are additive: a service that talks to both databases enables both.
+
+| Path | What it is |
+|------|------------|
+| `wakuwaku::entity::sqlx::backend::SqlxSource<DB>` | An sqlx `Pool<DB>` as a data source |
+| `wakuwaku::entity::sqlx::backend::PgSource` | `SqlxSource<Postgres>` (feature `sqlx-pg`) |
+| `wakuwaku::entity::sqlx::backend::MySqlSource` | `SqlxSource<MySql>` (feature `sqlx-mysql`) |
+| `wakuwaku::entity::sqlx::transaction` | Transactions written as pure state machines; see [Transactions](/en/docs/data/transactions) |
+| `wakuwaku::deps::sqlx` | The sqlx crate itself, the same version wakuwaku is built against |
+
+## Which sqlx features are enabled
+
+wakuwaku depends on sqlx 0.9 with `default-features = false` and turns on only what it needs itself:
+
+- `runtime-tokio`
+- `postgres` (with `sqlx-pg`) or `mysql` (with `sqlx-mysql`)
+
+Everything else is off. In particular, `wakuwaku::deps::sqlx` has **no TLS, no derive or query macros, no migrations, and no extra column types**. If you need any of them, enable the sqlx feature yourself:
+
+| You need | sqlx feature |
+|----------|--------------|
+| Encrypted connections (`sslmode=require`, `verify-full`; MySQL `ssl-mode=REQUIRED`, …) | `tls-rustls` or `tls-native-tls` |
+| `#[derive(sqlx::FromRow)]` | `derive` |
+| `sqlx::query!`, `sqlx::query_as!` (implies `derive`) | `macros` |
+| `sqlx::migrate!` | `migrate` and `macros` |
+| `Uuid`, `chrono`/`time` dates, `Json<T>`, `Decimal` columns | `uuid`, `chrono` or `time`, `json`, `rust_decimal` |
+
+<Callout type="warn" title="No TLS unless you ask for it">
+Without a TLS feature, sqlx does not refuse to start. With the default `sslmode=prefer` (PostgreSQL) or `ssl-mode=PREFERRED` (MySQL) it connects **in plaintext**. Only a connection string that requires TLS fails, with `TLS upgrade required by connect options but SQLx was built without TLS support enabled`. Enable a TLS feature in production, and require TLS in the connection string.
+</Callout>
+
+You cannot turn these features on through `wakuwaku`: it has no feature that forwards them. Add sqlx as a direct dependency instead, with the same `0.9` version requirement:
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "macros", "migrate"] }
+```
+
+Cargo builds a semver-compatible crate only once and unifies the features every dependent asks for. There is still a single sqlx in the build, now with your features on, and `wakuwaku::deps::sqlx::PgPool` and `sqlx::PgPool` are the same type. The direct dependency is also what the macros need: `#[derive(FromRow)]` and `query!` expand to paths that start with `::sqlx::`, which only resolve when your crate has a dependency named `sqlx`.
+
+<Callout type="info" title="Keep the versions in step">
+If your requirement differs in its first non-zero component (for example `sqlx = "0.10"` while wakuwaku uses 0.9), Cargo builds two sqlx crates, and your pool no longer fits into `SqlxSource`. `cargo tree -i sqlx` should list exactly one sqlx, used by `wakuwaku`, `wakuwaku-entity` and your crate.
+</Callout>
+
+The rest of this page uses only what `wakuwaku::deps::sqlx` provides out of the box.
+
+## Creating a pool and a `Db` handle
+
+Build the pool with sqlx as usual, wrap it in `SqlxSource::new`, and give the source a capability with `Db::new`:
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```rust title="src/db.rs"
+use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn connect(url: &str) -> Result<Db<PgSource, ReadWrite>, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(url)
+        .await?;
+    Ok(Db::new(SqlxSource::new(pool)))
+}
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```rust title="src/db.rs"
+use wakuwaku::deps::sqlx::{self, mysql::MySqlPoolOptions};
+use wakuwaku::entity::sqlx::backend::{MySqlSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn connect(url: &str) -> Result<Db<MySqlSource, ReadWrite>, sqlx::Error> {
+    let pool = MySqlPoolOptions::new()
+        .max_connections(10)
+        .connect(url)
+        .await?;
+    Ok(Db::new(SqlxSource::new(pool)))
+}
+```
+
+</Tab>
+</Tabs>
+
+A few things to know about the handle:
+
+- **Each query acquires its own connection.** A query run through a `Db` takes a connection from the pool and runs in autocommit mode. To run several statements atomically, write a [transaction](/en/docs/data/transactions).
+- **The pool stays private.** `SqlxSource` does not hand its pool back out, so nobody can reach around the capability by running raw SQL on it. Run migrations and other setup on the pool **before** you wrap it.
+- **Handles are cheap to clone.** `SqlxSource` and `Db` are `Clone`, and cloning shares the same pool. This is what `ServiceCreation::Dep` expects; see [ServiceBuilder](/en/docs/core/service-builder).
+
+With the extra features from the previous section, setup with migrations looks like this:
+
+```rust title="src/db.rs"
+use wakuwaku::deps::sqlx::postgres::PgPoolOptions;
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn connect(url: &str) -> Result<Db<PgSource, ReadWrite>, Box<dyn std::error::Error>> {
+    let pool = PgPoolOptions::new().connect(url).await?;
+    // The pool is still yours here: run migrations and other setup first.
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    Ok(Db::new(SqlxSource::new(pool)))
+}
+```
+
+## Writing queries
+
+A query for sqlx implements two traits:
+
+- `Query`, from `wakuwaku::entity`, declares its **effect**: which entities it reads and writes.
+- `Execute<SqlxSource<DB>>` says how it runs. `execute` receives `&mut DB::Connection` (`&mut PgConnection` or `&mut MySqlConnection`), which is an sqlx executor, so you write the body with plain sqlx calls.
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```rust title="src/queries.rs"
+use wakuwaku::deps::sqlx::{self, PgConnection, Postgres};
+use wakuwaku::entity::sqlx::backend::SqlxSource;
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+
+/// The `users` table, as a type.
+pub struct User;
+impl Entity for User {}
+
+/// A row of `users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Look a user up by id.
+pub struct FindUser {
+    pub id: i64,
+}
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+impl Execute<SqlxSource<Postgres>> for FindUser {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Self::Output, sqlx::Error> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, name FROM users WHERE id = $1")
+                .bind(self.id)
+                .fetch_optional(conn)
+                .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+
+/// Rename a user. Returns whether the user existed.
+pub struct RenameUser {
+    pub id: i64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<SqlxSource<Postgres>> for RenameUser {
+    type Output = bool;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
+            .bind(self.id)
+            .bind(self.name)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+}
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```rust title="src/queries.rs"
+use wakuwaku::deps::sqlx::{self, MySql, MySqlConnection};
+use wakuwaku::entity::sqlx::backend::SqlxSource;
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+
+/// The `users` table, as a type.
+pub struct User;
+impl Entity for User {}
+
+/// A row of `users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Look a user up by id.
+pub struct FindUser {
+    pub id: i64,
+}
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+impl Execute<SqlxSource<MySql>> for FindUser {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut MySqlConnection) -> Result<Self::Output, sqlx::Error> {
+        let row: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, name FROM users WHERE id = ?")
+                .bind(self.id)
+                .fetch_optional(conn)
+                .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+
+/// Rename a user. Returns whether the user existed.
+pub struct RenameUser {
+    pub id: i64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<SqlxSource<MySql>> for RenameUser {
+    type Output = bool;
+
+    async fn execute(self, conn: &mut MySqlConnection) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("UPDATE users SET name = ? WHERE id = ?")
+            .bind(self.name)
+            .bind(self.id)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
+}
+```
+
+</Tab>
+</Tabs>
+
+The `Query` half is identical for both databases; only the `Execute` half (placeholders, connection type) changes. A query written in portable SQL may implement `Execute` for both sources.
+
+Rows are decoded into tuples here because tuples implement sqlx's `FromRow` without the `derive` feature. With `derive` enabled you can write `#[derive(sqlx::FromRow)] struct UserRow { … }` and use `sqlx::query_as::<_, UserRow>(…)` instead.
+
+Inside `execute`, `conn` is either a pool connection (the query runs on its own) or the connection of an open transaction (the query runs as a [transaction step](/en/docs/data/transactions)). The same query type works in both places.
+
+<Callout type="info" title="Compile-time checked SQL">
+`sqlx::query!` and `sqlx::query_as!` work inside `execute` as well; they need the `macros` feature and, at build time, either `DATABASE_URL` or sqlx's offline query data. The capability check described below is independent of them: it checks *which* queries run where, not the SQL text.
+</Callout>
+
+### Running a query
+
+`Db<S, C>` implements kanau's `Processor<Q>` for every query `Q` that executes on `S` and whose effect `C` covers. Running a query is a `process` call, and the error type is `sqlx::Error`:
+
+```rust title="src/rename.rs"
+use crate::queries::{FindUser, RenameUser};
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx;
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn rename(db: &Db<PgSource, ReadWrite>) -> Result<(), sqlx::Error> {
+    if let Some(user) = db.process(FindUser { id: 1 }).await? {
+        let renamed = db.process(RenameUser { id: user.id, name: "Ada".into() }).await?;
+        assert!(renamed);
+    }
+    Ok(())
+}
+```
+
+## Primary and replica
+
+A common deployment writes to a primary and reads from replicas. With wakuwaku you give each pool its own handle and its own capability:
+
+- `Db<PgSource, ReadWrite>` on the primary may run any query.
+- `Db<PgSource, ReadOnly>` on the replica may run only queries whose effect reads.
+
+Sending a write to the replica handle is a compile error, not a runtime error from the database:
+
+```rust
+async fn on_replica(replica: &Db<PgSource, ReadOnly>) {
+    // error[E0277]: the trait bound `ReadOnly: CanWrite<User>` is not satisfied
+    let _ = replica.process(RenameUser { id: 1, name: "Ada".into() }).await;
+}
+```
+
+Components should not name the capability at all. Keep them generic over the handle and list the queries they run as `Processor` bounds; the capability is then checked once, where the component is wired to a concrete handle:
+
+```rust title="src/profiles.rs"
+use crate::queries::{FindUser, UserRow};
+use wakuwaku::ServiceBuilder;
+use wakuwaku::ServiceCreation;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
+
+/// Reads user profiles. Generic over the handle: it only lists the queries it runs.
+pub struct Profiles<D> {
+    db: D,
+}
+
+impl<D> Profiles<D>
+where
+    D: Processor<FindUser, Output = Option<UserRow>, Error = sqlx::Error>,
+{
+    pub async fn display_name(&self, id: i64) -> Result<Option<String>, sqlx::Error> {
+        Ok(self.db.process(FindUser { id }).await?.map(|user| user.name))
+    }
+}
+
+/// Wired to the replica: the capability is checked here, once.
+impl ServiceCreation for Profiles<Db<PgSource, ReadOnly>> {
+    type Dep = Db<PgSource, ReadOnly>;
+
+    fn create_service(db: Self::Dep) -> Self {
+        Self { db }
+    }
+}
+
+pub async fn build(primary_url: &str, replica_url: &str) -> Result<(), sqlx::Error> {
+    let primary = PgPoolOptions::new().connect(primary_url).await?;
+    let replica = PgPoolOptions::new().connect(replica_url).await?;
+
+    let services = ServiceBuilder::new(Db::<PgSource, ReadWrite>::new(SqlxSource::new(primary)))
+        .push(Db::<PgSource, ReadOnly>::new(SqlxSource::new(replica)));
+
+    let replica_db = services.provide::<Db<PgSource, ReadOnly>, _>().clone();
+    let profiles = Profiles::create_service(replica_db);
+    let _ = profiles.display_name(1).await?;
+    Ok(())
+}
+```
+
+The two handles have different types, so the `ServiceBuilder` can hold both and `provide` finds each by its type. In a real service you would hand the builder to `grpc_service`, `cron_job` or `iggy_consumer`, which call `create_service` for you; see [ServiceBuilder](/en/docs/core/service-builder). In a unit test, `Profiles` takes any fake that implements `Processor<FindUser>`, so it needs no database at all; see [Testing](/en/docs/core/testing).
+
+<Callout type="warn" title="What the types prove, and what they don't">
+The capability check proves **routing**: code wired to a `Db<_, ReadOnly>` never issues a query *declared* as a write. It cannot prove that a query declared as `Read<User>` contains no `UPDATE`. Keep the database's own guard on replicas: a hot standby rejects writes, and on a primary `default_transaction_read_only = on` (PostgreSQL) or a read-only user does the same.
+</Callout>
+
+A service that may write only some entities can define its own capability instead of `ReadWrite` (for example "read everything, write only `Session`"); see [Queries and capabilities](/en/docs/data/queries).
+
+## API reference
+
+- [`SqlxSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/backend/struct.SqlxSource.html), [`SqlxBackend`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/backend/trait.SqlxBackend.html)
+- [`Db`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html), [`Query`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Query.html), [`Execute`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html)
+- [`wakuwaku::deps`](https://docs.rs/wakuwaku/latest/wakuwaku/deps/index.html)
+
+<Cards>
+  <Card title="Transactions" href="/en/docs/data/transactions" description="Several statements, atomically, written as a pure state machine." />
+  <Card title="Hooks" href="/en/docs/data/hooks" description="Run code before or after every write query." />
+  <Card title="Queries and capabilities" href="/en/docs/data/queries" description="Entities, effects and custom capabilities." />
+</Cards>

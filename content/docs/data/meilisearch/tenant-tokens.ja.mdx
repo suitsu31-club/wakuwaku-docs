@@ -1,0 +1,117 @@
+---
+title: テナントトークン
+description: 短命なトークンでフロントエンドに Meilisearch を直接検索させます。インデックスとスコープは Meilisearch が強制します。
+icon: KeyRound
+---
+
+インクリメンタルサーチは、ブラウザが Meilisearch と直接通信し、サービスを経由する往復がないときに最も快適です。*テナントトークン* はそれを安全にします。テナントトークンは、サーバーが Meilisearch の API キーで署名してクライアントに渡す JWT です。クライアントはそれを API キーとして Meilisearch に送り、Meilisearch はトークンに載っているインデックスだけを、しかも各インデックスについてトークンのフィルターにマッチするドキュメントだけを検索させます。
+
+wakuwaku の [`TokenSigner<C>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/token/struct.TokenSigner.html) は、サーバー側の検索と同じ型付き [フィルター](/ja/docs/data/meilisearch/search#typed-filters) からトークンを作り、トークンに載せられるインデックスをケーパビリティで制限します。
+
+## トークンに署名する
+
+```rust title="src/search/tokens.rs"
+use std::time::{Duration, SystemTime};
+use wakuwaku::deps::meilisearch_sdk::client::Client;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::entity::meilisearch::filter::Filter;
+use wakuwaku::entity::meilisearch::token::TokenSigner;
+use wakuwaku::entity::CanRead;
+
+/// フロントエンドが検索できるもの: posts インデックスだけ。
+pub enum FrontendSearch {}
+impl CanRead<PostIndex> for FrontendSearch {}
+
+/// `search_key` は `search` アクションだけを持つ。`search_key_uid` はその uid。
+pub fn token_signer(
+    url: &str,
+    search_key: &str,
+    search_key_uid: &str,
+) -> Result<TokenSigner<FrontendSearch>, Error> {
+    let client = Client::new(url, Some(search_key))?;
+    Ok(TokenSigner::new(search_key_uid, client))
+}
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// あるワークスペースの投稿を 15 分間検索できるトークン。
+pub fn frontend_token(
+    signer: &TokenSigner<FrontendSearch>,
+    workspace_id: i64,
+) -> Result<String, BoxError> {
+    let expires_at = SystemTime::now() + Duration::from_secs(15 * 60);
+    let token = signer
+        .token(expires_at)
+        .scoped::<PostIndex>(&Filter::Eq(PostFilter::WorkspaceId, workspace_id.into()))?
+        .sign()?;
+    Ok(token)
+}
+```
+
+ビルダーは次のように動きます。
+
+1. `signer.token(expires_at)` は、指定時刻に失効し、まだどのインデックスも許可しないトークンを開始します。
+2. `.scoped::<I>(&scope)` は、`I` のうち `scope` にマッチするドキュメントの検索を許可します。スコープをレンダリングできなければ `FilterError` で失敗します。`.unscoped::<I>()` は `I` のすべてのドキュメントを許可します。同じインデックスに対してもう一度呼ぶと前のルールを置き換えます。複数のインデックスに対して呼べば、複数インデックス用のトークンになります。
+3. `.sign()` はトークンに署名します。失効時刻がすでに過ぎている場合や、キーの uid が UUID v4 でない場合は失敗します。
+
+署名はローカルで行われ、Meilisearch を呼び出しません。そのため、ページを読み込むたびにトークンを発行しても安価です。
+
+### トークンに載せられるインデックス
+
+`TokenSigner<C>` は、`C: Covers<Read<I>>` を満たすインデックス `I` だけを受け付けます。トークンを発行するサービスは、同じケーパビリティのハンドルとまったく同じように制限されます。上の `FrontendSearch` では、users インデックス用のトークンはコンパイルできません。
+
+```rust
+pub fn users_token(signer: &TokenSigner<FrontendSearch>) -> Result<String, Error> {
+    signer
+        .token(SystemTime::now() + Duration::from_secs(60))
+        // error[E0277]: the trait bound `FrontendSearch: Covers<Read<UserIndex>>` is not satisfied
+        .unscoped::<UserIndex>()
+        .sign()
+}
+```
+
+`TokenSigner<ReadOnly>` ならすべてのインデックスのトークンを発行できてしまいます。フロントエンドに応答するサービスには、狭いケーパビリティを選んでください。
+
+## セキュリティモデル
+
+トークンのフィルターは、[サーバー側の検索](/ja/docs/data/meilisearch/search#running-a-search-under-a-scope) のスコープと同じく、検索のフィルター配列の別要素として Meilisearch が適用します。そのため、クライアントが何を送ってもそれを外せません。トークンが制御 *しない* のは、検索のそれ以外のすべてです。
+
+### 署名鍵
+
+- **`search` アクションだけを持つキーで署名してください。** トークンはキー以上のことはできませんが、サーバーに置くキー自体も、検索以上のことができてはいけません。Meilisearch はマスターキーで署名されたトークンを拒否します。
+- **トークンを個別に失効させることはできません。** 署名に使ったキーを削除すると、そのキーが署名したすべてのトークンが失効します。そのため失効時刻が主な制御手段になります。
+- **有効期限は短くしてください。** 日単位ではなく分単位です。クライアントは失効が近づいたら新しいトークンを要求します。ブラウザから漏れたトークンも、すぐに使えなくなります。
+- **ローテーションは新しいキーを作って行います。** 新しいトークンは新しいキーで署名し、古いキーが署名したトークンが失効してから古いキーを削除します。
+
+### クライアントがなお制御できるもの
+
+取得する属性、ファセット、ソート、ページサイズ、ハイブリッド検索は、すべてクライアント次第です。これらは [インデックス設定](/ja/docs/data/meilisearch#index-settings-are-security-settings) で制限します。
+
+- `displayedAttributes` を明示的に列挙してください。既定ではすべての属性が表示されます。
+- フィルター可能な属性はすべてファセットとして使え、トークンのスコープ内のドキュメントの値ごとの件数を明かします。
+- `pagination.maxTotalHits` で、クライアントがどこまで深くページングできるかを制限します。
+- インデックスに設定したエンベッダーは、トークンを持つ誰もが起動できます。
+
+<Callout type="warn" title="ドキュメント型は公開情報">
+  テナントトークンでは、`max_hits_per_page` もドキュメント型へのデシリアライズも効きません。ブラウザは Meilisearch が返すものをそのまま受け取ります。インデックスに保存され表示される属性は、スコープがそのドキュメントを含むすべてのトークン保持者が読めます。
+</Callout>
+
+## トークンかサーバー側の検索か
+
+| | テナントトークン | サーバー側の `Search` |
+|---|---|---|
+| レイテンシ | ブラウザから Meilisearch への 1 ホップ | サービスを経由する 2 ホップ |
+| スコープを強制するもの | 署名済みトークンに基づき Meilisearch | サービスが送るフィルター配列に基づき Meilisearch |
+| ページサイズ、ファセット、ソート | インデックス設定による制限のみ | フィールド enum と `max_hits_per_page` による制限 |
+| 返される属性 | 表示属性 | あなたの `Document` 型 |
+| 失効 | キーを削除する (全トークン) か、期限切れを待つ | 即時: 自分のエンドポイントなので |
+| ネットワークへの露出 | Meilisearch にブラウザから到達できる必要がある | Meilisearch を非公開のままにできる |
+
+スコープ内の誰に見られてもよい表示属性を持つデータに対する、公開向けのインタラクティブな検索にはトークンを使います。より厳密な制御が必要な場合、結果を他のデータと組み合わせる場合、Meilisearch をインターネットから到達可能にしたくない場合は、サーバー側の検索を使います。
+
+## 次のステップ
+
+<Cards>
+  <Card title="検索" href="/ja/docs/data/meilisearch/search" description="型付きフィルターとサーバー側のスコープ。" />
+  <Card title="同期" href="/ja/docs/data/meilisearch/sync" description="トークンが検索する内容を最新に保つ。" />
+</Cards>

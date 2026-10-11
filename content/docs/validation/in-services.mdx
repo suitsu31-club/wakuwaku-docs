@@ -1,0 +1,287 @@
+---
+title: Using proofs in services
+description: Validate gRPC requests at the boundary, pass proofs into domain logic and queries, map errors to tonic::Status, and test predicates.
+icon: ServerCog
+---
+
+Proofs pay off at service boundaries. The pattern is always the same:
+
+1. The handler receives raw input and runs `prove` once, with a context registered in the [`ServiceBuilder`](/en/docs/core/service-builder).
+2. A failure is mapped to a `tonic::Status` and returned.
+3. On success, the `Proven` value is passed inward. Domain functions and queries take `Proven<T, P>`, so no path reaches them without the check.
+
+This page builds a `Register` RPC on top of the `Directory` context and the `NewUsername` predicate from [Composing predicates](/en/docs/validation/composition#io-predicates):
+
+```rust
+pub type NewUsername = And<UsernameAvailable, And<NonEmpty, ShortEnough>>;
+```
+
+## Queries that require a proof
+
+Push the requirement as far down as it goes. A query that inserts a user can only be built from a validated name:
+
+```rust title="src/accounts.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Execute, Query, Write};
+use wakuwaku::proof::Proven;
+
+/// Inserts a user. Can only be built from a name that passed `NewUsername`.
+pub struct InsertUser {
+    name: Proven<String, NewUsername>,
+}
+
+impl InsertUser {
+    pub fn new(name: Proven<String, NewUsername>) -> Self {
+        Self { name }
+    }
+}
+
+impl Query for InsertUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<PgSource> for InsertUser {
+    type Output = i64;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
+        let (id,) = sqlx::query_as::<_, (i64,)>("INSERT INTO users (name) VALUES ($1) RETURNING id")
+            .bind(self.name.subject().as_str())
+            .fetch_one(conn)
+            .await?;
+        Ok(id)
+    }
+}
+```
+
+The field is private, so outside its module the only way to build an `InsertUser` is `InsertUser::new`, which asks for the proof. Keep queries in their own module to get that guarantee.
+
+Domain logic follows the [data access convention](/en/docs/data/queries) of staying generic over the handle, and is typed on the proof:
+
+```rust title="src/accounts.rs"
+/// Domain logic: generic over the handle, typed on the proof.
+pub async fn create_account<D>(db: &D, name: Proven<String, NewUsername>) -> Result<i64, sqlx::Error>
+where
+    D: Processor<InsertUser, Output = i64, Error = sqlx::Error>,
+{
+    db.process(InsertUser::new(name)).await
+}
+```
+
+## Mapping ValidateError to a gRPC status
+
+`ValidateError` and `tonic::Status` are both foreign types, so the orphan rules forbid `impl From<ValidateError<LookupError>> for Status`. Write a function and use it with `map_err`. Compare reasons against their `static`s (equality is by identity; see [Denied reasons](/en/docs/validation#denied-reasons)) and keep I/O errors apart from denials:
+
+```rust title="src/accounts.rs"
+use wakuwaku::deps::tonic::Status;
+use wakuwaku::proof::ValidateError;
+
+pub fn validation_status(error: ValidateError<LookupError>) -> Status {
+    match error {
+        ValidateError::Deny(reason) if reason == TAKEN => Status::already_exists(reason.0),
+        ValidateError::Deny(reason) if reason == EMPTY || reason == TOO_LONG => {
+            Status::invalid_argument(reason.0)
+        }
+        ValidateError::Deny(reason) => Status::failed_precondition(reason.0),
+        // The check could not be decided: nothing is known about the input.
+        ValidateError::IoError(LookupError::Db(error)) => {
+            // Keep database details out of the response.
+            eprintln!("username lookup failed: {error}");
+            Status::unavailable("could not validate the request, try again")
+        }
+    }
+}
+```
+
+| Error | Status | Why |
+| --- | --- | --- |
+| `Deny` for a malformed value | `INVALID_ARGUMENT` | The client sent something that can never be valid. |
+| `Deny` for a conflict with existing state | `ALREADY_EXISTS` / `FAILED_PRECONDITION` | Valid in form, rejected given the current state. |
+| `IoError` | `UNAVAILABLE` (or `INTERNAL`) | Nothing is known about the input; the client may retry. |
+
+The reason strings are meant for the client, so write them that way. Do not put internal details in them.
+
+## The gRPC handler
+
+The service definition is ordinary protobuf:
+
+```proto title="proto/accounts.proto"
+syntax = "proto3";
+
+package accounts;
+
+service Accounts {
+  rpc Register(RegisterRequest) returns (RegisterReply);
+}
+
+message RegisterRequest {
+  string username = 1;
+}
+
+message RegisterReply {
+  int64 id = 1;
+}
+```
+
+Generate the code as described in [gRPC services](/en/docs/services/grpc#generating-code-from-a-proto-file); the generated code needs direct `tonic`, `tonic-prost` and `prost` dependencies and `tonic-prost-build` as a build dependency. The service holds the validation context and the write handle, and is built from one registered dependency through `ServiceCreation`:
+
+```rust title="src/accounts.rs"
+pub mod pb {
+    tonic::include_proto!("accounts");
+}
+
+use pb::accounts_server::{Accounts, AccountsServer};
+use pb::{RegisterReply, RegisterRequest};
+use wakuwaku::ServiceCreation;
+use wakuwaku::deps::tonic::{Request, Response, Status};
+use wakuwaku::entity::{Db, ReadWrite};
+use wakuwaku::proof::{CheckOrder, prove};
+
+/// Registered once in the `ServiceBuilder`; cloned into the service.
+#[derive(Clone)]
+pub struct AccountsDeps {
+    pub directory: Directory,
+    pub writer: Db<PgSource, ReadWrite>,
+}
+
+pub struct AccountsService {
+    directory: Directory,
+    writer: Db<PgSource, ReadWrite>,
+}
+
+impl ServiceCreation for AccountsService {
+    type Dep = AccountsDeps;
+
+    fn create_service(dep: AccountsDeps) -> Self {
+        Self { directory: dep.directory, writer: dep.writer }
+    }
+}
+
+#[tonic::async_trait]
+impl Accounts for AccountsService {
+    async fn register(
+        &self,
+        request: Request<RegisterRequest>,
+    ) -> Result<Response<RegisterReply>, Status> {
+        let RegisterRequest { username } = request.into_inner();
+
+        // 1. Validate at the boundary.
+        let username = prove::<_, NewUsername>(username, &self.directory, CheckOrder::Parallel)
+            .await
+            .map_err(validation_status)?;
+
+        // 2. Hand the proof to the domain.
+        let id = create_account(&self.writer, username).await.map_err(|error| match error {
+            // The name was free when checked, but another request took it since.
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                Status::already_exists(TAKEN.0)
+            }
+            _ => Status::internal("could not create the account"),
+        })?;
+
+        Ok(Response::new(RegisterReply { id }))
+    }
+}
+```
+
+The subject does not have to be a single field. A predicate can be implemented for the whole request message (`impl Predicate<RegisterRequest> for …`) when the rules span several fields.
+
+<Callout type="warn" title="Proofs are snapshots: keep the database constraint">
+`UsernameAvailable` was true when it was checked. Two concurrent requests for the same name can both pass it before either inserts. The proof cannot prevent that; a unique index on `users.name` can. The handler above maps the resulting unique violation to the same `ALREADY_EXISTS` a denial would produce.
+</Callout>
+
+### Choosing the check order
+
+`CheckOrder::Parallel` makes the database lookup and the cheap rules run concurrently, which is a good default when latency matters. With `Sequential`, `NewUsername` would run the lookup first (it is the left operand) and skip the cheap rules if the name is taken. To reject bad names without touching the database, use the staged `check_new_username` from [Cheap checks before I/O](/en/docs/validation/composition#cheap-checks-before-io) instead of `prove::<_, NewUsername>`; it returns the same `Proven<String, NewUsername>`.
+
+## Wiring the context
+
+The context is a dependency like any other. Register it with the service builder; the service clones it out when it is created, and `And` clones it again on every check, so it must be cheap to clone. A `Db` over a `PgSource` wraps a pool handle, so cloning it is cheap.
+
+```rust title="src/accounts.rs"
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::sqlx::postgres::PgPoolOptions;
+use wakuwaku::deps::tonic::service::Routes;
+use wakuwaku::deps::tonic::transport::Server;
+use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
+
+pub async fn serve(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPoolOptions::new().connect(database_url).await?;
+
+    let deps = AccountsDeps {
+        directory: Directory {
+            // Validation only reads, so it gets a read-only handle.
+            users: Db::<_, ReadOnly>::new(PgSource::new(pool.clone())),
+            limits: Limits { max_len: 32 },
+        },
+        writer: Db::<_, ReadWrite>::new(PgSource::new(pool)),
+    };
+
+    let (_services, register) = ServiceBuilder::new(deps)
+        .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+        .into_router_fn();
+
+    let router = Server::builder().add_routes(Routes::default());
+    register(router).serve("[::1]:50051".parse()?).await?;
+    Ok(())
+}
+```
+
+Giving the predicates a `ReadOnly` handle means validation code cannot run a write query: that would not compile (see [Queries](/en/docs/data/queries)). The two handles share one pool here; the capability only controls which queries each handle accepts.
+
+## Testing predicates
+
+Predicates are plain async functions of their subject and context, so pure ones are unit-tested by calling `prove` directly. Assert the specific reason, not just "it failed":
+
+```rust title="src/validation.rs"
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+    use wakuwaku::proof::{CheckOrder, ValidateError, prove};
+
+    fn limits() -> Limits {
+        Limits { max_len: 8 }
+    }
+
+    #[tokio::test]
+    async fn rejects_long_names() {
+        let result = prove::<_, ShortEnough>("a".repeat(9), &limits(), CheckOrder::Sequential).await;
+        assert!(matches!(result, Err(ValidateError::Deny(reason)) if reason == TOO_LONG));
+    }
+
+    #[tokio::test]
+    async fn reports_spare_room() {
+        let Ok(name) = prove::<_, ShortEnough>("haruki".to_owned(), &limits(), CheckOrder::Sequential).await
+        else {
+            panic!("`haruki` fits in 8 bytes");
+        };
+        assert_eq!(name.evidence().spare, 2);
+    }
+
+    #[tokio::test]
+    async fn composite_reports_which_rule_failed() {
+        for order in [CheckOrder::Sequential, CheckOrder::Parallel] {
+            let result = prove::<_, ValidUsername>(String::new(), &limits(), order).await;
+            assert!(matches!(result, Err(ValidateError::Deny(reason)) if reason == EMPTY));
+        }
+    }
+}
+```
+
+`#[tokio::test]` needs a direct `tokio` dependency with the `macros` and `rt` features (`rt-multi-thread` includes `rt`).
+
+A few guidelines:
+
+- **Test both check orders** for composites whose outcome you rely on. They differ in which operands run and which error is reported when several fail (see [Check order](/en/docs/validation/composition#check-order)).
+- **Test the evidence**, not only success. Later code reads it, so a wrong `spare` or a wrong row is a bug even when the check passes.
+- **Functions that take a `Proven` are tested with real proofs.** There is no test-only constructor, by design: get the proof from `prove` in the test. For pure predicates this costs nothing.
+- **I/O predicates** read through a concrete context (`Directory` holds a `Db<PgSource, ReadOnly>`), so test them against a real database in integration tests. Keep the decision itself trivial, as in `UsernameAvailable`, so the interesting logic stays in pure predicates. See [Testing](/en/docs/core/testing) for the overall approach.
+
+## Next steps
+
+<Cards>
+  <Card title="gRPC services" href="/en/docs/services/grpc" description="Code generation and registering servers from the service builder." />
+  <Card title="Queries" href="/en/docs/data/queries" description="Capability-typed queries and the Db handle." />
+  <Card title="Testing" href="/en/docs/core/testing" description="Unit tests for components, integration tests for wiring." />
+</Cards>

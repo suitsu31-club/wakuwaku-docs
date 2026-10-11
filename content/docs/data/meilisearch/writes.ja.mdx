@@ -1,0 +1,132 @@
+---
+title: 書き込み
+description: ドキュメントの upsert と削除、インデックス設定の適用、Meilisearch の非同期タスクの待機を行います。
+icon: PenLine
+---
+
+Meilisearch への書き込みは、データベースへの書き込みとは振る舞いが異なります。リクエストは *タスクをキューに入れる* だけで、Meilisearch はそれを後で適用します。主キーのないドキュメントのようなエラーは、タスクが実行されたときに初めて現れます。wakuwaku の書き込みクエリはこれを明示的にします。各クエリは自分のタスクの [`TaskInfo`](https://docs.rs/meilisearch-sdk/0.33.0/meilisearch_sdk/task_info/struct.TaskInfo.html) を出力し、別のクエリでその完了を待ちます。
+
+| クエリ | エフェクト | 内容 |
+|---|---|---|
+| [`Upsert<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.Upsert.html) | `Write<I>` | ドキュメントを追加し、同じ主キーのドキュメントを置き換えます。 |
+| [`Delete<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.Delete.html) | `Write<I>` | 主キーでドキュメントを削除します。ドキュメントのないキーは無視されます。 |
+| [`ApplySettings<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.ApplySettings.html) | `Write<I>` | インデックスの設定を書き込み、必要ならインデックスを作成します。 |
+| [`WaitTask`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.WaitTask.html) | `()` | タスクの実行完了を待ちます。タスクが失敗していれば失敗します。 |
+
+いずれも `wakuwaku::entity::meilisearch::write` にあります。
+
+<Callout type="info" title="インデックスを手で書くことはまれ">
+  インデックスは別のデータソースの射影です。ほとんどのサービスでは、インデックスに書き込むコードは情報源からドキュメントを読み直す [インデクサー](/ja/docs/data/meilisearch/sync) だけです。このページのクエリはその部品であり、単発のジョブやデプロイ手順で使うものです。
+</Callout>
+
+## インデクサー用のケーパビリティ [#a-capability-for-the-indexer]
+
+`ReadWrite` ではインデクサーがシステムのすべてのエンティティを書けてしまいます。[データベースハンドルを絞り込む](/ja/docs/data/queries) のと同じ方法で、自分のインデックスだけを書けるケーパビリティを与えます。
+
+```rust title="src/search/indexer.rs"
+use wakuwaku::deps::meilisearch_sdk::client::Client;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::entity::meilisearch::MeiliSource;
+use wakuwaku::entity::{CanRead, CanWrite, Db, Entity};
+
+/// インデクサーサービス: すべてのエンティティを読み、posts インデックスだけを書く。
+pub enum PostIndexer {}
+impl<E: Entity> CanRead<E> for PostIndexer {}
+impl CanWrite<PostIndex> for PostIndexer {}
+
+/// `posts` インデックスに対する `documents.*`、`settings.*`、`tasks.get`
+/// を持つキーから作る。
+pub fn indexer_handle(url: &str, key: &str) -> Result<Db<MeiliSource, PostIndexer>, Error> {
+    Ok(Db::new(MeiliSource::new(Client::new(url, Some(key))?)))
+}
+```
+
+これが防ぐ 2 つの誤りは、どちらもコンパイルできません。検索用ハンドルは書き込めません。
+
+```rust
+async fn write_with_search_key(reader: &Db<MeiliSource, ReadOnly>) {
+    // error[E0277]: the trait bound `ReadOnly: CanWrite<PostIndex>` is not satisfied
+    let _ = reader.process(Upsert::<PostIndex>::new(vec![])).await;
+}
+```
+
+posts のインデクサーは別のインデックスに触れられません。
+
+```rust
+async fn write_other_index(meili: &Db<MeiliSource, PostIndexer>) {
+    // error[E0277]: the trait bound `PostIndexer: CanWrite<UserIndex>` is not satisfied
+    let _ = meili.process(Delete::<UserIndex>::new(vec![1])).await;
+}
+```
+
+ケーパビリティと組み合わせて、同じインデックスに限定した Meilisearch の API キーを使ってください。型が拒否するものを Meilisearch も拒否するようになります。
+
+## 書き込みと待機
+
+```rust title="src/search/indexer.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::meilisearch::write::{Delete, Upsert, WaitTask};
+
+/// ドキュメントを書き込み、Meilisearch が適用するまで待つ。
+pub async fn index_posts(
+    meili: &Db<MeiliSource, PostIndexer>,
+    posts: Vec<PostDocument>,
+) -> Result<(), Error> {
+    let task = meili.process(Upsert::<PostIndex>::new(posts)).await?;
+    // Ok(TaskInfo) は「キューに入った」という意味でしかない。不正なドキュメントはここで失敗する。
+    meili.process(WaitTask::new(task, Duration::from_secs(30))).await
+}
+
+/// ドキュメントを削除する。ドキュメントのないキーは無視される。
+pub async fn unindex_posts(
+    meili: &Db<MeiliSource, PostIndexer>,
+    ids: Vec<i64>,
+) -> Result<u32, Error> {
+    let task = meili.process(Delete::<PostIndex>::new(ids)).await?;
+    Ok(task.task_uid)
+}
+```
+
+`Upsert` は `PRIMARY_KEY` を主キーとしてドキュメントを送り、`Delete` はインデックスの `Key` 型のキーを受け取ります。そのため、別のインデックスのドキュメントや型の違うキーはコンパイルできません。
+
+### タスクの振る舞い
+
+- **順序**: 同じインデックスのタスクは、キューに入った順に実行されます。同じキーの upsert の後に delete をすると、ドキュメントは削除された状態で終わります。
+- **成功**: タスクが成功すると、`WaitTask` は `()` を出力します。
+- **失敗**: タスクが失敗すると、`WaitTask` はタスクのエラーを持つ `Error::Meilisearch` で失敗します。
+- **タイムアウト**: タイムアウト後もタスクが保留中なら、`WaitTask` は `Error::Timeout` で失敗します。タスクは実行され続けます。止まったのは待機だけです。
+
+`WaitTask` はどのエンティティにも触れない (エフェクトが `()`) ので、読み取り専用を含むどのハンドルでも実行できます。
+
+<Callout type="warn" title="待たないことは知らないこと">
+  `WaitTask` を省くと、後で失敗した書き込みに気づけません。リクエストの処理経路ではそれも妥当なトレードオフです ([`without_waiting`](/ja/docs/data/meilisearch/sync#delivering-changes-with-a-write-hook) を参照) が、定期的な [再構築](/ja/docs/data/meilisearch/sync#rebuilding-an-index) のように、取りこぼしを修復する仕組みが別にある場合に限ります。
+</Callout>
+
+## 設定の適用 [#applying-settings]
+
+[`SearchIndex::settings()`](/ja/docs/data/meilisearch#the-index-itself) は設定を記述するだけです。`ApplySettings<I>` は、インデックスのフィールド enum から取ったフィルター可能・ソート可能属性と合わせてそれを書き込み、インデックスがなければ作成します。
+
+```rust title="src/search/deploy.rs"
+use wakuwaku::entity::meilisearch::write::ApplySettings;
+
+/// デプロイごとに一度、検索を受け付ける前に実行する。
+pub async fn deploy_settings(meili: &Db<MeiliSource, PostIndexer>) -> Result<(), Error> {
+    let task = meili.process(ApplySettings::<PostIndex>::new()).await?;
+    // フィルター可能属性や検索対象属性を変えると、全ドキュメントが再インデックスされる。
+    meili.process(WaitTask::new(task, Duration::from_secs(600))).await
+}
+```
+
+フィルター可能・ソート可能・検索対象の属性を変更すると、Meilisearch はすべてのドキュメントを再インデックスします。大きなインデックスでは時間がかかります。デプロイ時に実行し、リクエストごとには決して実行しないでください。再インデックス途中のインデックスを検索に見せずに変更を展開したい場合は、代わりにインデックスを [再構築](/ja/docs/data/meilisearch/sync#rebuilding-an-index) します。再構築は新しいコピーに設定を適用してから入れ替えます。
+
+## インデックスへの書き込みとフック
+
+インデックスへの書き込みクエリのエフェクトは `Write<I>` なので、他の書き込みと同様に [書き込みフック](/ja/docs/data/hooks) で包むことはできます。しかし、そうする理由はほとんどありません。インデックスは射影です。フックはその *情報源* への書き込みに掛け、そこからインデックスを更新してください。それが次のページの内容です。
+
+## 次のステップ
+
+<Cards>
+  <Card title="同期" href="/ja/docs/data/meilisearch/sync" description="インデックスを射影元のテーブルと同期させる。" />
+  <Card title="検索" href="/ja/docs/data/meilisearch/search" description="書き込んだものを検索する。" />
+</Cards>

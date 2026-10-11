@@ -1,0 +1,209 @@
+---
+title: Meilisearch
+description: Meilisearch のインデックスをエンティティとしてモデル化し、検索・書き込み・テナントトークンを他のクエリと同じようにケーパビリティで検査します。
+icon: Search
+---
+
+wakuwaku は [Meilisearch](https://www.meilisearch.com) を、PostgreSQL や Redis と同じ [`Db<S, C>`](/ja/docs/data/queries) ハンドルの背後にあるデータソースのひとつとして扱います。検索エンジンにはデータベースと異なる点が 3 つあり、Meilisearch モジュールはそれに合わせて設計されています。
+
+- **クエリがエンドユーザーから直接届くことがあります。** ブラウザが Meilisearch と直接通信する場合さえあります。そのためフィルターとソートは型付けされており、クライアントの JSON から安全にデシリアライズできます。
+- **インデックスは決して信頼できる唯一の情報源 (source of truth) ではありません。** インデックスが保持するのは、別の場所 (多くは SQL テーブル) にあるデータの *射影* です。重要な書き込みはインデックスではなく、その情報源に対するものです。
+- **インデックスは情報源と同期し続ける必要があります。** そこで起こりうる失敗はよく知られています。[同期](/ja/docs/data/meilisearch/sync) のヘルパーが、どのプロジェクトでも共通する部分を引き受けます。
+
+| ページ | 内容 |
+|---|---|
+| このページ | フィーチャーの有効化、インデックスの記述、ケーパビリティと API キー |
+| [検索](/ja/docs/data/meilisearch/search) | 型付きフィルターとソート、サーバーが強制するスコープの下でクライアントの検索を実行する |
+| [書き込み](/ja/docs/data/meilisearch/writes) | ドキュメントの upsert と削除、設定の適用、タスクの待機 |
+| [テナントトークン](/ja/docs/data/meilisearch/tenant-tokens) | フロントエンドから Meilisearch を安全に直接検索させる |
+| [同期](/ja/docs/data/meilisearch/sync) | インデックスを情報源と同期させる: 書き込みフック、トランザクションフック、完全な再構築 |
+
+## フィーチャーの有効化
+
+Meilisearch サポートは `wakuwaku` の `meilisearch` フィーチャーで有効になります。ドキュメントとフィルターのフィールドは serde で (デ)シリアライズするので、derive マクロ付きの `serde` を追加します。クライアントのリクエストを自分でパースする場合は `serde_json` も追加します。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["meilisearch"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+このフィーチャーは [`wakuwaku::entity::meilisearch`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/index.html) (`wakuwaku::entity` として再エクスポートされている `wakuwaku-entity` クレート) を有効にし、土台となる SDK (`meilisearch-sdk` 0.33) を `wakuwaku::deps::meilisearch_sdk` として再エクスポートします。`Client`、`Settings`、エラー型にはこのパスを使ってください。バージョンが常に一致します。
+
+## インデックスを記述する
+
+インデックスは、[`SearchIndex`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/trait.SearchIndex.html) を実装するマーカー型で一度だけ記述します。この型は [`Entity`](/ja/docs/data/queries) でもあるので、ケーパビリティについて知っていることがそのまま当てはまります。記述はドキュメント、フィールド、インデックス本体の 3 つの部分からなります。
+
+### ドキュメント
+
+ドキュメントは検索が返しうるものです。元になる行とは別の型にし、すべての検索者が見てよいデータだけを入れてください。[テナントトークン](/ja/docs/data/meilisearch/tenant-tokens) を持つフロントエンドは、スコープが許すすべてのドキュメントの、表示されるすべての属性を読めます。
+
+```rust title="src/search/posts.rs"
+use serde::{Deserialize, Serialize};
+
+/// 検索が返しうるもの。すべての検索者が見てよいデータだけを入れる。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostDocument {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub author_id: i64,
+    pub title: String,
+    pub summary: String,
+    pub tags: Vec<String>,
+    pub published_at: i64,
+}
+```
+
+### フィルター可能・ソート可能なフィールド
+
+各インデックスは、検索がフィルターに使える属性とソートに使える属性を、[`Field`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/trait.Field.html) を実装するフィールドなし enum として列挙します。`ALL` はすべてのバリアントを並べ、`name` はドキュメント内の属性名を返します (ネストした属性には `author.id` のようにドットを使います)。クライアントが JSON でフィールドを指定できるよう、`Deserialize` も derive します。
+
+```rust title="src/search/posts.rs"
+use wakuwaku::entity::meilisearch::filter::Field;
+
+/// 検索がフィルターとファセットに使える属性。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostFilter {
+    WorkspaceId,
+    AuthorId,
+    Tags,
+    PublishedAt,
+}
+
+impl Field for PostFilter {
+    const ALL: &'static [Self] = &[
+        Self::WorkspaceId,
+        Self::AuthorId,
+        Self::Tags,
+        Self::PublishedAt,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::WorkspaceId => "workspace_id",
+            Self::AuthorId => "author_id",
+            Self::Tags => "tags",
+            Self::PublishedAt => "published_at",
+        }
+    }
+}
+
+/// 検索がソートに使える属性。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostSort {
+    PublishedAt,
+}
+
+impl Field for PostSort {
+    const ALL: &'static [Self] = &[Self::PublishedAt];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::PublishedAt => "published_at",
+        }
+    }
+}
+```
+
+これらの enum が、何をフィルターできるかの唯一の定義です。設定を適用すると、インデックスのフィルター可能属性とソート可能属性はちょうどこれらになり、それ以外を指定するフィルターやソートは Rust で組み立てることも JSON からデシリアライズすることもできません。フィルターもソートもしないインデックスには [`NoField`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/enum.NoField.html) を使います。
+
+<Callout type="warn" title="serde の名前と name() を揃える">
+  serde の名前はクライアントが送るもの、`name()` は Meilisearch が受け取るものです。クライアント向けの名前と保存される属性名を変えられるよう意図的に分かれていますが、両者の一致は検査されません。`#[serde(rename_all = "snake_case")]` と、それに合わせた `name()` の文字列を使うのが最も簡単な揃え方です。
+</Callout>
+
+### インデックス本体 [#the-index-itself]
+
+```rust title="src/search/posts.rs"
+use wakuwaku::deps::meilisearch_sdk::settings::{PaginationSetting, Settings};
+use wakuwaku::entity::Entity;
+use wakuwaku::entity::meilisearch::SearchIndex;
+
+/// `posts` インデックス: `post` テーブルの射影。
+pub struct PostIndex;
+impl Entity for PostIndex {}
+
+impl SearchIndex for PostIndex {
+    const UID: &'static str = "posts";
+    const PRIMARY_KEY: &'static str = "id";
+    type Key = i64;
+    type Document = PostDocument;
+    type Filterable = PostFilter;
+    type Sortable = PostSort;
+
+    fn settings() -> Settings {
+        Settings::new()
+            .with_searchable_attributes(["title", "summary", "tags"])
+            .with_displayed_attributes([
+                "id",
+                "workspace_id",
+                "author_id",
+                "title",
+                "summary",
+                "tags",
+                "published_at",
+            ])
+            .with_pagination(PaginationSetting { max_total_hits: 1000 })
+    }
+}
+```
+
+| 項目 | 意味 |
+|---|---|
+| `UID` | Meilisearch でのインデックスの uid。 |
+| `PRIMARY_KEY` | 各ドキュメントの主キーを持つ属性。 |
+| `Key` | そのキーの型。ドキュメントの削除や、情報源からの再インデックスに使います。 |
+| `Document` | 検索が返すもの。結果はこの型としてデシリアライズされます。 |
+| `Filterable` / `Sortable` | 上のフィールド enum。 |
+| `settings()` | それ以外のすべての設定。設定しなかった項目はインデックス上の現在の値のまま残ります。フィルター可能・ソート可能属性は enum から埋められるので、ここでは設定しません。 |
+
+`settings()` が Meilisearch に書き込まれるのは [`ApplySettings`](/ja/docs/data/meilisearch/writes#applying-settings) を実行したときだけです。通常はデプロイごとに一度実行します。
+
+## インデックス、エンティティ、ケーパビリティ [#indexes-entities-and-capabilities]
+
+各インデックスがそれぞれ独立したエンティティなので、`PostIndex` を検索するクエリのエフェクトは `Read<PostIndex>`、書き込むクエリのエフェクトは `Write<PostIndex>` です。これが *意味しない* ことに注意してください。射影を検索することは `Read<Post>` ではなく、インデックスへの書き込みは `post` テーブルへの書き込み権限を与えません。検索サービスはデータベースへのアクセスなしにインデックスを読め、インデクサーサービスは他の何も書けないままインデックスを書けます。
+
+ハンドルを組み立てるときに、ケーパビリティを Meilisearch の API キーに対応させます。
+
+| ハンドル | ケーパビリティ | API キー |
+|---|---|---|
+| ユーザーの代わりに検索する | `ReadOnly` (またはより狭い独自のケーパビリティ) | `search` アクションを持つキー |
+| インデクサー / 同期ワーカー | 自分のインデックスだけを書ける独自のケーパビリティ ([書き込み](/ja/docs/data/meilisearch/writes#a-capability-for-the-indexer) を参照) | そのインデックスに対する `documents.*`、`settings.*`、`tasks.get` を持つキー |
+| テナントトークンの署名 | 任意。トークンに載せられるインデックスを制限する | `search` アクションだけを持つキー |
+
+型システムが証明するのはルーティングです。`Db<MeiliSource, ReadOnly>` に接続されたコードが書き込みを発行することはありません。Meilisearch 自身に拒否させるのは API キーの役割です。PostgreSQL のレプリカを読み取り専用に保つのと同じく、両方を使ってください。
+
+```rust title="src/search/handles.rs"
+use wakuwaku::deps::meilisearch_sdk::client::Client;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::entity::meilisearch::MeiliSource;
+use wakuwaku::entity::{Db, ReadOnly};
+
+/// すべてのインデックスを検索でき、何も書けないハンドル。
+pub fn search_handle(url: &str, search_key: &str) -> Result<Db<MeiliSource, ReadOnly>, Error> {
+    let client = Client::new(url, Some(search_key))?;
+    Ok(Db::new(MeiliSource::new(client)))
+}
+```
+
+`MeiliSource` はクライアントを `Arc` で包むので、ハンドルの clone は安価です。
+
+## インデックス設定はセキュリティ設定 [#index-settings-are-security-settings]
+
+フロントエンドが Meilisearch と直接通信する場合や、クライアントがサーバー経由でファセットやソートを選べる場合、何が知られるかはインデックス設定で決まります。アクセスルールと同じように見直してください。
+
+- **`displayedAttributes` の既定値はすべての属性です。** 秘密はドキュメント型に入れず、そのうえで表示属性を明示的に列挙してください。
+- **フィルター可能な属性はすべてファセットにもなります。** ファセットは、クライアントが見られるドキュメントの中での値ごとの件数を明かします。
+- **`pagination.maxTotalHits`** で、クライアントがどこまで深くページングできるかを制限します。
+- **インデックスに設定したエンベッダーは**、そのインデックスを検索できるすべてのクライアントが起動できます。
+
+## 次のステップ
+
+<Cards>
+  <Card title="検索" href="/ja/docs/data/meilisearch/search" description="クライアントの JSON から組み立てる型付きフィルターとスコープ付き検索。" />
+  <Card title="書き込み" href="/ja/docs/data/meilisearch/writes" description="upsert、削除、設定、非同期タスク。" />
+  <Card title="テナントトークン" href="/ja/docs/data/meilisearch/tenant-tokens" description="フロントエンドから Meilisearch を直接検索させる。" />
+  <Card title="同期" href="/ja/docs/data/meilisearch/sync" description="インデックスを情報源と同期させる。" />
+</Cards>

@@ -1,0 +1,19 @@
+{
+  "title": "wakuwaku",
+  "pages": [
+    "---はじめに---",
+    "index",
+    "...getting-started",
+    "---コアコンセプト---",
+    "...core",
+    "---サービスを作る---",
+    "...services",
+    "events",
+    "data",
+    "validation",
+    "---ガイド---",
+    "...guides",
+    "roadmap",
+    "[ExternalLink][API リファレンス](https://docs.rs/wakuwaku/latest/wakuwaku/)"
+  ]
+}

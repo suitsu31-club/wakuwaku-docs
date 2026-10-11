@@ -1,0 +1,300 @@
+---
+title: Write Hooks
+description: Run code before or after every write query, for audit logs, cache invalidation and search sync, without changing the handlers that issue the writes.
+---
+
+A write hook wraps a handle and runs a processor around every **write** query that goes through it. Handlers don't change: the wrapped handle has the same output and error as the handle it wraps, so a function that takes `D: Processor<RenameUser>` accepts either one.
+
+There are two wrappers, both in [`wakuwaku::entity`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/index.html):
+
+- [`BeforeWrite`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/struct.BeforeWrite.html) runs the hook, then the query.
+- [`AfterWrite`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/struct.AfterWrite.html) runs the query, then the hook if the query succeeded.
+
+In Spring you might use an aspect or a JPA entity listener for this. Here the hook is an explicit wrapper type around the handle, and whether every write query is supported is checked at compile time.
+
+## What hooks are for
+
+| Use | Wrapper | Notes |
+|---|---|---|
+| Audit log | `AfterWrite` | records only changes that actually happened |
+| Cache invalidation | `AfterWrite` | delete the cached entries of the changed keys; see [Redis](/en/docs/data/redis) |
+| Search index sync | `AfterWrite` | use the Meilisearch `Indexer` as the hook; see [Meilisearch](/en/docs/data/meilisearch) |
+| Metrics, logging the intent | `BeforeWrite` | runs even if the write then fails |
+| Outbox relay | `AfterWrite` | best effort only; see the callout below |
+
+<Callout type="warn" title="Hooks are not atomic with the write">
+The hook runs after the query has committed (or before it starts), on its own. If the process crashes in between, the hook never runs. For changes that must not be lost, write an outbox row in the same [transaction](/en/docs/data/transactions) as the change and deliver it from there. Use hooks for work that a periodic repair can make up for, such as rebuilding a search index or letting a cache entry expire.
+</Callout>
+
+## Describe the change: `WriteQuery`
+
+A hook doesn't receive the query. It receives a **change**, a value that the query builds from itself. Every write query that goes through a hooked handle implements [`WriteQuery`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/trait.WriteQuery.html). Many queries can share one change type, so one hook covers all of them.
+
+This continues the user service from [Queries and handles](/en/docs/data/queries):
+
+```rust title="src/hooks.rs"
+/// What a write on `users` changed. Shared by every write query on users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserChanged {
+    pub ids: Vec<i64>,
+    pub action: &'static str,
+}
+
+impl WriteQuery for RenameUser {
+    type Change = UserChanged;
+
+    fn change(&self) -> UserChanged {
+        UserChanged { ids: vec![self.id], action: "rename" }
+    }
+}
+
+impl WriteQuery for DeactivateUsers {
+    type Change = UserChanged;
+
+    fn change(&self) -> UserChanged {
+        UserChanged { ids: self.ids.clone(), action: "deactivate" }
+    }
+}
+```
+
+<Callout type="info" title="The change is built before the query runs">
+`change(&self)` sees only the query, and it is called before the query runs, even for `AfterWrite`. It can't contain anything the database produces, such as a generated id or a row count. If a hook needs the current state, carry keys in the change and reload by key in the hook, as the Meilisearch `Indexer` does. If it needs the id of a new row, generate the id in the application.
+</Callout>
+
+## Write the hook
+
+A hook is any [`Processor`](https://docs.rs/kanau/latest/kanau/processor/trait.Processor.html) of the change type, with its own output and error. This one records an audit row per changed user, through its own handle to the primary:
+
+```rust title="src/hooks.rs"
+/// The `audit_log` table.
+pub struct AuditLog;
+impl Entity for AuditLog {}
+
+pub struct RecordAudit {
+    pub subject: i64,
+    pub action: &'static str,
+}
+
+impl Query for RecordAudit {
+    type Effect = Write<AuditLog>;
+}
+
+impl Execute<PgSource> for RecordAudit {
+    type Output = ();
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO audit_log (subject, action, at) VALUES ($1, $2, now())")
+            .bind(self.subject)
+            .bind(self.action)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Writes one audit row per changed user.
+#[derive(Clone)]
+pub struct AuditTrail {
+    db: Db<PgSource, ReadWrite>,
+}
+
+impl Processor<UserChanged> for AuditTrail {
+    type Output = ();
+    type Error = sqlx::Error;
+
+    async fn process(&self, change: UserChanged) -> Result<(), sqlx::Error> {
+        for subject in change.ids {
+            self.db.process(RecordAudit { subject, action: change.action }).await?;
+        }
+        Ok(())
+    }
+}
+```
+
+Give the hook the plain handle, not the hooked one. Its own writes then don't go through hooks.
+
+## Handle hook errors
+
+A hook never changes the result of the query. If the hook fails, its error goes to an **error handler**: a processor of the hook's error whose own error is `Infallible`. The handler has to deal with the failure itself, by logging it, retrying, or parking it somewhere for later. A handler can be generic and serve every hook:
+
+```rust title="src/hooks.rs"
+/// Error handler: hook failures end here and never reach the caller.
+#[derive(Clone)]
+pub struct LogHookError;
+
+impl<E: Display + Send + 'static> Processor<E> for LogHookError {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn process(&self, error: E) -> Result<(), std::convert::Infallible> {
+        eprintln!("write hook failed: {error}");
+        Ok(())
+    }
+}
+```
+
+In a real service, log with your tracing setup instead of `eprintln!`.
+
+## Attach the hook
+
+Wrap the handle with `AfterWrite::new(inner, hook, on_error)`:
+
+```rust title="src/hooks.rs"
+/// The primary handle, audited.
+pub type AuditedPrimary = AfterWrite<Db<PgSource, ReadWrite>, AuditTrail, LogHookError>;
+
+pub fn audited(dbs: &Databases) -> AuditedPrimary {
+    let audit = AuditTrail { db: dbs.primary.clone() };
+    AfterWrite::new(dbs.primary.clone(), audit, LogHookError)
+}
+
+pub async fn use_it(dbs: &Databases) -> Result<(), sqlx::Error> {
+    let users = audited(dbs);
+
+    // Same output and error as the plain handle: a drop-in replacement.
+    let renamed: bool = rename_user(&users, 7, "Haruki".into()).await?;
+
+    // Reads pass through without touching the hook.
+    let user: Option<UserRow> = users.process(FindUser { id: 7 }).await?;
+    println!("{renamed} {user:?}");
+    Ok(())
+}
+```
+
+The wrappers derive `Clone`. When the inner handle, the hook and the error handler are all `Clone`, the wrapped handle is too, so you can register it in the [`ServiceBuilder`](/en/docs/core/service-builder) or put it in a dependency struct like any other handle. A type alias such as `AuditedPrimary` keeps those signatures readable. Use `inner()` to reach the wrapped handle.
+
+## Execution order and errors
+
+| | `BeforeWrite` | `AfterWrite` |
+|---|---|---|
+| Order | change, hook, query | change, query, hook |
+| Query fails | the hook has already run; the caller gets the query's error | the hook doesn't run; the caller gets the query's error |
+| Hook fails | the error handler runs, then the query runs anyway | the error handler runs; the caller still gets the query's output |
+| Read query (`ReadKind`) | forwarded untouched | forwarded untouched |
+
+Whether a query is a write is decided by the [`Kind`](/en/docs/data#effects) of its effect. Reads, including queries with the effect `()`, never reach the hook and don't need to implement `WriteQuery`.
+
+The hook is awaited as part of `process`, so the caller waits for it. Keep hooks fast, or hand the work off. For example, the Meilisearch `Indexer` has a `without_waiting()` mode so that requests don't wait for Meilisearch to apply the update.
+
+## Stack hooks
+
+Wrappers wrap any processor of the query, including other wrappers. A second hook that counts writes before they run can't fail:
+
+```rust title="src/hooks.rs"
+/// Counts writes that are about to run. Can't fail.
+#[derive(Clone, Default)]
+pub struct CountWrites(Arc<AtomicU64>);
+
+impl Processor<UserChanged> for CountWrites {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn process(&self, _: UserChanged) -> Result<(), std::convert::Infallible> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+```
+
+Put it inside the audit hook:
+
+```rust title="src/hooks.rs"
+pub type Instrumented =
+    AfterWrite<BeforeWrite<Db<PgSource, ReadWrite>, CountWrites, LogHookError>, AuditTrail, LogHookError>;
+
+pub fn instrumented(dbs: &Databases, counter: CountWrites) -> Instrumented {
+    let counted = BeforeWrite::new(dbs.primary.clone(), counter, LogHookError);
+    AfterWrite::new(counted, AuditTrail { db: dbs.primary.clone() }, LogHookError)
+}
+```
+
+`LogHookError` also serves as the error handler of `CountWrites`, because it is generic and `Infallible` implements `Display`. For a write, the outer `AfterWrite` passes the query to the `BeforeWrite`, which counts it and runs it on the `Db`. When the query succeeds, the audit hook runs. Each layer calls `change()` once for itself.
+
+## What the compiler checks
+
+**Every write query needs a change.** A write query without a `WriteQuery` impl can't run through a hooked handle:
+
+```rust
+users.process(DeletePost { id: 1 }).await
+```
+
+```text
+error[E0277]: the trait bound `DeletePost: WriteQuery` is not satisfied
+   = note: required for `WriteKind` to implement `HookDispatch<DeletePost, Db<SqlxSource<Postgres>, ReadWrite>, AuditTrail, LogHookError>`
+   = note: required for `AfterWrite<Db<SqlxSource<Postgres>, ReadWrite>, AuditTrail, LogHookError>` to implement `Processor<DeletePost>`
+```
+
+**The hook must accept the change.** If `DeletePost` describes itself as a `PostChanged`, the audit hook has to process that too:
+
+```text
+error[E0277]: the trait bound `AuditTrail: Processor<PostChanged>` is not satisfied
+```
+
+Implement `Processor<PostChanged>` for the hook, or run post writes through a different handle. A write can't silently skip its hooks.
+
+**Capabilities still apply.** A wrapper implements `Processor<Q>` only when the handle inside it does. Wrapping a `Db<_, ReadOnly>` doesn't make writes possible.
+
+## Transactions bypass write hooks
+
+Queries inside a [transaction](/en/docs/data/transactions) run on the transaction's connection, so they don't pass through `BeforeWrite` / `AfterWrite`. To act on a transaction, hook its final state with `AfterTransaction`. Its hook receives the flow's report together with what became of the transaction: committed, rolled back, or commit outcome unknown. The two compose: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>` hooks queries run on their own *and* transactions. `AfterWrite::inner()` gives you back the transaction hook.
+
+## Test a hook
+
+A wrapper accepts any processor, so you can test hook behavior without a database. Put a fake in place of the `Db` and a recorder in place of the hook:
+
+```rust title="src/hooks.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+    use tokio::sync::Mutex;
+
+    /// Stands in for the database.
+    struct FakeUsers;
+
+    impl Processor<RenameUser> for FakeUsers {
+        type Output = u64;
+        type Error = &'static str;
+
+        async fn process(&self, query: RenameUser) -> Result<u64, &'static str> {
+            if query.id == 0 { Err("no such user") } else { Ok(1) }
+        }
+    }
+
+    /// Records every change it sees.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<UserChanged>>);
+
+    impl Processor<UserChanged> for Recorder {
+        type Output = ();
+        type Error = Infallible;
+
+        async fn process(&self, change: UserChanged) -> Result<(), Infallible> {
+            self.0.lock().await.push(change);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_runs_only_after_successful_writes() {
+        let recorder = Recorder::default();
+        let users = AfterWrite::new(FakeUsers, &recorder, LogHookError);
+
+        assert_eq!(users.process(RenameUser { id: 7, name: "Haruki".into() }).await, Ok(1));
+        assert_eq!(users.process(RenameUser { id: 0, name: "Nobody".into() }).await, Err("no such user"));
+
+        let seen = recorder.0.lock().await;
+        assert_eq!(*seen, [UserChanged { ids: vec![7], action: "rename" }]);
+    }
+}
+```
+
+`&recorder` works as the hook because kanau implements `Processor` for references to processors. The hook itself (`AuditTrail`) is a processor too, and you can test it on its own. See [Testing](/en/docs/core/testing).
+
+## Next steps
+
+<Cards>
+  <Card title="Transactions" href="/en/docs/data/transactions" description="Atomic multi-query writes, and the AfterTransaction hook." />
+  <Card title="Meilisearch" href="/en/docs/data/meilisearch" description="Keep a search index in sync with an AfterWrite hook." />
+  <Card title="Redis" href="/en/docs/data/redis" description="Caches to invalidate from a hook." />
+</Cards>

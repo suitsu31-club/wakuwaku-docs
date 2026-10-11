@@ -1,0 +1,344 @@
+---
+title: テスト
+description: サービスもインフラも起動せずに、wakuwaku の cron ジョブ、イベントハンドラ、gRPC サービス、述語、データアクセスをユニットテストします。
+icon: FlaskConical
+---
+
+wakuwaku のサービスが正しく配線されていることはコンパイラが証明し、各コンポーネントが正しく動くことはテストが証明します ([証明駆動プログラミング](/ja/docs/core/proof-driven) を参照)。このページでは、あらゆる種類のコンポーネントについてそのテストの書き方を示します。どのテストもサービスを起動せず、ポートも開かず、Iggy もデータベースも必要としません。
+
+手順はいつも同じです。
+
+1. 自分で制御できる依存を渡して、`ServiceCreation::create_service` でコンポーネントを作る。
+2. 手で組み立てた入力で、その唯一の async メソッドを呼ぶ。
+3. 出力と依存の状態を検証する。
+
+例では [ライフサイクル](/ja/docs/core/lifecycle) のサンプルのコンポーネントをテストします。テストは `src/components.rs` の末尾にある `#[cfg(test)]` モジュールに置きます。
+
+```rust title="src/components.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::Balance;
+    use std::time::UNIX_EPOCH;
+    use wakuwaku::ServiceBuilder;
+    use wakuwaku::deps::tonic::Code;
+
+    // ...tests below...
+}
+```
+
+## 準備 [#setup]
+
+`#[tokio::test]` は `tokio` 依存に含まれています (`macros` と `rt` は `full` フィーチャーの一部です)。追加で必要なのは [一時停止したクロック](#controlling-time) 用の `test-util` フィーチャーだけで、本番ビルドに入らないよう `dev-dependencies` に書きます。
+
+```toml title="Cargo.toml"
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+```
+
+## cron ジョブ [#cron-jobs]
+
+cron ジョブは [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html) の [`Processor`](/ja/docs/core/proof-driven#the-processor-abstraction) です。`CronTick` のフィールドはどちらも公開されているので、テストは必要なティックを組み立てて `process` を呼びます。
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test]
+async fn expire_sessions_removes_only_expired_sessions() {
+    let sessions = SessionStore::default();
+    let now = SystemTime::now();
+    sessions.insert("old", now - Duration::from_secs(1));
+    sessions.insert("fresh", now + Duration::from_secs(3600));
+
+    let job = ExpireSessions::create_service(sessions.clone());
+    job.process(CronTick { run: 0, fired_at: now }).await.unwrap();
+
+    assert!(!sessions.contains("old"));
+    assert!(sessions.contains("fresh"));
+}
+```
+
+時刻に依存するロジックは、`fired_at` を自分で設定してテストします。ジョブは `SystemTime::now()` を呼ばずにティックから時刻を読むので、「現在」をテストが決められます。同様に、実行回数に依存する振る舞いは `run` (初回は `0`) を設定してテストできます。
+
+## イベントハンドラ [#event-handlers]
+
+イベントハンドラは `EventHandler::handle` を実装します。引数はイベントのスライスで、一つのキーについて適用すべき順に並んだランです。テストしたいスライスを渡して呼び出します。
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test]
+async fn welcome_mail_is_sent_to_every_new_user() {
+    let mailer = Mailer::default();
+    let handler = SendWelcomeMail::create_service(mailer.clone());
+
+    let run = [
+        UserRegistered { user_id: 1, email: "ann@example.com".into() },
+        UserRegistered { user_id: 1, email: "ann@work.example".into() },
+    ];
+    handler.handle(&run).await.unwrap();
+
+    assert_eq!(mailer.sent(), ["ann@example.com", "ann@work.example"]);
+}
+```
+
+ランがハンドラに届く前に、コンシューマーはキーごとに計画を立て、イベントの [代数](/ja/docs/events/algebra) で縮約しています (たとえば `Associative` なイベントを一つに畳み込みます)。ユニットテストではランを直接渡すので、受け取ったイベントに対してハンドラが何をするかをそのままテストできます。失敗時の扱いを確認するには、返された `HandleError` の `class()` を検証します。[エラー処理](/ja/docs/events/error-handling) を参照してください。
+
+## gRPC サービス [#grpc-services]
+
+gRPC サービスは、tonic が `.proto` から生成したトレイト (ここでは `Accounts`) を実装します。そのメソッドは `tonic::Request` を受け取る普通の async メソッドなので、サーバーもネットワークもなしにテストから呼べます。
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test]
+async fn get_balance_returns_the_stored_balance() {
+    let store = AccountStore::default();
+    store.deposit(7, 1_500);
+    let service = AccountsService::create_service(store);
+
+    let response = service
+        .get_balance(Request::new(GetBalanceRequest { account_id: 7 }))
+        .await
+        .unwrap();
+    assert_eq!(response.into_inner(), Balance { account_id: 7, cents: 1_500 });
+
+    let status = service
+        .get_balance(Request::new(GetBalanceRequest { account_id: 8 }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::NotFound);
+}
+```
+
+メソッドを呼ぶには生成されたトレイトがスコープにある必要があります (`components.rs` が `proto::accounts_server::Accounts` をインポートしており、`use super::*` でテストモジュールにも入ります)。リクエストのメタデータを読むコードをテストするには、呼び出し前に `request.metadata_mut().insert(..)` で設定します。インターセプターなどのミドルウェアはサービスではなく `Server` に設定するものなので、別途テストします。
+
+## 述語 [#predicates]
+
+[述語](/ja/docs/validation) は `prove` で検査します。引数は対象、述語のコンテキスト、`CheckOrder` です。コンテキストには自分で制御できるものを渡します。ここではコンテキストが `AccountStore` そのもので、述語は口座が存在することを、その残高を証拠として持ちながら証明します。
+
+```rust title="src/validation.rs"
+use std::convert::Infallible;
+
+use wakuwaku::proof::{CheckOrder, DeniedReason, Predicate, Proven, ValidateContext, ValidateError, prove};
+
+use crate::components::AccountStore;
+
+impl ValidateContext for AccountStore {
+    type IoError = Infallible;
+}
+
+pub static NO_SUCH_ACCOUNT: DeniedReason = DeniedReason("no such account");
+
+/// The account exists. The evidence is its balance at check time.
+pub struct AccountExists {
+    pub balance: i64,
+}
+
+impl Predicate<u64> for AccountExists {
+    type Ctx = AccountStore;
+    async fn check(
+        account: &u64,
+        store: &AccountStore,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<Infallible>> {
+        match store.balance(*account) {
+            Some(balance) => Ok(AccountExists { balance }),
+            None => Err(ValidateError::Deny(NO_SUCH_ACCOUNT)),
+        }
+    }
+}
+
+/// Only callable with an account that was proven to exist.
+pub fn describe(account: &Proven<u64, AccountExists>) -> String {
+    format!("account {} holds {} cents", account.subject(), account.evidence().balance)
+}
+```
+
+```rust title="src/validation.rs (mod tests)"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn existing_account_is_proven_with_its_balance() {
+        let store = AccountStore::default();
+        store.deposit(7, 250);
+
+        let proven = prove::<_, AccountExists>(7, &store, CheckOrder::Sequential)
+            .await
+            .unwrap();
+        assert_eq!(describe(&proven), "account 7 holds 250 cents");
+    }
+
+    #[tokio::test]
+    async fn unknown_account_is_denied() {
+        let store = AccountStore::default();
+
+        let result = prove::<_, AccountExists>(8, &store, CheckOrder::Sequential).await;
+        assert!(matches!(result, Err(ValidateError::Deny(reason)) if reason == NO_SUCH_ACCOUNT));
+    }
+}
+```
+
+`DeniedReason` はテキストではなく **ポインタの同一性** で比較されます。理由は (`NO_SUCH_ACCOUNT` のように) `static` として一度だけ宣言し、その `static` と比較してください。`ValidateError` は `PartialEq` を実装していないので、上のようにパターンマッチで検証します。
+
+## データアクセス [#data-access]
+
+`wakuwaku::entity` のデータアクセスは、クエリの `Processor` であるハンドルを通して行います ([クエリ](/ja/docs/data/queries))。ビジネスロジックを、実行するクエリを列挙した上でハンドルについてジェネリックに書けば、それらのクエリを処理する任意の Processor でテストできます。
+
+```rust title="src/data.rs"
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::{DataSource, Db, Entity, Execute, Query, Read, ReadOnly, ReadWrite, Write};
+
+pub struct User;
+impl Entity for User {}
+
+/// Look a user's name up by id.
+pub struct FindUser(pub u64);
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+/// Rename a user.
+pub struct RenameUser {
+    pub id: u64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = (Read<User>, Write<User>);
+}
+
+/// Business logic: generic over any handle that can run the queries it needs.
+pub async fn greeting<D>(db: &D, id: u64) -> Result<String, D::Error>
+where
+    D: Processor<FindUser, Output = Option<String>>,
+{
+    let name = db.process(FindUser(id)).await?;
+    Ok(match name {
+        Some(name) => format!("Hello, {name}!"),
+        None => "Hello, stranger!".to_owned(),
+    })
+}
+```
+
+便利なテストダブルが二つあります。
+
+**クエリに直接答える Processor。** 最小のフェイクで、クエリの周辺のロジックをテストするのに向いています。
+
+```rust title="src/data.rs"
+// ---- Test double 1: a processor that answers the query directly.
+
+#[cfg(test)]
+struct FixedUser(&'static str);
+
+#[cfg(test)]
+impl Processor<FindUser> for FixedUser {
+    type Output = Option<String>;
+    type Error = Infallible;
+    async fn process(&self, _: FindUser) -> Result<Option<String>, Infallible> {
+        Ok(Some(self.0.to_owned()))
+    }
+}
+```
+
+**本物の `Db` の裏に置いたインメモリのデータソース。** 接続が共有マップである `DataSource` です。クエリにはそのための `Execute` 実装を用意し、テストでは本物の `Db` ハンドルを使うので、ケイパビリティも検査されます。下の読み取り専用ハンドルでは `RenameUser` を実行できません。
+
+```rust title="src/data.rs"
+// ---- Test double 2: an in-memory data source behind a real `Db` handle.
+
+/// Users kept in memory, shared between clones.
+#[derive(Clone, Default)]
+pub struct MemorySource {
+    users: Arc<Mutex<HashMap<u64, String>>>,
+}
+
+impl DataSource for MemorySource {
+    type Connection = Self;
+    type Error = Infallible;
+    async fn run<Q: Execute<Self>>(&self, query: Q) -> Result<Q::Output, Infallible> {
+        query.execute(&mut self.clone()).await
+    }
+}
+
+impl Execute<MemorySource> for FindUser {
+    type Output = Option<String>;
+    async fn execute(self, conn: &mut MemorySource) -> Result<Option<String>, Infallible> {
+        Ok(conn.users.lock().unwrap().get(&self.0).cloned())
+    }
+}
+
+impl Execute<MemorySource> for RenameUser {
+    type Output = ();
+    async fn execute(self, conn: &mut MemorySource) -> Result<(), Infallible> {
+        conn.users.lock().unwrap().insert(self.id, self.name);
+        Ok(())
+    }
+}
+```
+
+```rust title="src/data.rs (mod tests)"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn greets_with_a_stubbed_query() {
+        assert_eq!(greeting(&FixedUser("Ann"), 1).await.unwrap(), "Hello, Ann!");
+    }
+
+    #[tokio::test]
+    async fn greets_through_a_read_only_handle() {
+        let source = MemorySource::default();
+        let writer: Db<MemorySource, ReadWrite> = Db::new(source.clone());
+        writer.process(RenameUser { id: 1, name: "Ann".into() }).await.unwrap();
+
+        let replica: Db<MemorySource, ReadOnly> = Db::new(source);
+        assert_eq!(greeting(&replica, 1).await.unwrap(), "Hello, Ann!");
+        assert_eq!(greeting(&replica, 2).await.unwrap(), "Hello, stranger!");
+    }
+}
+```
+
+本番で使わないのであれば、インメモリのソースとその `Execute` 実装はテスト専用のコード (`#[cfg(test)]` やテスト支援用モジュール) に置いてください。これらでテストできないのは SQL や Redis のコマンドそのものです。それは本物のデータベースに対する結合テストの役割です。
+
+## 時間の制御 [#controlling-time]
+
+cron のスケジュールのように、*いつ* 起きるかが問題になる振る舞いもあります。`#[tokio::test(start_paused = true)]` を使うと Tokio のクロックは一時停止した状態で始まり、すべてのタスクがタイマー待ちになるたびに先へ進みます。そのため、数分ぶんのスケジュールを数マイクロ秒でテストできます。次のテストは、本物の `ServiceBuilder` から組み立てた本物の `CronRuntime` を動かします。
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test(start_paused = true)]
+async fn expire_sessions_runs_at_start_and_then_every_minute() {
+    let sessions = SessionStore::default();
+    let (_services, cron) = ServiceBuilder::new(sessions.clone())
+        .cron_job::<ExpireSessions, _>()
+        .start();
+
+    sessions.insert("a", UNIX_EPOCH);
+    tokio::time::sleep(Duration::from_secs(1)).await; // t = 1s
+    assert!(!sessions.contains("a")); // run 0 happened at t = 0
+
+    sessions.insert("b", UNIX_EPOCH);
+    tokio::time::sleep(Duration::from_secs(30)).await; // t = 31s
+    assert!(sessions.contains("b")); // no run in between
+    tokio::time::sleep(Duration::from_secs(30)).await; // t = 61s
+    assert!(!sessions.contains("b")); // run 1 happened at t = 60s
+
+    cron.shutdown().await;
+}
+```
+
+<Callout type="warn" title="一時停止するのは Tokio の時間です">
+一時停止したクロックが制御するのは `tokio::time` (sleep、interval、cron のスケジューラ) です。`SystemTime::now()` には影響せず、`CronTick::fired_at` は実時間です。上のテストでずっと昔に期限切れになったセッションを使っているのはそのためで、実行時刻に依存するロジックは [手で作ったティックで `process` を呼ぶ](#cron-jobs) 方法でテストするのが最適です。
+</Callout>
+
+## ユニットテストの範囲外 [#what-unit-tests-leave-out]
+
+- **配線。** すべての依存が登録されているかはテストの仕事ではありません。そうでなければ `ServiceBuilder` のチェーンを組み立てるコードがコンパイルされないからです。[実行間隔ゼロの cron ジョブ](/ja/docs/core/proof-driven#a-cron-job-with-no-interval) も検出できるよう、CI では `cargo check` だけでなく `cargo build` か `cargo test` を実行してください。
+- **インフラ。** トピックやパーティション、SQL 文、Redis スクリプト、ネットワークの挙動には、本物のシステムに対する結合テストが必要です。構成が誤っていれば、[ライフサイクル](/ja/docs/core/lifecycle#startup-failures) で説明した `start` の検査がすぐに失敗します。
+
+<Cards>
+  <Card title="証明駆動プログラミング" href="/ja/docs/core/proof-driven" description="正しさのうち、テストが受け持つ半分。" />
+  <Card title="バリデーション" href="/ja/docs/validation" description="述語、Proven な値、その組み合わせ方。" />
+  <Card title="クエリ" href="/ja/docs/data/queries" description="クエリ、エフェクト、ケイパビリティ付きハンドル。" />
+</Cards>

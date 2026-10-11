@@ -1,0 +1,115 @@
+---
+title: ストリームバッファ
+description: 終端を持つ順序付き配列に本体を追記し、任意の数の購読者が任意のインデックスから追従できるようにします。LLM の回答のチャンクなどに使います。
+icon: ListEnd
+---
+
+[`StreamBuffer`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/stream_buffer/struct.StreamBuffer.html) は追記専用の本体の配列で、プロデューサーが finish すると終わります。任意の数の購読者が任意のインデックスから読み、追記される新しい本体に追従できるので、再接続したクライアントはちょうど止まったところから再開できます。
+
+典型的な用途はストリーミング出力です。ワーカーが LLM を呼び出して各チャンクを追記し、ユーザーの接続を持つ HTTP ハンドラー（別のレプリカでもかまいません）がチャンクをブラウザへストリーミングします。ブラウザが再接続したり、同じ回答を 2 つ目のタブで開いたりした場合は、すでに持っているインデックスから購読します。
+
+## 生産と購読
+
+```rust title="src/completion.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::entity::redis::dynamic::stream_buffer::StreamBuffer;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Chunk {
+    pub text: String,
+}
+
+/// リクエスト ID ごとの LLM の補完。最後のチャンクから 2 分間保持する。
+pub const COMPLETIONS: StreamBuffer<u64, Chunk> =
+    StreamBuffer::new("completion", Duration::from_secs(120));
+
+/// プロデューサー: モデルからストリーミングするワーカー。
+pub async fn produce(redis: &Redis, request: u64, tokens: Vec<String>) -> RedisResult<()> {
+    for text in tokens {
+        if redis.process(COMPLETIONS.append(&request, Chunk { text })).await?.is_none() {
+            break; // すでに finish 済み（ユーザーによるキャンセルなど）
+        }
+    }
+    redis.process(COMPLETIONS.finish(&request)).await?;
+    Ok(())
+}
+
+/// 購読者: すでに `seen` 個のチャンクを受け取ったクライアント
+/// （初回接続では 0）へストリーミングする HTTP ハンドラー。
+pub async fn stream_to_client(
+    redis: &Redis,
+    client: &redis::Client,
+    request: u64,
+    seen: u64,
+) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let mut subscription = redis.process(COMPLETIONS.subscribe(&request, seen, conn)).await?;
+    while let Some(chunk) = subscription.recv().await? {
+        send_to_client(&chunk.text).await;
+    }
+    Ok(())
+}
+```
+
+- `append(name, body)` は本体を追加し、必要ならバッファを作成します。本体のインデックス（0 から）を出力し、バッファがすでに finish 済みなら `None` を出力します。
+- `finish(name)` はバッファを終わらせ、必要なら空のバッファを作成します。購読者は最後の本体の後で終わり、以降の append は `None` を出力します。すでに finish 済みだった場合は `false` を出力します。
+- `subscribe(name, from, conn)` は購読を出力します。購読はまずインデックス `from` 以降の本体を読み、次に新しい本体を待ち、finish 済みのバッファの最後の本体の後で終わります（`recv` が `None` を出力します）。バッファが存在する前に始めてもかまいません。`conn` は[専用コネクション](/ja/docs/data/redis#following-changes-dedicated-connections)です。
+- `remove(name)` はバッファを削除します。
+
+`finish` は *消費者* がプロデューサーを止める手段にもなる（次の `append` が `None` を出力する）ので、「生成を停止」ボタンは、クリックを受けたハンドラーから `finish` を呼ぶだけで実現できます。
+
+## 待たずに読む
+
+`read(name, from)` は、インデックス `from` 以降の本体と、バッファが finish 済みかどうかをブロックせずに出力します。ポーリングするクライアントや、その時点までの内容を 1 回のレスポンスで描画する場合に使います。
+
+```rust
+pub async fn poll(redis: &Redis, request: u64, seen: u64) -> RedisResult<(String, bool)> {
+    let contents = redis.process(COMPLETIONS.read(&request, seen)).await?;
+    let text: String = contents.bodies.into_iter().map(|chunk| chunk.text).collect();
+    Ok((text, contents.finished))
+}
+```
+
+存在しないバッファは空で未 finish として読まれるので、`read` では「まだ始まっていない」と「失効した」を区別できません。購読なら区別できます（後述）。
+
+## Redis 上の表現
+
+各名前は 1 つの Redis ストリーム `@@wakuwaku-entity:StreamBuffer:<namespace>:<name>` です。インデックス `i` の本体は ID `0-(i + 1)` のエントリで、finish 済みのバッファの末尾には終端を示すエントリがもう 1 つあります。`append` と `finish` は終端マーカーを確認して次のエントリをアトミックに書き込む Lua スクリプトなので、複数のプロデューサーの append が同じインデックスを得ることも、終端の後に何かが追記されることもありません。
+
+購読者は持っているインデックスより後を `XREAD BLOCK` で最大 128 エントリずつ読みます。待機する前にすべてに追いつくので、本体を飛ばすことはありません。
+
+## 寿命と TTL
+
+`StreamBuffer::new(namespace, ttl)` は、最後の変更からバッファが生きる時間を決めます。
+
+- 各 `append` と `finish` は TTL をやり直すので、バッファは finish 済みかどうかに関係なく、最後の変更から 1 TTL 生きます。遅れてきた購読者が finish 済みのバッファを再生できる程度に長い TTL を選んでください。
+- 1 TTL の間何も受け取らなかった購読者は、バッファがまだ存在するかを確認します。存在しなければ（finish される前に失効したか削除された）、`recv` は "structure gone" という `RedisError` で失敗し、以降は `None` を出力します。したがって、finish せずにクラッシュしたプロデューサーを購読者が永遠に待つことはありません。
+- バッファがまだ存在する（プロデューサーが遅いだけの）場合、購読者は待ち続けます。それ以外の `recv` の失敗はリトライできます。
+
+## 落とし穴
+
+- **append は冪等ではありません。** Redis が実行した後に `append` がタイムアウトで失敗した場合、リトライすると本体が 2 回追加されます。チャンク化されたテキストなら通常は許容できますが、そうでなければ本体に連番を含め、読み手が重複を捨てるようにしてください。
+- **インデックスはクライアント側で数える。** 再開には、クライアントがすでに受け取った本体の数が必要です。届くたびに数えてください。`append` が出力するインデックスは、同じ数をプロデューサー側から見たものです。
+- **必ず finish する。** 失敗したプロデューサーも `finish` を呼ぶべきです（その前にエラーを表す本体を追記してもよいでしょう）。そうすれば購読者は TTL を待たずにすぐ終わります。
+- **Capability。** `read` と `subscribe` は読み取り、`append`、`finish`、`remove` は書き込みです。
+
+## 他の dynamic な構造との比較
+
+| | [パイプ](/ja/docs/data/redis/pipe) | [ライブビュー](/ja/docs/data/redis/live-view) | ストリームバッファ |
+| --- | --- | --- | --- |
+| 受信者 | ちょうど 1 人 | 任意の数 | 任意の数 |
+| 読むと消費される | はい | いいえ | いいえ |
+| 位置からの再生 | 不可 | バージョンから | インデックスから |
+| 終わり | close されたとき | なし | finish されたとき |
+| 失効 | 最後の書き込みから 1 TTL | なし | 最後の変更から 1 TTL |
+
+## 次のステップ
+
+<Cards>
+  <Card title="Redis の概要" href="/ja/docs/data/redis" description="セットアップ、キー、capability、専用コネクション。" />
+  <Card title="イベント" href="/ja/docs/events" description="Apache Iggy 上の永続的で型付きのイベントストリーム。" />
+</Cards>

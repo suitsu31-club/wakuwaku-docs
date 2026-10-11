@@ -1,0 +1,366 @@
+---
+title: Defining events
+description: Declare partition keys, event types, type tags and body serialization for wakuwaku's Iggy event layer.
+icon: FileCode
+---
+
+An event type in wakuwaku is an ordinary Rust type plus a few trait implementations. Together they answer every question the publisher and the consumer have about it:
+
+| Trait | Answers |
+|---|---|
+| [`PartitionKey`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/trait.PartitionKey.html) (on the key type) | Which topic? Which partition? Which events are ordered together? |
+| [`Event`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/trait.Event.html) | How is the type recognised on the wire? Which key? How much ordering? How can runs be reduced? |
+| [`EventBody`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/trait.EventBody.html) | How are the bytes in the log encoded and decoded? |
+
+This page builds the two events used throughout the section: `OrderPlaced` and `PaymentReceived`, both keyed by an order.
+
+## Partition keys
+
+A partition key is the thing whose events must stay in order: a user, an order, an account. Implement `PartitionKey` on a small type that holds it:
+
+```rust title="src/events.rs"
+use std::hash::DefaultHasher;
+use wakuwaku::iggy::{IggySuperPartitionName, PartitionKey};
+
+/// Every event keyed by an order goes to the `orders` topic.
+#[derive(Hash)]
+pub struct OrderId(pub u64);
+
+impl PartitionKey for OrderId {
+    type PartitionMerge = DefaultHasher;
+    const SUPER_PARTITION_NAME: IggySuperPartitionName = IggySuperPartitionName("orders");
+}
+```
+
+The two items do different jobs:
+
+- **`SUPER_PARTITION_NAME`** is the name of the Iggy **topic** that carries every event keyed by this type. wakuwaku calls it the key type's *super partition*: one topic per key type, divided into Iggy partitions by key. The stream is not part of the key; it comes from the publisher and consumer configuration.
+- **`PartitionMerge`** is the `Hasher` (it must also be `Default`) that turns a key into its 64-bit key hash with [`key_hash`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/fn.key_hash.html). That hash is the Iggy message key, so it picks the partition; it is also the key the consumer groups events by, so it scopes ordering. Equal keys always land in the same partition. Two different keys whose hashes collide are treated as one key: they are ordered and retried together, which is safe but costs concurrency.
+
+<Callout type="warn" title="Every publisher must hash the same way">
+  If two services hash the same key differently, events of one order land in different partitions and their order is lost. The Rust standard library documents that `DefaultHasher`'s algorithm is unspecified and may change between Rust releases. It is fine while all publishers are built with the same toolchain. For a fleet built with different toolchains, or with other languages publishing too, use a hasher with a fixed specification.
+</Callout>
+
+A hasher with a fixed algorithm takes a few lines. This is 64-bit FNV-1a:
+
+```rust title="src/hasher.rs"
+use std::hash::Hasher;
+use wakuwaku::iggy::{IggySuperPartitionName, PartitionKey};
+
+/// 64-bit FNV-1a: a fixed, documented algorithm, so every publisher agrees
+/// regardless of the Rust version it was built with.
+pub struct Fnv1a(u64);
+
+impl Default for Fnv1a {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for Fnv1a {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Hash)]
+pub struct CustomerId(pub u64);
+
+impl PartitionKey for CustomerId {
+    type PartitionMerge = Fnv1a;
+    const SUPER_PARTITION_NAME: IggySuperPartitionName = IggySuperPartitionName("customers");
+}
+```
+
+### Choosing the key type
+
+The key type is a design decision, not a detail:
+
+- **All event types that must be ordered against each other need the same key type.** Ordering only exists inside one key, and one key type means one topic. `OrderPlaced` and `PaymentReceived` are both keyed by `OrderId`, so they share the `orders` topic and the consumer can keep a payment behind the order it pays.
+- **The key decides the unit of concurrency.** Different keys are processed concurrently and a failing key is isolated on its own. A coarse key (one key for a whole tenant) serialises much more than a fine one (one key per order).
+- **One consumer reads one topic.** A consumer's handlers must all belong to one key type; see [One main topic per consumer](/en/docs/events/consuming#one-main-topic-per-consumer).
+
+## Event types
+
+An event type implements `Event`. Here is the first one:
+
+```rust title="src/events.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::iggy::{Event, EventAtomicOrdering, EventBody, EventTypeTag, NonAssociative};
+
+/// An order was placed. Must be handled before anything else of the order.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct OrderPlaced {
+    pub order_id: u64,
+    pub customer: String,
+    pub total_cents: i64,
+}
+
+impl EventBody for OrderPlaced {}
+
+impl Event for OrderPlaced {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = OrderId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> OrderId {
+        OrderId(self.order_id)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Acquire
+    }
+}
+```
+
+### `TYPE_TAG`
+
+Every record carries the [`EventTypeTag`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/struct.EventTypeTag.html) of its type, a `u32`. The consumer dispatches records to handlers by this tag, so it must be **unique among the event types that share a topic**. Tags only need to be unique per topic: `OrderPlaced` (topic `orders`) and an unrelated `CustomerChanged` (topic `customers`) may both use tag `1`.
+
+The consumer enforces part of this for you: `start` fails with `Error::DuplicateEventType` if two registered handlers use the same tag. It cannot see event types that are only published, so keep the tags of one topic in one place, for example next to the key type.
+
+<Callout type="warn" title="Tags are part of the log format">
+  Records already in the log keep the tag they were written with. Never renumber a tag or reuse the tag of a retired event type for a new one. A consumer drops, and logs, records whose tag it has no handler for.
+</Callout>
+
+### `Key`
+
+`type Key` names the key type, and `fn key(&self)` extracts the key of one event. The key type fixes the topic for every event of this type; the key value fixes the partition of each event.
+
+### `Algebra`
+
+`type Algebra` is one of five marker types and says how a *run* may be reduced before it reaches the handler. A run is every event of this type for one key inside one ordering segment of a polled batch, in log order (events of other types may sit between them in the log):
+
+| Marker | Effect on a run | Body must be |
+|---|---|---|
+| `NonAssociative` | none | anything |
+| `Commutative` | none; may be applied in any order | anything |
+| `Idempotent` | adjacent equal events collapse | `Eq` |
+| `IdempotentCommutative` | all equal events collapse | `Ord` |
+| `Associative` | folded into one event | `EventSemigroup` |
+
+The bound is checked at compile time: choosing `Associative` for a body without `EventSemigroup` does not compile. Pick `NonAssociative` when in doubt. The laws each marker promises, and how to choose, are in [Algebra](/en/docs/events/algebra).
+
+The second event of the example folds: the payments of one order add up.
+
+```rust title="src/events.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::iggy::{
+    Associative, Event, EventAtomicOrdering, EventBody, EventSemigroup, EventTypeTag,
+};
+
+/// A payment arrived. Payments of one order add up.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct PaymentReceived {
+    pub order_id: u64,
+    pub amount_cents: i64,
+}
+
+impl EventBody for PaymentReceived {}
+
+impl EventSemigroup for PaymentReceived {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            order_id: self.order_id,
+            amount_cents: self.amount_cents + other.amount_cents,
+        }
+    }
+}
+
+impl Event for PaymentReceived {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(2);
+    type Key = OrderId;
+    type Algebra = Associative;
+
+    fn key(&self) -> OrderId {
+        OrderId(self.order_id)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+### `atomic_ordering`
+
+`atomic_ordering` returns the [`EventAtomicOrdering`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/enum.EventAtomicOrdering.html) of one message relative to the other events of the same key. Unlike `Algebra`, it is a method, so it may depend on the event's contents. Events of the same type and key always keep their log order whatever you return; the ordering only controls movement past events of *other* types:
+
+| Ordering | Within the key |
+|---|---|
+| `Relaxed` | may be reordered with events of other types |
+| `Acquire` | nothing after it is processed before it |
+| `Release` | nothing before it is processed after it |
+| `AcqRel` | both |
+
+In the example, `OrderPlaced` is `Acquire`, so no later payment of the order can be applied before the order exists, and `PaymentReceived` is `Relaxed`. [Ordering](/en/docs/events/ordering) explains segments and fences in detail.
+
+## Serializing the body
+
+The bytes stored in the log are the event's *body*. A body type implements `EventBody`, which is a marker over the two [`kanau::message`](https://docs.rs/kanau/latest/kanau/message/index.html) traits:
+
+```rust title="wakuwaku::iggy (declaration)"
+pub trait EventBody: kanau::message::MessageDe + kanau::message::MessageSer {}
+```
+
+`MessageSer::to_bytes(self) -> Result<Box<[u8]>, Self::SerError>` encodes and `MessageDe::from_bytes(&[u8]) -> Result<Self, Self::DeError>` decodes. wakuwaku does not pick a format for you; the body format is your contract with every other service reading the topic.
+
+### With the JSON derives (recommended)
+
+kanau ships derive macros for these traits. wakuwaku enables kanau's `message` feature, but not a codec, so add kanau yourself with the `serde_json` feature, plus serde:
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["iggy"] }
+kanau = { version = "0.6", features = ["serde_json"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+Then derive `JsonMessageSer` and `JsonMessageDe` next to serde's `Serialize` and `Deserialize`, and mark the type as a body:
+
+```rust
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::iggy::EventBody;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct OrderPlaced {
+    pub order_id: u64,
+    pub customer: String,
+    pub total_cents: i64,
+}
+
+impl EventBody for OrderPlaced {}
+```
+
+<Callout type="info" title="Why a direct kanau dependency?">
+  The derives expand to paths starting with `::kanau`, so `kanau` must be a dependency of your own crate; `wakuwaku::deps::kanau` alone is not enough. Requesting `kanau` 0.6 resolves to the same crate wakuwaku uses, and Cargo merges the features, so `wakuwaku`'s `MessageSer` and the one your derive implements are the same trait. The JSON codec itself (`serde_json`) is reached through kanau, so you do not need a direct `serde_json` dependency.
+</Callout>
+
+JSON is a good default for events: it is human-readable, other languages can produce and consume it, and serde attributes such as `#[serde(default)]` let you add fields without breaking records already in the log. kanau also has features `bincode`, `rkyv`, `prost` and `musli-wire` with matching derives (`BincodeMessageSer`/`BincodeMessageDe` and so on) when you need a compact binary format.
+
+### By hand
+
+Without the derives, implement the two traits directly. The error types only need to convert into kanau's `SerializeError` and `DeserializeError`, so the simplest choice is those types themselves; both wrap an `anyhow::Error`, and any standard error converts into it with `.into()`:
+
+```rust title="src/manual.rs"
+use wakuwaku::deps::kanau::message::{DeserializeError, MessageDe, MessageSer, SerializeError};
+use wakuwaku::iggy::EventBody;
+
+/// A hand-written body: 8 bytes of customer id, little endian.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CustomerTouched {
+    pub customer: u64,
+}
+
+impl MessageSer for CustomerTouched {
+    type SerError = SerializeError;
+
+    fn to_bytes(self) -> Result<Box<[u8]>, SerializeError> {
+        Ok(Box::new(self.customer.to_le_bytes()))
+    }
+}
+
+impl MessageDe for CustomerTouched {
+    type DeError = DeserializeError;
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
+        let bytes: [u8; 8] = bytes
+            .try_into()
+            .map_err(|error: std::array::TryFromSliceError| DeserializeError(error.into()))?;
+        Ok(Self {
+            customer: u64::from_le_bytes(bytes),
+        })
+    }
+}
+
+impl EventBody for CustomerTouched {}
+```
+
+This needs no dependency beyond `wakuwaku`. It is worth it for tiny, stable payloads; for anything with several fields, the derives are less code and less risk.
+
+<Callout type="warn" title="Undecodable records are dropped">
+  When the consumer cannot decode a record, it logs the error with `tracing` and drops the record; it is not retried. Treat a change to the body format like a database migration: keep the decoder able to read every record still retained in the topic.
+</Callout>
+
+## When the event is not the body
+
+So far each event type was its own body: every `EventBody` automatically implements [`IntoEventBody`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/trait.IntoEventBody.html) with itself as `Target`. When the value you publish is a domain type that should not go on the wire as is, implement `IntoEventBody` instead and convert it into a separate body type:
+
+```rust title="src/manual.rs"
+use wakuwaku::iggy::{
+    Event, EventAtomicOrdering, EventTypeTag, IdempotentCommutative, IntoEventBody,
+};
+
+/// A domain type that is published as a separate wire body.
+pub struct Customer {
+    pub id: u64,
+    pub name: String,
+    pub password_hash: String,
+}
+
+/// The event: "this customer changed". Only the id goes on the wire.
+pub struct CustomerChanged(pub Customer);
+
+impl IntoEventBody for CustomerChanged {
+    type Target = CustomerTouched;
+
+    fn into_event_body(self) -> CustomerTouched {
+        CustomerTouched { customer: self.0.id }
+    }
+}
+
+impl Event for CustomerChanged {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = CustomerId;
+    type Algebra = IdempotentCommutative;
+
+    fn key(&self) -> CustomerId {
+        CustomerId(self.0.id)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+The publisher calls `into_event_body` and serializes the result. On the consuming side there is no `CustomerChanged` any more: the consumer decodes records into `Target`, applies the algebra to `Target` (here `IdempotentCommutative`, which is why `CustomerTouched` derives `Ord`), and a handler of `CustomerChanged` receives `&[CustomerTouched]`:
+
+```rust title="src/manual.rs"
+/// Handlers of `CustomerChanged` receive the decoded body type.
+pub struct Reindex;
+
+impl wakuwaku::iggy::EventHandler<CustomerChanged> for Reindex {
+    const MAX_BATCH: std::num::NonZeroUsize = std::num::NonZeroUsize::new(50).unwrap();
+
+    async fn handle(
+        &self,
+        run: &[CustomerTouched],
+    ) -> Result<(), wakuwaku::iggy::error::HandleError> {
+        for touched in run {
+            println!("reindex customer {}", touched.customer);
+        }
+        Ok(())
+    }
+}
+```
+
+## Next steps
+
+<Cards>
+  <Card title="Publishing" href="/en/docs/events/publishing" description="Send OrderPlaced and PaymentReceived to Iggy." />
+  <Card title="Consuming" href="/en/docs/events/consuming" description="Write handlers for them and start a consumer." />
+  <Card title="Ordering" href="/en/docs/events/ordering" description="How atomic_ordering splits a key's events into segments." />
+  <Card title="Algebra" href="/en/docs/events/algebra" description="The laws behind each Algebra marker." />
+</Cards>

@@ -1,0 +1,13 @@
+{
+  "title": "Redis",
+  "icon": "Zap",
+  "pages": [
+    "index",
+    "cache",
+    "lock",
+    "rate-limiter",
+    "pipe",
+    "live-view",
+    "stream-buffer"
+  ]
+}

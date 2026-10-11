@@ -1,0 +1,5 @@
+{
+  "title": "Guides",
+  "icon": "BookOpen",
+  "pages": ["coming-from-spring", "migrating-from-0.3"]
+}

@@ -1,0 +1,317 @@
+---
+title: 述語の合成
+description: And と Or で述語を組み合わせ、チェック順序を選び、データベースを参照する述語を書きます。
+icon: Combine
+---
+
+実際のルールが 1 つのチェックで済むことはまれです。`wakuwaku::proof` には [`And`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.And.html) と [`Or`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.Or.html) の 2 つのコンビネーターがあります。どちらもそれ自体が述語なので入れ子にでき、成り立ったオペランドの証拠を保持します。このページでは [概要](/ja/docs/validation) の `Limits`、`NonEmpty`、`ShortEnough` を使います。
+
+## And [#and]
+
+`And<A, B>` は対象について `A` と `B` の両方が成り立つときに成り立ちます。証拠は両側の証拠を持つタプル構造体 `And(Evidence<A>, Evidence<B>)` なので、分解して使います。
+
+```rust
+pub type ValidUsername = And<NonEmpty, ShortEnough>;
+
+pub fn register(name: Proven<String, ValidUsername>) -> String {
+    let And(_, short_enough) = name.evidence();
+    format!("{} ({} bytes to spare)", name.subject(), short_enough.spare)
+}
+```
+
+`short_enough` は `&Evidence<ShortEnough>` です。フィールドアクセスは `Deref` を通るので、`short_enough.spare` とそのまま書けます。
+
+## Or [#or]
+
+`Or<A, B>` は `A` か `B` (または両方) が成り立つときに成り立ちます。証拠は、どちら側が成り立つと **分かっているか** を記録する列挙型です。
+
+| バリアント | 意味 |
+| --- | --- |
+| `Or::Left(Evidence<A>)` | `A` が成り立った。`B` については何も言わない (失敗した、判定できなかった、またはチェックされていない)。 |
+| `Or::Right(Evidence<B>)` | `B` が成り立った。`A` については何も言わない。 |
+| `Or::Both(Evidence<A>, Evidence<B>)` | 両方が成り立った。 |
+
+証拠に対してパターンマッチすれば、後続のコードは実際に証明された内容に基づいて動けます。後で出てくるサインインの例では「ユーザー名またはメールアドレス」を受け付け、証拠からどちらだったかを判断しています。
+
+```rust
+/// 「ユーザー名またはメールアドレス」欄に入力された値
+pub type SignInId = Or<NameRegistered, EmailRegistered>;
+
+pub fn resolve(login: &Proven<String, SignInId>) -> Result<i64, &'static str> {
+    match login.evidence() {
+        Or::Left(by_name) => Ok(by_name.user.id),
+        Or::Right(by_email) => Ok(by_email.user.id),
+        // あるユーザーの名前が別のユーザーのメールアドレスと一致する: 推測しない
+        Or::Both(by_name, by_email) if by_name.user.id != by_email.user.id => {
+            Err("ambiguous sign-in id")
+        }
+        Or::Both(by_name, _) => Ok(by_name.user.id),
+    }
+}
+```
+
+## チェック順序 [#check-order]
+
+`prove` は [`CheckOrder`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.CheckOrder.html) を受け取り、`And` と `Or` がオペランドをどう評価するかを決めます。順序はそのまま入れ子の述語にも渡されるので、ツリー全体に適用されます。末端の述語も受け取りますが、無視して構いません。
+
+- `CheckOrder::Sequential` はオペランドを左から右へ、1 つずつ await します。
+- `CheckOrder::Parallel` は `tokio::join!` で両方のオペランドを現在のタスク上で並行にポーリングします。タスクは spawn されず、片方が早く失敗しても両方が最後まで実行されます。
+
+その後の振る舞いはコンビネーターによって異なります。
+
+| | `Sequential` | `Parallel` |
+| --- | --- | --- |
+| `And<A, B>` | まず `A`。`A` が失敗するとそのエラーを返し、**`B` は実行されない**。 | 両方実行する。両方失敗した場合は `A` のエラーを返す。 |
+| `Or<A, B>` | `A`、次に `B`。**`A` が成り立っていても `B` は実行される。** | 両方実行する。 |
+
+`Or` はどちらの順序でも短絡評価しません。両側が成り立つときは証拠が `Both` になるので、両方を実行する必要があるからです。結果は次のとおりです。
+
+- 両方成り立つ: `Or::Both`
+- ちょうど片方が成り立つ: その側の証拠。もう一方のエラーは **I/O エラーも含めて** 破棄される
+- 両方失敗: `A` のエラー。`B` のエラーは破棄される
+
+<Callout type="warn" title="Or は失敗した側の I/O エラーを握りつぶします">
+`A` が成り立ち、`B` がデータベース停止のために判定できなかった場合でも、`Or<A, B>` は `Or::Left` で成功します。論理的には正しい (`A` だけで十分) のですが、障害は証明を通じては報告されません。依存しているサービスは別途監視してください。
+</Callout>
+
+### 順序の選び方 [#choosing-an-order]
+
+- 左のオペランドが安価で失敗しやすいときは `Sequential` を使います。`And` では左側が失敗すれば右側をまるごと省けます。
+- 複数のオペランドが I/O を行い、レイテンシが重要なときは `Parallel` を使います。待ち時間が重なります。
+- `Parallel` で複数のオペランドが失敗したときに返るエラーは常に一番左のものです。最も報告したい理由を持つチェックを左に置いてください。
+
+<Callout type="info" title="右側のコンテキストは常に作られます">
+`And` と `Or` は、チェックのたびに左側のコンテキストをクローンして `From` で変換し、右側のオペランドのコンテキストを 1 回作ります ([コンテキストの組み合わせ](#mixing-contexts) を参照)。これは結果的に `B` が実行されない場合でも行われます。コンテキストはハンドル、プール、`Arc` など、クローンが安価なものにしてください。
+</Callout>
+
+## I/O を行う述語 [#io-predicates]
+
+述語は I/O を行えます。コンテキストに必要なハンドルを持たせ、`IoError` 型で起こりうる失敗を表します。ここでは 2 つの述語が `wakuwaku::entity` の読み取り専用 [`Db`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html) ハンドルを通して `users` テーブルを読みます (フィーチャー `sqlx-pg`。クエリの定義方法は [クエリ](/ja/docs/data/queries) を参照)。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+```
+
+まずクエリです。`User` を読むと宣言しているので、`Db<_, ReadOnly>` を通して実行できます。
+
+```rust title="src/users.rs"
+use crate::validation::{Limits, NonEmpty, ShortEnough};
+use std::convert::Infallible;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Db, Entity, Execute, Query, Read, ReadOnly};
+use wakuwaku::proof::{
+    And, CheckOrder, DeniedReason, Or, Predicate, Proven, ValidateContext, ValidateError, prove,
+};
+
+pub struct User;
+impl Entity for User {}
+
+#[derive(Debug, Clone)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+pub struct FindUserByName(pub String);
+
+impl Query for FindUserByName {
+    type Effect = Read<User>;
+}
+
+impl Execute<PgSource> for FindUserByName {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (i64, String)>("SELECT id, name FROM users WHERE name = $1")
+            .bind(self.0)
+            .fetch_optional(conn)
+            .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+
+// `FindUserByEmail` は `WHERE email = $1` にした同じクエリ
+```
+
+次にコンテキストとそのエラー型です。`Directory` はデータベースハンドルに加えて `Limits` も持ちます。その理由は [コンテキストの組み合わせ](#mixing-contexts) で説明します。
+
+```rust title="src/users.rs"
+/// 検索を判定できなかった理由
+#[derive(Debug)]
+pub enum LookupError {
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for LookupError {
+    fn from(e: sqlx::Error) -> Self {
+        LookupError::Db(e)
+    }
+}
+
+/// users テーブルを読む述語のコンテキスト
+#[derive(Clone)]
+pub struct Directory {
+    pub users: Db<PgSource, ReadOnly>,
+    pub limits: Limits,
+}
+
+impl ValidateContext for Directory {
+    type IoError = LookupError;
+}
+```
+
+そして述語です。`UsernameAvailable` は行が **見つからない** ときに成り立つので、持つものはありません。`NameRegistered` は行が **見つかった** ときに成り立ち、その行を証拠として持ちます。証明を持つコードは、ユーザーを再度検索する必要がありません。
+
+```rust title="src/users.rs"
+pub static TAKEN: DeniedReason = DeniedReason("username is already taken");
+pub static UNKNOWN_NAME: DeniedReason = DeniedReason("no user with this name");
+
+/// 「この名前のユーザーはまだいない」
+pub struct UsernameAvailable;
+
+impl Predicate<String> for UsernameAvailable {
+    type Ctx = Directory;
+
+    async fn check(
+        name: &String,
+        ctx: &Directory,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<LookupError>> {
+        let found = ctx
+            .users
+            .process(FindUserByName(name.clone()))
+            .await
+            .map_err(|e| ValidateError::IoError(e.into()))?;
+        match found {
+            None => Ok(UsernameAvailable),
+            Some(_) => Err(ValidateError::Deny(TAKEN)),
+        }
+    }
+}
+
+/// 「この名前のユーザーがいる」。検索で見つかった行を持つ
+pub struct NameRegistered {
+    pub user: UserRow,
+}
+
+impl Predicate<String> for NameRegistered {
+    type Ctx = Directory;
+
+    async fn check(
+        name: &String,
+        ctx: &Directory,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<LookupError>> {
+        match ctx.users.process(FindUserByName(name.clone())).await {
+            Ok(Some(user)) => Ok(NameRegistered { user }),
+            Ok(None) => Err(ValidateError::Deny(UNKNOWN_NAME)),
+            Err(e) => Err(ValidateError::IoError(e.into())),
+        }
+    }
+}
+
+// `EmailRegistered { user }` は `FindUserByEmail` を使う同じ形の述語
+```
+
+データベースのエラーは `Deny` ではなく必ず `IoError` にします。「データベースが応答しなかった」は「名前が使われている」ではありません。[Or](#or) の節の `SignInId = Or<NameRegistered, EmailRegistered>` は、この 2 つの検索を組み合わせたものです。
+
+## コンテキストの組み合わせ [#mixing-contexts]
+
+`And` や `Or` のコンテキストは **1 つ** で、左オペランドのものです。右オペランドは左のコンテキストをクローンし、`From` で変換して自分のコンテキストを得ます。`And<A, B>` (`Or` も同様) では、コンパイラが次を要求します。
+
+| 境界 | 理由 |
+| --- | --- |
+| `A::Ctx: Clone + Send + Sync` | `B` のコンテキストを作るためにクローンされる。 |
+| `B::Ctx: From<A::Ctx>` | `B` のコンテキストは `A` のものから作られる。 |
+| `B` の `IoError: Into<A の IoError>` (`And` のみ) | `And` は `B` が失敗したとき `B` の I/O エラーを返す。`Or` は `A` のエラーしか返さないので変換は不要。 |
+
+つまり、左オペランドが「大きい」コンテキストを持つ必要があります。`Limits` を使うルールを `Directory` の述語の右側に置くには、`Directory` 側に 2 つの変換を用意します。
+
+```rust title="src/users.rs"
+/// `IoError = Infallible` の述語を `And` の右側に置けるようにする
+impl From<Infallible> for LookupError {
+    fn from(never: Infallible) -> Self {
+        match never {}
+    }
+}
+
+/// `Limits` を使う述語を `Directory` の述語の右側に置けるようにする
+impl From<Directory> for Limits {
+    fn from(directory: Directory) -> Self {
+        directory.limits
+    }
+}
+
+/// 新しいアカウントが使える名前
+pub type NewUsername = And<UsernameAvailable, And<NonEmpty, ShortEnough>>;
+```
+
+オペランドを入れ替えると、`Limits` から `Directory` を作れないためコンパイルできません。
+
+```rust
+let _ = prove::<_, And<NonEmpty, UsernameAvailable>>(name, &limits, CheckOrder::Sequential).await;
+// error[E0277]: the trait bound `Directory: From<Limits>` is not satisfied
+// error[E0277]: the trait bound `Infallible: From<LookupError>` is not satisfied
+```
+
+述語の大半が 1 つのコンテキスト型を共有している場合 (サービスごとに 1 つがよくある形です)、これらの境界は自明に満たされ、オペランドの順序を自由に決められます。
+
+### I/O の前に安価なチェックを [#cheap-checks-before-io]
+
+上の `NewUsername` では `UsernameAvailable` が左にあるため、`Sequential` ではデータベース検索が先に実行されます。安価なルールでクエリの前に絞り込みたい場合は、部分ごとに証明して `Proven::from_both` で結合します。
+
+```rust title="src/users.rs"
+/// 安価なルールが先。それを通った名前だけデータベースで確認する
+pub async fn check_new_username(
+    name: String,
+    ctx: &Directory,
+) -> Result<Proven<String, NewUsername>, ValidateError<LookupError>> {
+    let rules = match prove::<_, And<NonEmpty, ShortEnough>>(name, &ctx.limits, CheckOrder::Sequential).await {
+        Ok(rules) => rules,
+        Err(ValidateError::Deny(reason)) => return Err(ValidateError::Deny(reason)),
+        Err(ValidateError::IoError(never)) => match never {},
+    };
+    let available =
+        prove::<_, UsernameAvailable>(rules.subject().clone(), ctx, CheckOrder::Sequential).await?;
+    // 2 つの証明は等しい文字列についてのものなので、連言が成り立つ
+    Proven::from_both(available, rules).map_err(|_| unreachable!("same subject"))
+}
+```
+
+`from_both(a, b)` は `T: Eq` を要求します。2 つの対象を比較し、`a` の対象と両方の証拠を保持します。対象が異なる場合は両方の証明をそのまま返します。この健全性は `T` の `Eq` に依存します。述語が見ているフィールドを無視する独自の `Eq` を実装していると、別の値に対する証明が通ってしまいます。
+
+## 入れ子 [#nesting]
+
+`And` と `Or` は述語なので、いくらでも入れ子にできます。使う形には `NewUsername` のように型エイリアスで名前を付けてください。証拠も同じように入れ子になります。内側のコンビネーターには `Evidence` を Deref してたどり着きます。
+
+```rust title="src/users.rs"
+pub fn spare_bytes(name: &Proven<String, NewUsername>) -> usize {
+    let And(_available, rules) = name.evidence();
+    let And(_non_empty, short_enough) = &**rules;
+    short_enough.spare
+}
+```
+
+`rules` は `&Evidence<And<NonEmpty, ShortEnough>>` で、`&**rules` はその中の `&And<NonEmpty, ShortEnough>` です。
+
+## 証明の分割と結合 [#splitting-and-joining-proofs]
+
+組み合わせた述語をチェックするだけでなく、再チェックせずに組み合わせとその部分の間を行き来できます。
+
+| メソッド | 変換元 | 変換先 |
+| --- | --- | --- |
+| `Proven::into_a` / `into_b` | `Proven<T, And<A, B>>` | `Proven<T, A>` / `Proven<T, B>` (もう一方の証拠は破棄) |
+| `Proven::from_a` / `from_b` | `Proven<T, A>` / `Proven<T, B>` | `Proven<T, Or<A, B>>` (`Or::Left` / `Or::Right`) |
+| `Proven::from_both` | 対象が等しい `Proven<T, A>` と `Proven<T, B>` | `Proven<T, And<A, B>>` |
+
+並べ替え、括り直し、分配は [証明の導出](/ja/docs/validation/derivation) のブール代数の法則で行います。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="証明の導出" href="/ja/docs/validation/derivation" description="交換律、結合律、吸収律などを証明に適用します。" />
+  <Card title="サービスでの証明の利用" href="/ja/docs/validation/in-services" description="Directory コンテキストを ServiceBuilder に登録し、gRPC リクエストを検証します。" />
+</Cards>

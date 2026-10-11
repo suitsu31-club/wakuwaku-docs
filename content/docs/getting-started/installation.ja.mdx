@@ -1,0 +1,151 @@
+---
+title: インストール
+description: Rust ツールチェーンを用意し、適切なフィーチャーフラグで wakuwaku を追加して、各フィーチャーが接続するインフラを準備します。
+icon: Download
+---
+
+## Rust ツールチェーン
+
+wakuwaku は Rust edition 2024 で書かれているため、Rust 1.85 以上が必要です。さらに依存クレートによって下限が引き上げられます。wakuwaku 1.0.0-rc1 でロックされているバージョンでは、有効にするフィーチャーごとに次のとおりです。
+
+| フィーチャー                 | 必要な Rust | 引き上げている依存      |
+| ---------------------------- | ----------- | ----------------------- |
+| デフォルト (`grpc`、`proof`) | 1.88        | `tonic` 0.14            |
+| `redis`                      | 1.88        | `redis` 1.x             |
+| `meilisearch`                | 1.89        | `uuid` (`meilisearch-sdk` 経由) |
+| `sqlx-pg`、`sqlx-mysql`      | 1.94        | `sqlx` 0.9              |
+| `iggy`                       | 1.95        | `iggy` 0.11             |
+
+これらの依存の新しいリリースでさらに下限が上がる可能性があるため、最新の stable ツールチェーンを使ってください。
+
+```bash
+rustup update stable
+```
+
+gRPC のコード生成には、Protocol Buffers コンパイラ `protoc` が `PATH` 上に必要です。ビルドスクリプトは [クイックスタート](/ja/docs/getting-started/quick-start) で紹介します。
+
+## wakuwaku を追加する
+
+必要なフィーチャーを指定して `wakuwaku` を追加し、ランタイム用に `tokio` も追加します。
+
+```toml tab="gRPC サービス"
+[dependencies]
+wakuwaku = "1.0.0-rc1" # デフォルト: grpc, proof
+tokio = { version = "1.53", features = ["full"] }
+```
+
+```toml tab="イベント + PostgreSQL + Redis"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["iggy", "sqlx-pg", "redis"] }
+tokio = { version = "1.53", features = ["full"] }
+```
+
+```toml tab="検索インデクサー"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg", "meilisearch"] }
+tokio = { version = "1.53", features = ["full"] }
+```
+
+```toml tab="gRPC なし"
+[dependencies]
+# イベントを消費して MySQL に書き込むだけのワーカー
+wakuwaku = { version = "1.0.0-rc1", default-features = false, features = ["iggy", "sqlx-mysql"] }
+tokio = { version = "1.53", features = ["full"] }
+```
+
+`entity` は `sqlx-pg`、`sqlx-mysql`、`redis`、`meilisearch` のどれかを有効にすると自動で有効になります。`entity` だけを有効にするのは、データソースなしでクエリやケイパビリティの型だけを使いたい場合 (たとえばインメモリストア向けのクエリを定義するクレート) に限られます。
+
+<Callout type="info" title="リリース候補について">
+`"1.0.0-rc1"` という指定は、以降のリリース候補や 1.0.0 自体も受け入れます。次の候補版へ移るタイミングを自分で決めたい場合は `"=1.0.0-rc1"` と書いてください。
+</Callout>
+
+## `wakuwaku::deps` を使う理由
+
+あるクレートのあるバージョンの型は、別バージョンの同じアイテムとは別の型です。サービスが `sqlx` 0.8 に依存し、wakuwaku が `sqlx` 0.9 を使っていると、自分で作ったプールは `wakuwaku::entity` が受け取るプールとは別物になり、読み解きにくい型の不一致エラーになります。
+
+wakuwaku は、公開 API に現れるサードパーティのクレートをすべて再エクスポートすることでこの問題を避けています。
+
+| パス                         | フィーチャー              |
+| ---------------------------- | ------------------------- |
+| `wakuwaku::deps::kanau`      | 常に有効                  |
+| `wakuwaku::deps::tonic`      | `grpc`                    |
+| `wakuwaku::deps::iggy`       | `iggy`                    |
+| `wakuwaku::deps::sqlx`       | `sqlx-pg` または `sqlx-mysql` |
+| `wakuwaku::deps::redis`      | `redis`                   |
+| `wakuwaku::deps::meilisearch_sdk` | `meilisearch`        |
+
+これらのクレートを自分で追加する代わりに、次のパスからインポートします。
+
+```rust
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::PgPool;
+use wakuwaku::deps::tonic::{Request, Response, Status};
+```
+
+### 直接の依存が必要になる場合 [#when-you-need-a-direct-dependency]
+
+次の 2 つの場合は、それでも直接の依存が必要です。どちらの場合も wakuwaku が使うバージョンと互換性のあるバージョン指定にしてください。そうすれば Cargo がクレートを 1 つにまとめ、型も同一になります。
+
+**クレートをパスで参照する生成コードと derive マクロ。** `tonic-prost-build` が生成するコードは `tonic`、`tonic_prost`、`prost` を参照し、kanau の JSON 用 derive は `::kanau::...` というパスに展開されます。これらは `wakuwaku::deps` 経由のパスでは解決できません。
+
+```toml
+[dependencies]
+# tonic-prost-build が生成するコードが必要とします (クイックスタート参照)
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+# イベントやキャッシュの本体に付ける #[derive(JsonMessageSer, JsonMessageDe)] が必要とします
+kanau = { version = "0.6", features = ["serde_json"] }
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+```
+
+メッセージ本体のシリアライズについては [イベントの定義](/ja/docs/events/defining-events#serializing-the-body) で説明しています。
+
+**再エクスポートされたクレートの追加フィーチャー。** wakuwaku は `sqlx` と `redis` をデフォルトフィーチャーなしでビルドします。sqlx に入るのは Tokio ランタイムとデータベースドライバーだけ、redis に入るのは Tokio 用の接続とスクリプトのサポートだけで、どちらにも TLS は含まれません。フィーチャーを追加したい場合は、同じメジャーバージョンでそのクレートを追加し、必要なフィーチャーだけを指定します。Cargo はフィーチャーを、wakuwaku も使っている 1 つのクレートに統合します。
+
+```toml
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg", "redis"] }
+sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "migrate", "uuid"] }
+redis = { version = "1", default-features = false, features = ["tokio-rustls-comp"] }
+```
+
+このとき `sqlx::PgPool` と `wakuwaku::deps::sqlx::PgPool` は同じ型になります。
+
+## Tokio ランタイム
+
+wakuwaku は [Tokio](https://tokio.rs) 上で動きます。cron ジョブ、イベントコンシューマー、gRPC サーバーは Tokio のタスクとして起動され、Tokio ランタイムの外で cron ジョブを開始すると panic します。wakuwaku 自身が Tokio の `full` フィーチャーを有効にしているので、`features = ["full"]` で `tokio` を追加しても余計なコストはかかりません。`#[tokio::main]`、`#[tokio::test]`、`tokio::signal` を使うために直接の依存が必要です。
+
+## インフラ
+
+各フィーチャーは、自分で運用するサーバーに接続します。
+
+| フィーチャー  | 必要なもの                  | 補足 |
+| ------------- | --------------------------- | ---- |
+| `grpc`        | なし                        | サービス自身がサーバーです。 |
+| `iggy`        | [Apache Iggy](https://iggy.apache.org) サーバー | サンプルは `iggy://iggy:iggy@localhost:8090` で接続します。コンシューマーを起動する前に、ストリームと各メイントピックを作成してください。トピック名はパーティションキーのスーパーパーティション名です。コンシューマーが作成するのはリトライ用トピック `retry_<topic>` だけです。 |
+| `sqlx-pg`     | PostgreSQL                  | マイグレーションは、プールをラップする前にそのプールで実行します。 |
+| `sqlx-mysql`  | MySQL (InnoDB)              | PostgreSQL と同様です。 |
+| `redis`       | Redis                       | マルチプレックス接続で接続します。クローンは 1 本のソケットを共有します。 |
+| `meilisearch` | Meilisearch                 | インデックスは、別の場所にあるデータの射影です。 |
+
+詳しいセットアップは各フィーチャーのページで説明しています: [イベント](/ja/docs/events)、[sqlx](/ja/docs/data/sqlx)、[Redis](/ja/docs/data/redis)、[Meilisearch](/ja/docs/data/meilisearch)。
+
+## セットアップを確認する
+
+一度ビルドして、依存を取得・コンパイルします。
+
+```bash
+cargo build
+```
+
+一部の検査は、コードを完全にコンパイルしたときにだけ実行されます。たとえば間隔が 0 の cron ジョブは `cargo check` を通過し、`cargo build` で失敗します。CI では `cargo build` か `cargo test` を使ってください。
+
+<Cards>
+  <Card title="クイックスタート" href="/ja/docs/getting-started/quick-start" description="cron ジョブ付きの gRPC サービスをゼロから作ります。" />
+  <Card title="サービスビルダー" href="/ja/docs/core/service-builder" description="共有する依存の登録と解決の仕組み。" />
+</Cards>

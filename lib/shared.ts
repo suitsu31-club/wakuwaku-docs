@@ -1,21 +1,29 @@
-import { createGetUrl } from 'fumadocs-core/source';
+import { createGetUrl } from "fumadocs-core/source";
 
-export const appName = 'My App';
-export const docsRoute = '/docs';
-export const docsImageRoute = '/og/docs';
-export const docsContentRoute = '/llms.mdx/docs';
+export const appName = "wakuwaku";
+export const siteUrl = "https://www.wakuwaku.rs";
+export const docsRoute = "/docs";
+export const docsImageRoute = "/og/docs";
+export const docsContentRoute = "/llms.mdx/docs";
+export const apiReferenceUrl = "https://docs.rs/wakuwaku/latest/wakuwaku/";
 
-// fill this with your actual GitHub info, for example:
 export const gitConfig = {
-  user: 'fuma-nama',
-  repo: 'fumadocs',
-  branch: 'main',
+  user: "suitsu31-club",
+  repo: "wakuwaku",
+  branch: "main",
+};
+
+/** Repository of this documentation site, used for "edit this page" links. */
+export const docsGitConfig = {
+  user: "suitsu31-club",
+  repo: "wakuwaku-docs",
+  branch: "main",
 };
 
 const getContentUrl = createGetUrl(docsContentRoute);
 
 export function getPageMarkdownUrl(page: { slugs: string[]; locale?: string }) {
-  const segments = [...page.slugs, 'content.md'];
+  const segments = [...page.slugs, "content.md"];
 
   return { segments, url: getContentUrl(segments, page.locale) };
 }
@@ -23,7 +31,7 @@ export function getPageMarkdownUrl(page: { slugs: string[]; locale?: string }) {
 const getImageUrl = createGetUrl(docsImageRoute);
 
 export function getPageImageUrl(page: { slugs: string[]; locale?: string }) {
-  const segments = [...page.slugs, 'image.png'];
+  const segments = [...page.slugs, "image.png"];
 
   return { segments, url: getImageUrl(segments, page.locale) };
 }

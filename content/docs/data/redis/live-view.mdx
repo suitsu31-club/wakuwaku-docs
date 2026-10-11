@@ -1,0 +1,178 @@
+---
+title: Live views
+description: Keep a durable, versioned document in Redis whose writers commit diffs optimistically and whose subscribers follow every change.
+icon: Eye
+---
+
+A [`LiveView`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/live_view/struct.LiveView.html) holds a body `B` at a version, starting at 1, and the history of diffs that led to it. Writers move it forward one commit at a time; subscribers follow it as a stream of diffs. Think of a live scoreboard, an order-tracking page, a shared to-do list, or a dashboard that many browsers watch while a few backends update it.
+
+It combines three things that are usually built separately:
+
+- **O(1) reads of the latest version**, like a cache.
+- **Optimistic concurrency**: each commit names the version it builds on, so writers that race see a conflict instead of overwriting each other.
+- **A replayable change feed**: subscribers receive a diff per commit, and a subscriber that fell behind catches up, receiving a full snapshot only when the diffs it missed were squashed away.
+
+<LiveViewDiagram lang="en" />
+
+## Defining the body and its diff
+
+The body implements [`LiveViewDiff`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/live_view/trait.LiveViewDiff.html): it names its diff type and how to apply one. Both are serialized with kanau's `MessageSer` / `MessageDe`.
+
+```rust title="src/scoreboard.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use wakuwaku::entity::redis::dynamic::live_view::LiveViewDiff;
+
+#[derive(Clone, Default, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Scoreboard {
+    pub scores: BTreeMap<String, u32>,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Scored {
+    pub team: String,
+    pub points: u32,
+}
+
+impl LiveViewDiff for Scoreboard {
+    type Diff = Scored;
+
+    fn apply(&mut self, diff: Scored) {
+        *self.scores.entry(diff.team).or_default() += diff.points;
+    }
+}
+```
+
+`apply` is plain Rust, so unit-test it like any other function: it decides what every subscriber will see.
+
+## Writing: create and commit
+
+```rust title="src/scoreboard.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::entity::redis::dynamic::live_view::{Commit, LiveView};
+
+/// Scoreboards per game, squashed after 200 diffs.
+pub const SCOREBOARDS: LiveView<u64, Scoreboard> = LiveView::new("scoreboard", 200);
+
+pub async fn open_game(redis: &Redis, game: u64) -> RedisResult<bool> {
+    redis.process(SCOREBOARDS.create(&game, Scoreboard::default())).await
+}
+
+/// Outputs the new version, `None` if the game doesn't exist.
+pub async fn score(redis: &Redis, game: u64, team: &str, points: u32) -> RedisResult<Option<u64>> {
+    loop {
+        let Some(latest) = redis.process(SCOREBOARDS.get(&game)).await? else {
+            return Ok(None);
+        };
+        let diff = Scored { team: team.to_owned(), points };
+        let mut next = latest.body;
+        next.apply(diff.clone());
+        match redis.process(SCOREBOARDS.commit(&game, latest.version, diff, next)).await? {
+            Commit::Committed { version } => return Ok(Some(version)),
+            // Another writer committed first: rebuild on the new head.
+            Commit::Conflict { .. } => continue,
+            Commit::Absent => return Ok(None),
+        }
+    }
+}
+```
+
+- `create(name, body)` makes version 1. It outputs `false` and changes nothing if the view exists.
+- `get(name)` outputs `Option<Versioned<B>>`: the latest `version` and `body`. `version(name)` reads only the number.
+- `commit(name, parent, diff, body)` moves the view from `parent` to `parent + 1`. It outputs `Commit::Committed { version }`, `Commit::Conflict { head }` if the view had moved on, or `Commit::Absent`. Nothing changes unless it commits.
+
+The retry loop above is the usual way to handle `Conflict`: re-read, re-apply the intent, commit again. It is the Redis counterpart of an optimistic-locking `@Version` column in JPA.
+
+<Callout type="warn" title="The body must equal the parent with the diff applied">
+  `commit` sends both the diff and the resulting body, and nothing checks that they agree: readers of the latest version get `body`, subscribers apply `diff`, and they silently diverge if the two don't match. Always build `body` by calling `apply` on the parent body, as above.
+</Callout>
+
+## Following: subscribe
+
+```rust title="src/scoreboard.rs"
+use wakuwaku::entity::redis::dynamic::live_view::Versioned;
+
+pub async fn follow(redis: &Redis, client: &redis::Client, game: u64) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let Some((mut board, mut subscription)) =
+        redis.process(SCOREBOARDS.subscribe(&game, conn)).await?
+    else {
+        return Ok(()); // no such game
+    };
+    render(&board);
+    loop {
+        let event = subscription.recv().await?;
+        board.update(event);
+        render(&board);
+    }
+}
+```
+
+`subscribe(name, conn)` outputs the latest `Versioned<B>` together with a `LiveViewSubscription` to every version after it, or `None` if the view doesn't exist. `conn` is a [dedicated connection](/en/docs/data/redis#following-changes-dedicated-connections).
+
+Each `recv` outputs a `LiveViewEvent`:
+
+- `Diff { version, diff }`: the previous version became `version` through `diff`.
+- `Snapshot(Versioned<B>)`: the whole body at a version, sent instead of the diffs leading to it when they were squashed into a new base before the subscription read them.
+
+`Versioned::update(event)` applies either kind, so a local copy stays equal to the view. A subscription never ends on its own; drop it, or the stream from `into_stream`, to unsubscribe.
+
+### Resuming from a known version
+
+A client that already shows some version, for example a browser reconnecting after a network blip, doesn't need the whole body again. `resume(name, version, conn)` starts a subscription right after `version`:
+
+```rust title="src/scoreboard.rs"
+use wakuwaku::entity::redis::dynamic::live_view::LiveViewEvent;
+
+/// The client already shows `version`: send it what came after.
+pub async fn catch_up(
+    redis: &Redis,
+    client: &redis::Client,
+    game: u64,
+    version: u64,
+) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let mut subscription = redis.process(SCOREBOARDS.resume(&game, version, conn)).await?;
+    loop {
+        match subscription.recv().await? {
+            LiveViewEvent::Diff { version, diff } => send_diff(version, diff).await,
+            LiveViewEvent::Snapshot(board) => send_snapshot(board).await,
+        }
+    }
+}
+```
+
+The same applies after a failed `recv`: `subscription.version()` is the version of the last event it delivered, so open a new connection and `resume` from it.
+
+## In Redis
+
+Each name is two keys in one cluster hash slot:
+
+- The **head**, `…:LiveView:{<namespace>:<name>}:h`, a hash with the latest version `v` and body `b`. `get` reads only this, which is why the latest version reads in O(1).
+- The **history**, `…:l`, a Redis stream whose entry IDs are `<version>-0`. It starts with a *base* entry holding the body at its version, followed by one entry per later version holding its diff.
+
+`create` and `commit` are Lua scripts, so the version check, the head update and the history append happen atomically. When the history already holds `max_diffs` diffs, the next commit trims it and writes a new base holding both the new body and its diff. A subscriber that is up to date still reads a diff; one that was further behind finds a base where its next diff used to be, and receives a `Snapshot`.
+
+Subscriptions read the history with `XREAD BLOCK` after the version they have, in batches of up to 128 entries. They catch up on everything they missed before they wait, so they never skip a version.
+
+`history(name)` outputs the base and the diffs after it, as a `History<B>`; `History::into_latest` applies them, which is handy for audits and for testing that your diffs reproduce the head.
+
+## Choosing `max_diffs`
+
+`LiveView::new(namespace, max_diffs)` bounds the history. A larger bound lets subscribers that lag further behind still receive diffs instead of a full snapshot, at the cost of memory per view. A smaller bound keeps the history short but sends snapshots more often to slow subscribers. A bound of a few hundred diffs suits most interactive views.
+
+## Pitfalls
+
+- **Live views don't expire.** Call `remove` when a view is no longer needed.
+- **Removing doesn't notify subscribers.** They keep waiting. Tell them through your own protocol, for example by committing a final "closed" diff before removing.
+- **Don't recreate a view under the same name.** Recreating restarts the versions at 1, which subscribers past version 1 never see. Use a new name instead.
+- **Capability.** `get`, `version`, `history`, `subscribe` and `resume` are reads; `create`, `commit` and `remove` are writes. A `Db<_, ReadOnly>` can serve every subscriber, and only the writers need `ReadWrite`.
+
+## Next steps
+
+<Cards>
+  <Card title="Stream buffers" href="/en/docs/data/redis/stream-buffer" description="Append-only output that ends, followed from any index." />
+  <Card title="Caches" href="/en/docs/data/redis/cache" description="When readers only need the latest value now and then." />
+</Cards>

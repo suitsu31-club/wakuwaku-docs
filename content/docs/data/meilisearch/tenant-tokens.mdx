@@ -1,0 +1,117 @@
+---
+title: Tenant tokens
+description: Let a frontend search Meilisearch directly with short-lived tokens whose indexes and scopes Meilisearch enforces.
+icon: KeyRound
+---
+
+Search-as-you-type feels best when the browser talks to Meilisearch directly, without a round trip through your service. A *tenant token* makes that safe. It is a JWT your server signs with a Meilisearch API key and hands to the client. The client sends it to Meilisearch as its API key, and Meilisearch then lets it search only the indexes listed in the token, and only the documents matching the token's filter for each index.
+
+wakuwaku's [`TokenSigner<C>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/token/struct.TokenSigner.html) builds those tokens from the same typed [filters](/en/docs/data/meilisearch/search#typed-filters) as server-side searches, and limits which indexes a token may list by a capability.
+
+## Signing tokens
+
+```rust title="src/search/tokens.rs"
+use std::time::{Duration, SystemTime};
+use wakuwaku::deps::meilisearch_sdk::client::Client;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::entity::meilisearch::filter::Filter;
+use wakuwaku::entity::meilisearch::token::TokenSigner;
+use wakuwaku::entity::CanRead;
+
+/// What the frontend may search: the posts index, nothing else.
+pub enum FrontendSearch {}
+impl CanRead<PostIndex> for FrontendSearch {}
+
+/// `search_key` has the `search` action only; `search_key_uid` is its uid.
+pub fn token_signer(
+    url: &str,
+    search_key: &str,
+    search_key_uid: &str,
+) -> Result<TokenSigner<FrontendSearch>, Error> {
+    let client = Client::new(url, Some(search_key))?;
+    Ok(TokenSigner::new(search_key_uid, client))
+}
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A token that searches the posts of one workspace for 15 minutes.
+pub fn frontend_token(
+    signer: &TokenSigner<FrontendSearch>,
+    workspace_id: i64,
+) -> Result<String, BoxError> {
+    let expires_at = SystemTime::now() + Duration::from_secs(15 * 60);
+    let token = signer
+        .token(expires_at)
+        .scoped::<PostIndex>(&Filter::Eq(PostFilter::WorkspaceId, workspace_id.into()))?
+        .sign()?;
+    Ok(token)
+}
+```
+
+The builder works like this:
+
+1. `signer.token(expires_at)` starts a token that expires at the given time and allows no index yet.
+2. `.scoped::<I>(&scope)` allows searching the documents of `I` that match `scope`. It fails with a `FilterError` if the scope can't be rendered. `.unscoped::<I>()` allows every document of `I`. Calling either again for the same index replaces the earlier rule; call them for several indexes to build a multi-index token.
+3. `.sign()` signs the token. It fails if the expiry is already in the past, or if the key uid is not a UUID v4.
+
+Signing happens locally: it doesn't call Meilisearch, so issuing a token per page load is cheap.
+
+### Which indexes a token may list
+
+`TokenSigner<C>` only accepts indexes `I` with `C: Covers<Read<I>>`. A service that hands out tokens is limited exactly like a handle of the same capability. With the `FrontendSearch` capability above, a token for the users index doesn't compile:
+
+```rust
+pub fn users_token(signer: &TokenSigner<FrontendSearch>) -> Result<String, Error> {
+    signer
+        .token(SystemTime::now() + Duration::from_secs(60))
+        // error[E0277]: the trait bound `FrontendSearch: Covers<Read<UserIndex>>` is not satisfied
+        .unscoped::<UserIndex>()
+        .sign()
+}
+```
+
+`TokenSigner<ReadOnly>` would allow tokens for every index. Prefer a narrow capability for the service that serves your frontend.
+
+## The security model
+
+The token's filter is applied by Meilisearch as a separate element of the search's filter array, just like the scope of a [server-side search](/en/docs/data/meilisearch/search#running-a-search-under-a-scope), so nothing the client sends can lift it. What the token does *not* control is everything else about the search.
+
+### The signing key
+
+- **Sign with a key that has the `search` action and nothing else.** A token can't do more than its key, but the key itself, kept on your server, must not be able to do more than search either. Meilisearch rejects tokens signed with the master key.
+- **Tokens can't be revoked one by one.** Deleting the signing key revokes every token it signed. That makes expiry your main control.
+- **Keep expiry short.** Minutes, not days. The client asks for a fresh token when its token is about to expire; a token leaked from a browser is then useless soon after.
+- **Rotate by creating a new key.** Sign new tokens with the new key, then delete the old one once the tokens it signed have expired.
+
+### What the client still controls
+
+The attributes to retrieve, facets, sort, page size and hybrid search are all up to the client. Restrict them through the [index settings](/en/docs/data/meilisearch#index-settings-are-security-settings):
+
+- List `displayedAttributes` explicitly; the default displays every attribute.
+- Every filterable attribute can be used as a facet, revealing value counts among the documents in the token's scope.
+- `pagination.maxTotalHits` bounds how deep a client can page.
+- Any embedder configured on the index can be triggered by any token holder.
+
+<Callout type="warn" title="The document type is public">
+  With a tenant token, `max_hits_per_page` and the deserialization into your document type no longer apply: the browser receives what Meilisearch returns. Anything stored in the index and displayed is readable by every token holder whose scope covers the document.
+</Callout>
+
+## Tokens or server-side search?
+
+| | Tenant token | Server-side `Search` |
+|---|---|---|
+| Latency | One hop, browser to Meilisearch | Two hops, through your service |
+| Scope enforced by | Meilisearch, from the signed token | Meilisearch, from the filter array your service sends |
+| Page size, facets, sort | Bounded only by index settings | Bounded by your field enums and `max_hits_per_page` |
+| Returned attributes | Displayed attributes | Your `Document` type |
+| Revocation | Delete the key (all tokens) or wait for expiry | Immediate: it is your endpoint |
+| Network exposure | Meilisearch must be reachable from browsers | Meilisearch can stay private |
+
+Use tokens for interactive, public-facing search over data whose displayed attributes are fine to expose to everyone in scope. Use server-side search when you need tighter control, need to combine results with other data, or don't want Meilisearch reachable from the internet.
+
+## Next steps
+
+<Cards>
+  <Card title="Search" href="/en/docs/data/meilisearch/search" description="Typed filters and server-side scopes." />
+  <Card title="Sync" href="/en/docs/data/meilisearch/sync" description="Keep what the tokens search up to date." />
+</Cards>

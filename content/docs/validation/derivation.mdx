@@ -1,0 +1,177 @@
+---
+title: Deriving proofs
+description: Convert a proof into an equivalent or weaker one without rechecking, using the laws of Boolean algebra.
+icon: Workflow
+---
+
+A function states its requirement in its own shape: one needs `Proven<String, ShortEnough>`, another `Proven<String, And<ShortEnough, NonEmpty>>`. If you already hold a proof of something at least as strong, you should not have to run the checks again, and with I/O predicates you often cannot afford to. [`Proven::derive`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html#method.derive) converts a proof along a law of logic. It performs no I/O, cannot fail, and needs no context.
+
+This page uses `NonEmpty`, `ShortEnough` and `ValidUsername = And<NonEmpty, ShortEnough>` from [the overview](/en/docs/validation).
+
+## Weakening a proof
+
+The most common need is to pass a stronger proof to a function that asks for less, or for the same facts in a different arrangement:
+
+```rust title="src/derivation.rs"
+use wakuwaku::proof::{And, Or, Proven};
+
+/// Needs only the length rule.
+pub fn reserve_buffer(name: &Proven<String, ShortEnough>) -> usize {
+    name.evidence().spare
+}
+
+/// Written against the same facts in the other order.
+pub fn audit(name: Proven<String, And<ShortEnough, NonEmpty>>) -> String {
+    name.subject().clone()
+}
+
+/// Accepts either fact.
+pub fn greet(name: Proven<String, Or<NonEmpty, ShortEnough>>) -> String {
+    format!("hello, {}", name.subject())
+}
+
+pub fn reserve(name: Proven<String, ValidUsername>) -> usize {
+    // A ∧ B ⇒ B: elimination, an inherent method.
+    reserve_buffer(&name.into_b())
+}
+
+pub fn log_signup(name: Proven<String, ValidUsername>) -> String {
+    // A ∧ B ⇒ B ∧ A by `Commute`; the target type comes from `audit`'s signature.
+    audit(name.derive())
+}
+
+pub fn welcome(name: Proven<String, ValidUsername>) -> String {
+    // A ∧ B ⇒ A, then A ⇒ A ∨ B: elimination and introduction.
+    greet(Proven::from_a(name.into_a()))
+}
+```
+
+Every conversion consumes the proof and returns a new one about the same subject. `Proven` is not `Clone`, so a proof is used along one path; prove again if you need two independent proofs.
+
+## Elimination and introduction
+
+Dropping or adding an operand is done by inherent methods on `Proven`, not by `derive`:
+
+| Rule | Method |
+| --- | --- |
+| `A ∧ B ⇒ A`, `A ∧ B ⇒ B` | `proof.into_a()`, `proof.into_b()`; the other evidence is dropped. |
+| `A ⇒ A ∨ B`, `B ⇒ A ∨ B` | `Proven::from_a(proof)`, `Proven::from_b(proof)`; evidence `Or::Left` / `Or::Right`. |
+| `A`, `B` ⇒ `A ∧ B` | `Proven::from_both(a, b)`; requires `T: Eq` and equal subjects (see [Composing predicates](/en/docs/validation/composition#cheap-checks-before-io)). |
+
+## The laws
+
+Everything else goes through [`TermDerive<P, T, R>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.TermDerive.html): "whenever `Self` holds for a `T`, `P` holds too, by law `R`". The rule types `R` live in [`wakuwaku::proof::boolean_algebra`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/boolean_algebra/index.html). In the table `∧` is `And`, `∨` is `Or`, and every `⇔` is two impls, one per direction.
+
+| `R` | Laws |
+| --- | --- |
+| `Commute` | `A ∧ B ⇒ B ∧ A`, `A ∨ B ⇒ B ∨ A` |
+| `Associate` | `(A ∧ B) ∧ C ⇔ A ∧ (B ∧ C)`, `(A ∨ B) ∨ C ⇔ A ∨ (B ∨ C)` |
+| `Idempotence` | `A ∧ A ⇔ A`, `A ∨ A ⇔ A` |
+| `Absorb` | `A ∧ (A ∨ B) ⇔ A`, `A ∨ (A ∧ B) ⇔ A` |
+| `Distribute` | `A ∧ (B ∨ C) ⇔ (A ∧ B) ∨ (A ∧ C)`, `A ∨ (B ∧ C) ⇔ (A ∨ B) ∧ (A ∨ C)` |
+
+`Commute` is one impl per connective; applying it twice gets you back. In the `⇐` direction of `Absorb` (`A ⇒ A ∧ (A ∨ B)`, `A ⇒ A ∨ (A ∧ B)`), `B` is arbitrary and chosen by the target type.
+
+What is **not** there:
+
+- **Negation.** There is no negation predicate, so laws involving complement (De Morgan, excluded middle) are absent.
+- **Rewriting inside an operand.** Laws rewrite the whole proposition. There is no rule that applies `Commute` to the right half of an `And` while leaving the left half alone.
+- **Laws from an uncheckable source.** `Self` must itself implement `Predicate<T>`, so a law applies only where the source's operands have compatible contexts (see [Mixing contexts](/en/docs/validation/composition#mixing-contexts)). The target does not need to be checkable.
+
+## Calling derive
+
+`derive` has two type parameters, the target `Q` and the law `R`. Usually both are inferred: the target from where the result goes, the law from the source and target types. You can name the target with `proof.derive::<Q, _>()`.
+
+### Naming the law
+
+Sometimes more than one law fits. `Commute` and `Associate` both turn `(A ∧ A) ∧ A` into `A ∧ (A ∧ A)`, and the compiler refuses to choose:
+
+```rust
+let name: Proven<String, And<NonEmpty, And<NonEmpty, NonEmpty>>> = name.derive();
+// error[E0283]: type annotations needed
+//   multiple `impl`s satisfying `And<And<NonEmpty, NonEmpty>, NonEmpty>: TermDerive<..., String, _>`
+```
+
+Name the law as the second type parameter:
+
+```rust title="src/derivation.rs"
+use wakuwaku::proof::boolean_algebra::Associate;
+
+// Both `Commute` and `Associate` turn (A ∧ A) ∧ A into A ∧ (A ∧ A): name one.
+let _name: Proven<String, And<NonEmpty, And<NonEmpty, NonEmpty>>> =
+    name.derive::<_, Associate>();
+```
+
+## What happens to the evidence
+
+Laws move the evidence to its place in the target, so it stays readable after the conversion:
+
+```rust title="src/derivation.rs"
+let swapped: Proven<String, And<ShortEnough, NonEmpty>> = name.derive();
+let And(short_enough, _) = swapped.evidence();
+assert_eq!(short_enough.spare, 10);
+```
+
+Evidence the target has no room for is dropped:
+
+- `A ∧ A ⇒ A` keeps the left proof; so does `A ∨ A ⇒ A` when both are present.
+- `A ∧ (B ∨ C) ⇒ (A ∧ B) ∨ (A ∧ C)` keeps only `A ∧ B` when both `B` and `C` held.
+- `(A ∧ B) ∨ (A ∧ C) ⇒ A ∧ (B ∨ C)` keeps the first `A` when both sides held.
+- Laws that build a disjunction from a single proof (`A ⇒ A ∨ A`, `A ⇒ A ∨ (A ∧ B)`) produce `Or::Left`.
+
+### When evidence must be Clone
+
+`Evidence` is never `Clone`. Three laws produce a target that contains the same proof twice, so they duplicate the evidence and require `A: Clone`:
+
+- `A ⇒ A ∧ A` (`Idempotence`)
+- `A ⇒ A ∧ (A ∨ B)` (`Absorb`)
+- `A ∨ (B ∧ C) ⇒ (A ∨ B) ∧ (A ∨ C)` (`Distribute`)
+
+Without `Clone` the derivation does not compile:
+
+```rust
+let twice: Proven<String, And<NonEmpty, NonEmpty>> = name.derive();
+// error[E0277]: the trait bound `NonEmpty: TermDerive<And<NonEmpty, NonEmpty>, String, Idempotence>`
+//               is not satisfied
+//   the trait `Clone` is not implemented for `NonEmpty`
+//   help: consider annotating `NonEmpty` with `#[derive(Clone)]`
+```
+
+Deriving `Clone` on a predicate is harmless: a cloned predicate value proves nothing by itself (see [Never accept a bare predicate](/en/docs/validation#never-accept-a-bare-predicate)). Only the laws can put the copy inside a `Proven`. For evidence that is expensive to clone, such as a large row, consider whether you need these three laws at all.
+
+## Writing your own laws
+
+You can add laws by implementing `TermDerive` with your own rule type for `R`. The implementation must return a `Proven<T, P>`, and outside the crate a `Proven` can only come from `prove` or from transforming existing proofs. So a custom law cannot fabricate evidence; in practice it is a named chain of existing steps:
+
+```rust title="src/derivation.rs"
+use wakuwaku::proof::boolean_algebra::{Associate, Commute};
+use wakuwaku::proof::{And, Predicate, Proven, TermDerive};
+
+/// `A ∧ (B ∧ C) ⇒ C ∧ (A ∧ B)` for usernames: `Associate`, then `Commute`.
+pub enum RotateRight {}
+
+impl<A, B, C> TermDerive<And<C, And<A, B>>, String, RotateRight> for And<A, And<B, C>>
+where
+    Self: Predicate<String>,
+    And<And<A, B>, C>: Predicate<String>,
+{
+    fn term_derive(proof: Proven<String, Self>) -> Proven<String, And<C, And<A, B>>> {
+        proof
+            .derive::<And<And<A, B>, C>, Associate>()
+            .derive::<_, Commute>()
+    }
+}
+```
+
+Use it like a built-in law: `proof.derive::<_, RotateRight>()`. The `And<And<A, B>, C>: Predicate<String>` bound is there because the intermediate step is itself a law application, which needs a checkable source.
+
+<Callout type="warn" title="Fix the subject type in your own laws">
+The subject type above is `String`, not a generic `T`. Rust's orphan rules reject `impl<T, …> TermDerive<…, T, RotateRight> for And<…>`: the trait and `And` are foreign, and the uncovered `T` comes before your local rule type (`error[E0210]: type parameter T must be covered by another type when it appears before the first local type`). Write one impl per subject type you need.
+</Callout>
+
+## Next steps
+
+<Cards>
+  <Card title="Using proofs in services" href="/en/docs/validation/in-services" description="Validate at the gRPC boundary and pass proofs into domain logic." />
+  <Card title="Composing predicates" href="/en/docs/validation/composition" description="And, Or, check order, and contexts." />
+</Cards>

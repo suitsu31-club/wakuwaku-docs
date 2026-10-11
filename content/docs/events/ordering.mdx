@@ -1,0 +1,264 @@
+---
+title: Ordering
+description: Which event orders wakuwaku keeps, how EventAtomicOrdering fences work, and how the consumer turns a polled batch into concurrent runs.
+icon: ListOrdered
+---
+
+An Iggy partition is a totally ordered log. Most business logic, however, only cares about the order of events *of one thing*: one account, one order, one user. wakuwaku keeps exactly that order and nothing more, so that the consumer is free to process everything else concurrently and to batch events into fewer handler calls (see [Algebra](/en/docs/events/algebra)).
+
+This page explains which orders are guaranteed, how each event can ask for more with `EventAtomicOrdering`, and how the consumer's planner turns a polled batch into an execution plan.
+
+## The guarantees [#guarantees]
+
+Ordering is always scoped to a **key**: the value returned by `Event::key`, hashed by `key_hash`. Events with equal keys always land in the same partition (see [Defining events](/en/docs/events/defining-events)).
+
+1. **Events of different keys are never ordered against each other**, even when they share an Iggy partition. The consumer processes the keys of a batch concurrently.
+2. **Events of the same key and the same type always keep their log order**, whatever ordering they declare.
+3. **Events of the same key but different types** keep the order their [`EventAtomicOrdering`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/enum.EventAtomicOrdering.html) asks for.
+
+Within one partition the consumer handles one polled batch after another, so these rules also hold across batches. When a key fails and goes to the retry topic, its later events are diverted behind it, so a failure does not break them either (see [Error handling](/en/docs/events/error-handling#retryable)).
+
+<Callout type="info" title="Keys are compared by hash">
+  The planner compares keys by their 64-bit `key_hash`. If two different keys collide, their events are simply treated as one key: a collision can only add ordering, never remove it. Never rely on an order *between* keys, though; there is none to rely on.
+</Callout>
+
+## `EventAtomicOrdering` [#event-atomic-ordering]
+
+Every message declares its ordering through `Event::atomic_ordering(&self)`. The names mirror `std::sync::atomic::Ordering`, but the "memory" here is the stream of events of one key:
+
+| Ordering  | Promise within the key                                              |
+|-----------|---------------------------------------------------------------------|
+| `Relaxed` | May be reordered with events of other types.                        |
+| `Acquire` | No later event of the key is processed before this event.           |
+| `Release` | No earlier event of the key is processed after this event.         |
+| `AcqRel`  | Both: a full barrier.                                               |
+
+Think of `Acquire` as "this event opens something" (later events depend on it) and `Release` as "this event closes something" (it depends on everything before it).
+
+<Callout type="info" title="Fences are enforced conservatively">
+  The planner enforces fences more strictly than the table requires: an `Acquire` event also keeps every *earlier* event of the key before it, and a `Release` event also keeps every *later* event after it. In 1.0.0-rc1 this makes `AcqRel` behave exactly like `Acquire`. Still declare the ordering you actually need: the stricter behavior is an implementation choice of the planner, the table above is the contract.
+</Callout>
+
+## Worked example: a bank account [#worked-example]
+
+Take an account read model keyed by `AccountId`, with four event types:
+
+| Tag | Event            | Ordering  | Why                                                     |
+|-----|------------------|-----------|---------------------------------------------------------|
+| 1   | `AccountOpened`  | `Acquire` | Everything else updates a row this event creates.       |
+| 2   | `Deposited`      | `Relaxed` | Adds to the balance; may pass a withdrawal.             |
+| 3   | `Withdrawn`      | `Relaxed` | Subtracts from the balance; may pass a deposit.         |
+| 4   | `AccountClosed`  | `Release` | The closing balance must include every earlier change.  |
+
+Deposits and withdrawals may pass each other because the projection only adds signed amounts; the business checks (overdraft and so on) already ran on the command side before the events were published. The two fences are declared like this (the body derives are explained in [Defining events](/en/docs/events/defining-events#serializing-the-body)):
+
+```rust title="src/events.rs"
+#[derive(Hash)]
+pub struct AccountId(pub u64);
+
+impl PartitionKey for AccountId {
+    type PartitionMerge = DefaultHasher;
+    const SUPER_PARTITION_NAME: IggySuperPartitionName = IggySuperPartitionName("accounts");
+}
+
+#[derive(Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct AccountOpened {
+    pub account: u64,
+    pub owner: String,
+}
+
+impl EventBody for AccountOpened {}
+
+impl Event for AccountOpened {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = AccountId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> AccountId {
+        AccountId(self.account)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        // Nothing that happens to the account may be applied before it exists.
+        EventAtomicOrdering::Acquire // [!code highlight]
+    }
+}
+```
+
+```rust title="src/events.rs"
+impl Event for AccountClosed {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(4);
+    type Key = AccountId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> AccountId {
+        AccountId(self.account)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        // Every earlier deposit and withdrawal is applied before the account closes.
+        EventAtomicOrdering::Release // [!code highlight]
+    }
+}
+```
+
+`Deposited` and `Withdrawn` return `EventAtomicOrdering::Relaxed`. (They use `NonAssociative` here to keep this page about ordering; [Algebra](/en/docs/events/algebra) shows how to let the consumer sum deposits instead.)
+
+Now suppose the consumer polls this batch, in log order:
+
+| Offset | Account | Event           | Ordering  |
+|--------|---------|-----------------|-----------|
+| 0      | 42      | `AccountOpened` | `Acquire` |
+| 1      | 42      | `Deposited`     | `Relaxed` |
+| 2      | 7       | `Deposited`     | `Relaxed` |
+| 3      | 42      | `Withdrawn`     | `Relaxed` |
+| 4      | 42      | `Deposited`     | `Relaxed` |
+| 5      | 42      | `AccountClosed` | `Release` |
+| 6      | 42      | `AccountOpened` | `Acquire` |
+| 7      | 42      | `Deposited`     | `Relaxed` |
+
+The planner produces:
+
+- **Account 7**: one segment with one run, `[2]`. It runs concurrently with everything of account 42.
+- **Account 42, segment 1**: head `AccountOpened [0]`; then the body runs `Deposited [1, 4]` and `Withdrawn [3]`, concurrently; then the tail `AccountClosed [5]`.
+- **Account 42, segment 2** (only after segment 1 finished): head `AccountOpened [6]`; then the body run `Deposited [7]`.
+
+<OrderingDiagram lang="en" />
+
+Note what was *not* kept: deposit 4 may be applied before withdrawal 3, because both are `Relaxed` and of different types. Deposits 1 and 4 stay in order because they share a type.
+
+## How the planner builds a plan [#planner]
+
+For every polled batch, the consumer builds a [`Plan`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/plan/struct.Plan.html) from the message headers alone (key hash, type tag and ordering; bodies are not decoded for planning). The plan has three levels:
+
+- **Keys** are independent and processed concurrently.
+- Each key has a list of **segments**, processed strictly one after another.
+- Each segment has an optional **head run**, any number of **body runs** and an optional **tail run**. A **run** holds every event of one type in that segment, in log order.
+
+Segments are cut at the fences, walking the key's events in log order:
+
+- An `Acquire` or `AcqRel` event starts a new segment, and the run of its type becomes that segment's head.
+- A `Release` event ends the current segment, and the run of its type becomes that segment's tail.
+- `Relaxed` events join the current segment.
+
+One corner case: if a `Release` event's type is already the *head* of the current segment and the segment also holds other types, the `Release` event gets a segment of its own, because one run cannot be both first and last.
+
+Because a run gathers *every* event of its type in the segment, a `Relaxed` event can join the head or tail run of its own type:
+
+- In `[B, A (Acquire), B, A]`, the second `A` is `Relaxed`, yet it joins the head run of the second segment and is processed before the second `B`.
+- In `[A, B, A (Release), B]`, the first `A` joins the tail run and is processed after the first `B`.
+
+Both are allowed: a `Relaxed` event may move past events of other types, and events of one type never swap.
+
+### Execution [#execution]
+
+For each key, the consumer then walks the segments in order and, inside each segment:
+
+1. runs the head run;
+2. runs all body runs concurrently;
+3. runs the tail run.
+
+Each run is decoded, reduced with its type's [algebra](/en/docs/events/algebra), and handed to your `EventHandler` in chunks of at most `MAX_BATCH` events, one chunk after another. A handler call therefore only ever sees events of **one key and one type**. If a stage fails, the key stops there; what happens next depends on the [error class](/en/docs/events/error-handling).
+
+<Callout type="warn" title="Body runs of one key run at the same time">
+  Two `Relaxed` types of the same key can be handled concurrently. If their handlers update the same database row, make each update atomic on its own (for example `SET balance = balance + $1`) instead of read-modify-write in application code, or give one of the types a fence.
+</Callout>
+
+## Choosing an ordering [#choosing]
+
+Start from `Relaxed` and add a fence only where the business needs one:
+
+| The event…                                                         | Ordering  | Examples                                          |
+|--------------------------------------------------------------------|-----------|---------------------------------------------------|
+| is independent of other event types of the key                     | `Relaxed` | `Deposited`, `TagAdded`, `PointsGranted`          |
+| creates or (re)starts something later events depend on             | `Acquire` | `AccountOpened`, `OrderPlaced`, `UserRegistered`  |
+| concludes something and must see all earlier events                | `Release` | `AccountClosed`, `InvoiceIssued`, `ExportRequested` |
+| is a barrier in both directions                                    | `AcqRel`  | `AccountFrozen`, `OwnershipTransferred`           |
+
+You never need a fence just to keep events of one type in order; that is always guaranteed.
+
+Every fence cuts the key's events into more segments. Smaller segments mean smaller runs (less [reduction](/en/docs/events/algebra)) and less concurrency, so fences have a throughput cost.
+
+### Per-message orderings [#per-message]
+
+`atomic_ordering` takes `&self`, so a single event type can choose its ordering per message. This is useful when one type models several transitions:
+
+```rust title="src/events.rs"
+impl Event for AccountStatusChanged {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(5);
+    type Key = AccountId;
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> AccountId {
+        AccountId(self.account)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        match self.status {
+            // Re-activation is informational: let it float.
+            AccountStatus::Active => EventAtomicOrdering::Relaxed,
+            // A freeze is a full barrier: nothing passes it in either direction.
+            AccountStatus::Frozen => EventAtomicOrdering::AcqRel,
+            // Closing waits for everything before it.
+            AccountStatus::Closed => EventAtomicOrdering::Release,
+        }
+    }
+}
+```
+
+The ordering is written into each message's header by the [`Publisher`](/en/docs/events/publishing), and the consumer plans from the header.
+
+## Testing your orderings [#testing]
+
+The planner is pure and public: [`Plan::new`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/plan/struct.Plan.html) takes `PlanRecord`s (key, tag, ordering) and returns the plan. That makes it easy to pin down the behavior you rely on in a unit test, without Iggy. This test checks the worked example above:
+
+```rust title="src/events.rs"
+#[cfg(test)]
+mod tests {
+    use wakuwaku::iggy::EventAtomicOrdering::{Acquire, Relaxed, Release};
+    use wakuwaku::iggy::EventTypeTag;
+    use wakuwaku::iggy::partition::plan::{Plan, PlanRecord};
+
+    const OPENED: EventTypeTag = EventTypeTag::new(1);
+    const DEPOSITED: EventTypeTag = EventTypeTag::new(2);
+    const WITHDRAWN: EventTypeTag = EventTypeTag::new(3);
+    const CLOSED: EventTypeTag = EventTypeTag::new(4);
+
+    #[test]
+    fn closing_waits_for_every_earlier_event() {
+        let record = |key, tag, ordering| PlanRecord { key, tag, ordering };
+        let batch = [
+            record(42, OPENED, Acquire),   // 0
+            record(42, DEPOSITED, Relaxed), // 1
+            record(7, DEPOSITED, Relaxed),  // 2  another account
+            record(42, WITHDRAWN, Relaxed), // 3
+            record(42, DEPOSITED, Relaxed), // 4
+            record(42, CLOSED, Release),    // 5
+            record(42, OPENED, Acquire),    // 6  re-opened
+            record(42, DEPOSITED, Relaxed), // 7
+        ];
+        let plan = Plan::new(&batch);
+
+        let [account_42, account_7] = plan.keys() else { panic!() };
+        assert_eq!(plan.segments(account_7).len(), 1);
+
+        let [first, second] = plan.segments(account_42) else { panic!() };
+        assert_eq!(plan.head(first).map(|run| plan.records(run)), Some(&[0][..]));
+        let body: Vec<_> = plan.body(first).iter().map(|run| plan.records(run)).collect();
+        assert_eq!(body, [&[1, 4][..], &[3][..]]); // deposits ∥ withdrawals
+        assert_eq!(plan.tail(first).map(|run| plan.records(run)), Some(&[5][..]));
+        assert_eq!(plan.head(second).map(|run| plan.records(run)), Some(&[6][..]));
+        assert_eq!(plan.body(second).len(), 1);
+    }
+}
+```
+
+`Plan::keys` lists keys in order of first appearance, and `Plan::records` returns indices into the input slice.
+
+## Next steps [#next-steps]
+
+<Cards>
+  <Card title="Algebra" href="/en/docs/events/algebra" description="Let the consumer collapse and fold runs before your handler sees them." />
+  <Card title="Error handling" href="/en/docs/events/error-handling" description="What happens to a key, and to its order, when a handler fails." />
+  <Card title="Consuming events" href="/en/docs/events/consuming" description="Register handlers and configure the consumer." />
+</Cards>

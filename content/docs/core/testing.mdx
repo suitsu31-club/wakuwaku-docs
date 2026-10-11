@@ -1,0 +1,344 @@
+---
+title: Testing
+description: Unit-test cron jobs, event handlers, gRPC services, predicates and data access in wakuwaku without starting a service or any infrastructure.
+icon: FlaskConical
+---
+
+The compiler proves that a wakuwaku service is wired correctly; tests prove that each component does the right thing (see [Proof-driven programming](/en/docs/core/proof-driven)). This page shows how to write those tests for every kind of component. None of them starts the service, opens a port, or needs Iggy or a database.
+
+The recipe is always the same:
+
+1. create the component with `ServiceCreation::create_service`, passing a dependency you control;
+2. call its one async method with an input you built by hand;
+3. assert on the output and on the dependency.
+
+The examples test the components of the [Lifecycle](/en/docs/core/lifecycle) example. The tests live in a `#[cfg(test)]` module at the bottom of `src/components.rs`:
+
+```rust title="src/components.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::Balance;
+    use std::time::UNIX_EPOCH;
+    use wakuwaku::ServiceBuilder;
+    use wakuwaku::deps::tonic::Code;
+
+    // ...tests below...
+}
+```
+
+## Setup
+
+`#[tokio::test]` comes with the `tokio` dependency (`macros` and `rt` are part of its `full` feature). Only the [paused clock](#controlling-time) needs more, the `test-util` feature, which belongs in `dev-dependencies` so it never reaches production builds:
+
+```toml title="Cargo.toml"
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+```
+
+## Cron jobs
+
+A cron job is a [`Processor`](/en/docs/core/proof-driven#the-processor-abstraction) of [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html)s. Both fields of `CronTick` are public, so a test builds the tick it needs and calls `process`:
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test]
+async fn expire_sessions_removes_only_expired_sessions() {
+    let sessions = SessionStore::default();
+    let now = SystemTime::now();
+    sessions.insert("old", now - Duration::from_secs(1));
+    sessions.insert("fresh", now + Duration::from_secs(3600));
+
+    let job = ExpireSessions::create_service(sessions.clone());
+    job.process(CronTick { run: 0, fired_at: now }).await.unwrap();
+
+    assert!(!sessions.contains("old"));
+    assert!(sessions.contains("fresh"));
+}
+```
+
+Setting `fired_at` yourself is how you test time-dependent logic: the job reads the time from the tick rather than calling `SystemTime::now()`, so the test decides what "now" is. Likewise `run` (`0` for the first run) can be set to test behavior that depends on the run number.
+
+## Event handlers
+
+An event handler implements `EventHandler::handle`, which takes a slice of events: the run for one key, in the order it must be applied. Call it with the slice you want to test:
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test]
+async fn welcome_mail_is_sent_to_every_new_user() {
+    let mailer = Mailer::default();
+    let handler = SendWelcomeMail::create_service(mailer.clone());
+
+    let run = [
+        UserRegistered { user_id: 1, email: "ann@example.com".into() },
+        UserRegistered { user_id: 1, email: "ann@work.example".into() },
+    ];
+    handler.handle(&run).await.unwrap();
+
+    assert_eq!(mailer.sent(), ["ann@example.com", "ann@work.example"]);
+}
+```
+
+Before a run reaches the handler, the consumer has already planned it by key and reduced it with the event's [algebra](/en/docs/events/algebra) (for example, folding `Associative` events into one). In a unit test you pass the run directly, so you test exactly what the handler does with the events it receives. To check how failures are treated, assert on the returned `HandleError`'s `class()`; see [Error handling](/en/docs/events/error-handling).
+
+## gRPC services
+
+A gRPC service implements the trait tonic generated from your `.proto` (`Accounts` here). Its methods are ordinary async methods that take a `tonic::Request`, so a test calls them without a server or a network:
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test]
+async fn get_balance_returns_the_stored_balance() {
+    let store = AccountStore::default();
+    store.deposit(7, 1_500);
+    let service = AccountsService::create_service(store);
+
+    let response = service
+        .get_balance(Request::new(GetBalanceRequest { account_id: 7 }))
+        .await
+        .unwrap();
+    assert_eq!(response.into_inner(), Balance { account_id: 7, cents: 1_500 });
+
+    let status = service
+        .get_balance(Request::new(GetBalanceRequest { account_id: 8 }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::NotFound);
+}
+```
+
+The generated trait must be in scope to call its methods (`components.rs` imports `proto::accounts_server::Accounts`, and `use super::*` brings it into the test module). To test code that reads request metadata, set it on the request before the call with `request.metadata_mut().insert(..)`. Middleware such as interceptors is configured on the `Server`, not on the service, so it is tested separately.
+
+## Predicates
+
+A [predicate](/en/docs/validation) is checked with `prove`, which takes the subject, the predicate's context, and a `CheckOrder`. Give it a context you control. Here the context is the `AccountStore` itself, and the predicate proves that an account exists, carrying its balance as evidence:
+
+```rust title="src/validation.rs"
+use std::convert::Infallible;
+
+use wakuwaku::proof::{CheckOrder, DeniedReason, Predicate, Proven, ValidateContext, ValidateError, prove};
+
+use crate::components::AccountStore;
+
+impl ValidateContext for AccountStore {
+    type IoError = Infallible;
+}
+
+pub static NO_SUCH_ACCOUNT: DeniedReason = DeniedReason("no such account");
+
+/// The account exists. The evidence is its balance at check time.
+pub struct AccountExists {
+    pub balance: i64,
+}
+
+impl Predicate<u64> for AccountExists {
+    type Ctx = AccountStore;
+    async fn check(
+        account: &u64,
+        store: &AccountStore,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<Infallible>> {
+        match store.balance(*account) {
+            Some(balance) => Ok(AccountExists { balance }),
+            None => Err(ValidateError::Deny(NO_SUCH_ACCOUNT)),
+        }
+    }
+}
+
+/// Only callable with an account that was proven to exist.
+pub fn describe(account: &Proven<u64, AccountExists>) -> String {
+    format!("account {} holds {} cents", account.subject(), account.evidence().balance)
+}
+```
+
+```rust title="src/validation.rs (mod tests)"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn existing_account_is_proven_with_its_balance() {
+        let store = AccountStore::default();
+        store.deposit(7, 250);
+
+        let proven = prove::<_, AccountExists>(7, &store, CheckOrder::Sequential)
+            .await
+            .unwrap();
+        assert_eq!(describe(&proven), "account 7 holds 250 cents");
+    }
+
+    #[tokio::test]
+    async fn unknown_account_is_denied() {
+        let store = AccountStore::default();
+
+        let result = prove::<_, AccountExists>(8, &store, CheckOrder::Sequential).await;
+        assert!(matches!(result, Err(ValidateError::Deny(reason)) if reason == NO_SUCH_ACCOUNT));
+    }
+}
+```
+
+`DeniedReason`s compare by **pointer identity**, not by text, so declare each reason once as a `static` (like `NO_SUCH_ACCOUNT`) and compare against that `static`. `ValidateError` does not implement `PartialEq`; match on it as above.
+
+## Data access
+
+Data access in `wakuwaku::entity` goes through handles that are `Processor`s of queries ([Queries](/en/docs/data/queries)). Write business logic generic over the handle, naming the queries it runs, and it can be tested with any processor of those queries:
+
+```rust title="src/data.rs"
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::{DataSource, Db, Entity, Execute, Query, Read, ReadOnly, ReadWrite, Write};
+
+pub struct User;
+impl Entity for User {}
+
+/// Look a user's name up by id.
+pub struct FindUser(pub u64);
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+/// Rename a user.
+pub struct RenameUser {
+    pub id: u64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = (Read<User>, Write<User>);
+}
+
+/// Business logic: generic over any handle that can run the queries it needs.
+pub async fn greeting<D>(db: &D, id: u64) -> Result<String, D::Error>
+where
+    D: Processor<FindUser, Output = Option<String>>,
+{
+    let name = db.process(FindUser(id)).await?;
+    Ok(match name {
+        Some(name) => format!("Hello, {name}!"),
+        None => "Hello, stranger!".to_owned(),
+    })
+}
+```
+
+There are two convenient test doubles.
+
+**A processor that answers the query directly.** The smallest possible fake; good for testing the logic around the query:
+
+```rust title="src/data.rs"
+// ---- Test double 1: a processor that answers the query directly.
+
+#[cfg(test)]
+struct FixedUser(&'static str);
+
+#[cfg(test)]
+impl Processor<FindUser> for FixedUser {
+    type Output = Option<String>;
+    type Error = Infallible;
+    async fn process(&self, _: FindUser) -> Result<Option<String>, Infallible> {
+        Ok(Some(self.0.to_owned()))
+    }
+}
+```
+
+**An in-memory data source behind a real `Db`.** A `DataSource` whose connection is a shared map. The queries get an `Execute` implementation for it, and the test uses real `Db` handles, so capabilities are still checked: the read-only handle below could not run `RenameUser`.
+
+```rust title="src/data.rs"
+// ---- Test double 2: an in-memory data source behind a real `Db` handle.
+
+/// Users kept in memory, shared between clones.
+#[derive(Clone, Default)]
+pub struct MemorySource {
+    users: Arc<Mutex<HashMap<u64, String>>>,
+}
+
+impl DataSource for MemorySource {
+    type Connection = Self;
+    type Error = Infallible;
+    async fn run<Q: Execute<Self>>(&self, query: Q) -> Result<Q::Output, Infallible> {
+        query.execute(&mut self.clone()).await
+    }
+}
+
+impl Execute<MemorySource> for FindUser {
+    type Output = Option<String>;
+    async fn execute(self, conn: &mut MemorySource) -> Result<Option<String>, Infallible> {
+        Ok(conn.users.lock().unwrap().get(&self.0).cloned())
+    }
+}
+
+impl Execute<MemorySource> for RenameUser {
+    type Output = ();
+    async fn execute(self, conn: &mut MemorySource) -> Result<(), Infallible> {
+        conn.users.lock().unwrap().insert(self.id, self.name);
+        Ok(())
+    }
+}
+```
+
+```rust title="src/data.rs (mod tests)"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn greets_with_a_stubbed_query() {
+        assert_eq!(greeting(&FixedUser("Ann"), 1).await.unwrap(), "Hello, Ann!");
+    }
+
+    #[tokio::test]
+    async fn greets_through_a_read_only_handle() {
+        let source = MemorySource::default();
+        let writer: Db<MemorySource, ReadWrite> = Db::new(source.clone());
+        writer.process(RenameUser { id: 1, name: "Ann".into() }).await.unwrap();
+
+        let replica: Db<MemorySource, ReadOnly> = Db::new(source);
+        assert_eq!(greeting(&replica, 1).await.unwrap(), "Hello, Ann!");
+        assert_eq!(greeting(&replica, 2).await.unwrap(), "Hello, stranger!");
+    }
+}
+```
+
+Keep the in-memory source and its `Execute` implementations in test-only code (`#[cfg(test)]` or a test-support module) if production never uses them. What they cannot test is the SQL or the Redis commands themselves; those belong in integration tests against a real database.
+
+## Controlling time
+
+Some behavior is about *when* things happen, such as the cron schedule. With `#[tokio::test(start_paused = true)]` Tokio's clock starts paused and jumps forward whenever every task is waiting on a timer, so a test can cover minutes of schedule in microseconds. This test runs the real `CronRuntime`, built from a real `ServiceBuilder`:
+
+```rust title="src/components.rs (mod tests)"
+#[tokio::test(start_paused = true)]
+async fn expire_sessions_runs_at_start_and_then_every_minute() {
+    let sessions = SessionStore::default();
+    let (_services, cron) = ServiceBuilder::new(sessions.clone())
+        .cron_job::<ExpireSessions, _>()
+        .start();
+
+    sessions.insert("a", UNIX_EPOCH);
+    tokio::time::sleep(Duration::from_secs(1)).await; // t = 1s
+    assert!(!sessions.contains("a")); // run 0 happened at t = 0
+
+    sessions.insert("b", UNIX_EPOCH);
+    tokio::time::sleep(Duration::from_secs(30)).await; // t = 31s
+    assert!(sessions.contains("b")); // no run in between
+    tokio::time::sleep(Duration::from_secs(30)).await; // t = 61s
+    assert!(!sessions.contains("b")); // run 1 happened at t = 60s
+
+    cron.shutdown().await;
+}
+```
+
+<Callout type="warn" title="Paused time is Tokio time">
+The paused clock controls `tokio::time` (sleeps, intervals, and the cron scheduler). It does not affect `SystemTime::now()`, and `CronTick::fired_at` is wall-clock time. That is why the test above uses sessions that expired long ago, and why logic that depends on the time of a run is best tested by [calling `process` with a hand-made tick](#cron-jobs).
+</Callout>
+
+## What unit tests leave out
+
+- **Wiring.** Whether every dependency is registered is not a test's job: the code that builds the `ServiceBuilder` chain does not compile otherwise. Run `cargo build` or `cargo test` in CI, not only `cargo check`, so that [zero cron intervals](/en/docs/core/proof-driven#a-cron-job-with-no-interval) are caught too.
+- **Infrastructure.** Topics and partitions, SQL statements, Redis scripts, and network behavior need integration tests against the real systems. The `start` checks described in [Lifecycle](/en/docs/core/lifecycle#startup-failures) fail fast when the setup is wrong.
+
+<Cards>
+  <Card title="Proof-driven programming" href="/en/docs/core/proof-driven" description="Which half of correctness tests are responsible for." />
+  <Card title="Validation" href="/en/docs/validation" description="Predicates, Proven values and how to compose them." />
+  <Card title="Queries" href="/en/docs/data/queries" description="Queries, effects and capability-typed handles." />
+</Cards>

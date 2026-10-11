@@ -1,0 +1,159 @@
+---
+title: キャッシュ
+description: 型付きの本体を TTL 付きで Redis に保存し、本体をダウンロードせずに BLAKE3 ハッシュでコピーを再検証します。
+icon: HardDrive
+---
+
+キャッシュは、コストの高い読み取りの結果をしばらく手元に置いておくためのものです。wakuwaku は [`collection::cache`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/cache/index.html) に 2 種類のキャッシュを用意しています。
+
+- `Cache<N, B>`: 名前 `N` ごとに本体 `B` を持ち、それぞれ put されてから一定の TTL で失効します。
+- `HashedCache<N, B>`: 上記に加えて各本体の BLAKE3 ハッシュを持ち、すでにコピーを持つ読み手が本体をダウンロードせずに確認できます。
+
+どちらも `Copy` な値で、通常は `const` として宣言します。メソッドは [`Db`](/ja/docs/data/redis) 向けのクエリを組み立てます。Spring の `@Cacheable` と違い、プロキシもアノテーションもありません。キャッシュは値であり、読み取りは明示的なクエリであり、誰がキャッシュを埋めてよいかはハンドルの capability が決めます。
+
+## 本体
+
+本体は kanau の `MessageSer`（put 用）と `MessageDe`（get 用）を実装する任意の型です。最も簡単なのは JSON の derive です（`Cargo.toml` の記述は [セットアップ](/ja/docs/data/redis#setup) を参照）。
+
+```rust title="src/profile.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Profile {
+    pub name: String,
+    pub avatar: Option<String>,
+}
+```
+
+## `Cache` による cache-aside
+
+`Cache::new(namespace, ttl)` でキャッシュを宣言します。`get` は `Option<B>` を出力し、`put` は本体を保存して TTL をリセットし、`remove` は本体が存在したかどうかを出力します。
+
+```rust title="src/profile.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::cache::Cache;
+
+pub const PROFILES: Cache<u64, Profile> = Cache::new("profile", Duration::from_secs(300));
+
+pub async fn load_profile(redis: &Redis, user: u64) -> RedisResult<Profile> {
+    if let Some(profile) = redis.process(PROFILES.get(&user)).await? {
+        return Ok(profile);
+    }
+    let profile = fetch_profile_from_database(user).await;
+    redis.process(PROFILES.put(&user, profile.clone())).await?;
+    Ok(profile)
+}
+
+pub async fn rename(redis: &Redis, user: u64, name: String) -> RedisResult<()> {
+    update_name_in_database(user, name).await;
+    // 次の `load_profile` はデータベースから新しい名前を読む。
+    redis.process(PROFILES.remove(&user)).await?;
+    Ok(())
+}
+```
+
+`Redis` は [接続する](/ja/docs/data/redis#connecting) で定義した `Db<RedisSource, ReadWrite>` のエイリアスです。
+
+### Redis 上の表現
+
+各要素は `@@wakuwaku-entity:Cache:profile:7` という 1 つの文字列キーで、`SET … PX <ttl>` で書き込まれます。1 ミリ秒未満の TTL は 1 ミリ秒として扱われます。失効は Redis 自身が行うので、本体は読まれたかどうかに関係なく、最後の `put` からちょうど TTL 後に消えます。読み取りで TTL は延びません。
+
+### ハンドラーをジェネリックに保つ
+
+キャッシュを読むだけのハンドラーは、ハンドルについてジェネリックにし、必要なクエリを列挙できます。capability の検査はハンドルを配線する場所で一度だけ行われ、ユニットテストではフェイクを渡せます。
+
+```rust
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisError;
+use wakuwaku::entity::redis::collection::cache::CacheGet;
+
+pub async fn cached_name<D>(redis: &D, user: u64) -> Result<Option<String>, RedisError>
+where
+    D: Processor<CacheGet<u64, Profile>, Output = Option<Profile>, Error = RedisError>,
+{
+    let profile = redis.process(PROFILES.get(&user)).await?;
+    Ok(profile.map(|profile| profile.name))
+}
+```
+
+## `HashedCache` による再検証
+
+`HashedCache` は各本体をその BLAKE3 ハッシュと一緒に保存します。`get`（本体とハッシュ）に加えて、次のクエリがあります。
+
+- `hash(name)`: 32 バイトのハッシュだけを返します。存在しなければ `None` です。
+- `get_if_changed(name, known)`: Redis の中で `known` と保存済みのハッシュを比較し、異なる場合だけ本体を転送します。出力は `Freshness` で、`Missing`、`Unchanged`、`Changed(Hashed { body, hash })` のいずれかです。
+
+`put` は保存したハッシュを出力します。これは HTTP の `ETag` / `If-None-Match` にそのまま対応します。
+
+```rust title="src/pages.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Page {
+    pub html: String,
+}
+
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::cache::{Freshness, Hash, HashedCache};
+
+pub const RENDERED: HashedCache<str, Page> =
+    HashedCache::new("rendered-page", Duration::from_secs(3600));
+
+pub enum Reply {
+    NotModified,
+    Page { html: String, etag: String },
+    NotFound,
+}
+
+pub async fn serve(redis: &Redis, path: &str, if_none_match: Option<&str>) -> RedisResult<Reply> {
+    let known = if_none_match.and_then(|etag| Hash::from_hex(etag).ok());
+    let Some(known) = known else {
+        // クライアントはコピーを持っていない: 本体をダウンロードする。
+        return Ok(match redis.process(RENDERED.get(path)).await? {
+            Some(page) => Reply::Page { html: page.body.html, etag: page.hash.to_hex().to_string() },
+            None => Reply::NotFound,
+        });
+    };
+    Ok(match redis.process(RENDERED.get_if_changed(path, known)).await? {
+        Freshness::Unchanged => Reply::NotModified,
+        Freshness::Changed(page) => Reply::Page {
+            html: page.body.html,
+            etag: page.hash.to_hex().to_string(),
+        },
+        Freshness::Missing => Reply::NotFound,
+    })
+}
+
+pub async fn publish(redis: &Redis, path: &str, html: String) -> RedisResult<Hash> {
+    redis.process(RENDERED.put(path, Page { html })).await
+}
+```
+
+同じパターンはサービス間の帯域節約にも使えます。大きな本体をメモリに持つレプリカは、自分のコピーのハッシュで `get_if_changed` を問い合わせ、誰かが新しい本体を公開したときだけそれを受け取ります。
+
+### Redis 上の表現
+
+各要素は `@@wakuwaku-entity:HashedCache:<namespace>:<name>` という Redis ハッシュで、`body` と `hash` の 2 つのフィールドを持ちます。`put` は両フィールドと失効時刻を 1 つの `MULTI` ブロックで書き込むため、読み手が古いハッシュと新しい本体の組み合わせを見ることはありません。`get_if_changed` は Lua スクリプトなので、比較と読み取りはアトミックに行われます。ハッシュはシリアライズ後のバイト列に対して計算されるため、同じバイト列にシリアライズされる 2 つの本体は同じハッシュを持ちます。
+
+## 落とし穴
+
+<Callout type="warn" title="cache-aside の競合">
+  `get`、データベースの読み取り、`put` という流れはアトミックではありません。ある読み手がデータベースを読んでから `put` するまでの間に、書き手がデータベースを更新して `remove` すると、読み手は古い本体を保存してしまい、それが TTL の間ずっと残ります。それを許容できる程度に TTL を短く保つか、同じ要素の書き手を[ロック](/ja/docs/data/redis/lock)で直列化してください。
+</Callout>
+
+- **namespace。** 同じ種類で同じ namespace のキャッシュはキーを共有します。種類はキーの一部なので、`Cache` と `HashedCache` が衝突することはありません。
+- **スキーマの変更。** 古いバージョンのサービスが書いた本体は、`B` を変更した後にデシリアライズできなくなることがあります。その場合クエリは "failed to deserialize a stored body" という `RedisError` で失敗します。形式の互換性を保つか、型を変えるときに namespace も変えてください。
+- **エラーはキャッシュミスではありません。** `get` は本体がなければ `Ok(None)` を、Redis に到達できなければ `Err` を出力します。Redis が落ちているときにデータベースへフォールバックするのか失敗するのかを、明示的に決めてください。
+
+## 次のステップ
+
+<Cards>
+  <Card title="ロック" href="/ja/docs/data/redis/lock" description="同じ要素の書き手をレプリカ間で直列化します。" />
+  <Card title="ライブビュー" href="/ja/docs/data/redis/live-view" description="読み手がキャッシュをポーリングするのではなく、すべての変化に追従する必要があるときに。" />
+</Cards>

@@ -1,0 +1,71 @@
+---
+title: イントロダクション
+description: wakuwaku は、gRPC サーバー・イベントハンドラー・cron ジョブをコンパイル時のレジストリひとつから組み立てる、Rust 向けの証明駆動マイクロサービスフレームワークです。
+icon: BookOpen
+---
+
+**wakuwaku** は Rust 向けの証明駆動 (proof-driven) マイクロサービスフレームワークです。Java における Spring のように、バックエンドサービスで日常的に必要になるものをひとつのフレームワークでまかない、しかもその検査の大半を Rust のコンパイラに任せることを目指しています。
+
+wakuwaku のサービスは、ただの値を組み合わせて作ります。共有する依存 (コネクションプール、クライアント、設定の構造体など) を `ServiceBuilder` に登録します。gRPC サーバー、イベントハンドラー、cron ジョブといった各コンポーネントは、自分が組み立てられる元となる依存をひとつ宣言し、ビルダーがそれを使ってコンポーネントを生成します。依存の解決は実行時のコンテナではなくトレイトソルバーが行うため、登録していない依存を要求するコンポーネントはコンパイルが通りません。
+
+実際の処理を担うクレートはフィーチャーフラグの裏で再エクスポートされているので、サービスが依存するのは `wakuwaku` ひとつだけです。
+
+<ArchitectureDiagram lang="ja" />
+
+## 証明駆動プログラミング
+
+wakuwaku は正しさを 2 つに分けて扱います。
+
+- **マクロな正しさ**: コンポーネント同士がどう組み合わさるか。トレイトで証明し、コンパイラが検査します。依存が登録されていないコンポーネント、読み取り専用のデータベースハンドルを通した書き込みクエリ、間隔が 0 の cron ジョブは、いずれもビルドできません。
+- **ミクロな正しさ**: ひとつのコンポーネントが何をするか。ユニットテストで証明します。どのコンポーネントも [`kanau`](https://docs.rs/kanau) の `Processor` (またはその上に作られたトレイト) を実装したただの値なので、テストではサービスを起動せずにそれを生成して直接呼び出せます。
+
+その結果、配線のミスはほとんどビルド時に見つかり、残るテストは小さく高速に保てます。考え方の詳細は [証明駆動プログラミング](/ja/docs/core/proof-driven) で説明しています。
+
+## クレート構成
+
+| クレート          | インポート方法      | 提供するもの                                                                 |
+| ----------------- | ------------------- | ---------------------------------------------------------------------------- |
+| `wakuwaku`        | `wakuwaku`          | `ServiceBuilder`、gRPC の登録、cron ジョブ、Iggy コンシューマーの登録         |
+| `wakuwaku-entity` | `wakuwaku::entity`  | sqlx・Redis・Meilisearch 上の、ケイパビリティで型付けされたクエリとトランザクション |
+| `wakuwaku-iggy`   | `wakuwaku::iggy`    | Apache Iggy 上の型付きイベント (キーごとの順序保証と代数的なバッチ処理)        |
+| `wakuwaku-proof`  | `wakuwaku::proof`   | 証明を伴うバリデーション                                                     |
+
+これらの API に現れるサードパーティのクレート (`kanau`、`tonic`、`iggy`、`sqlx`、`redis`、`meilisearch_sdk`) は [`wakuwaku::deps`](https://docs.rs/wakuwaku/latest/wakuwaku/deps/index.html) の下に再エクスポートされています。ここからインポートすれば、バージョンが常に wakuwaku のビルドに使われたものと一致します。
+
+## フィーチャーフラグ
+
+| フィーチャー  | デフォルト | 有効になるもの                                                  |
+| ------------- | ---------- | --------------------------------------------------------------- |
+| `grpc`        | 有効       | gRPC サーバーの登録、`deps::tonic`                              |
+| `proof`       | 有効       | `wakuwaku::proof`                                               |
+| `iggy`        | 無効       | `wakuwaku::iggy`、Iggy コンシューマーの登録、`deps::iggy`       |
+| `entity`      | 無効       | データソースなしの `wakuwaku::entity`                           |
+| `sqlx-pg`     | 無効       | sqlx 経由の PostgreSQL を含む `entity`、`deps::sqlx`            |
+| `sqlx-mysql`  | 無効       | sqlx 経由の MySQL を含む `entity`、`deps::sqlx`                 |
+| `redis`       | 無効       | Redis を含む `entity`、`deps::redis`                            |
+| `meilisearch` | 無効       | Meilisearch を含む `entity`、`deps::meilisearch_sdk`            |
+
+cron ジョブと `ServiceBuilder` 自体は常に利用できます。よく使う組み合わせは [インストール](/ja/docs/getting-started/installation) で紹介しています。
+
+## 現在作れるもの
+
+- tonic が生成したサーバーから組み立てる **gRPC サービス**: [gRPC サービス](/ja/docs/services/grpc)
+- プロセス内で一定間隔で動く **cron ジョブ**: [cron ジョブ](/ja/docs/services/cron-jobs)
+- キーごとの順序保証・バッチ処理・リトライを備えた、Apache Iggy 上の **イベント駆動サービス**: [イベント](/ja/docs/events)
+- ハンドルの型によって触れてよい範囲が決まる、PostgreSQL・MySQL・Redis・Meilisearch への **データアクセス**: [データアクセス](/ja/docs/data)
+- 結果が型になるため、未検証の入力が検証済みの入力を要求するコードに届かない **バリデーション**: [バリデーション](/ja/docs/validation)
+
+## バージョンの状況
+
+現在のリリースはリリース候補の **1.0.0-rc1** です。API は 1.0.0 で出荷される予定のものですが、1.0.0 は実際のプロジェクトでの E2E テストに合格してからリリースされるため、細部はまだ変わる可能性があります。その先の計画は [ロードマップ](/ja/docs/roadmap) を参照してください。
+
+各アイテムの API リファレンスは [docs.rs](https://docs.rs/wakuwaku) にあります。このドキュメントでは、それを使って何をどう作るかを説明します。
+
+## 次のステップ
+
+<Cards>
+  <Card title="インストール" href="/ja/docs/getting-started/installation" description="ツールチェーン、Cargo.toml、フィーチャーフラグと、各フィーチャーに必要なインフラ。" />
+  <Card title="クイックスタート" href="/ja/docs/getting-started/quick-start" description="cron ジョブ付きの小さな gRPC サービスを作り、動かし、呼び出し、テストします。" />
+  <Card title="証明駆動プログラミング" href="/ja/docs/core/proof-driven" description="配線をコンパイラで、振る舞いをユニットテストで検査する理由。" />
+  <Card title="Spring から来た方へ" href="/ja/docs/guides/coming-from-spring" description="Spring の概念が wakuwaku の何に対応するか。" />
+</Cards>

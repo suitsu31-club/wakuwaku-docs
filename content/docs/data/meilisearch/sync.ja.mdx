@@ -1,0 +1,442 @@
+---
+title: 同期
+description: 射影、Indexer、書き込みフックやトランザクションフック、完全な再構築を使って、Meilisearch のインデックスを情報源と同期させます。
+icon: RefreshCw
+---
+
+インデックスが保持するのは、別の場所にあるデータの射影です。両者の同期には、よく知られた 4 つの失敗の仕方があり、それぞれに既知の対策があります。
+
+| 問題 | 原因 | 対策 | wakuwaku では |
+|---|---|---|---|
+| 気づかれない失敗 | 書き込みはタスクをキューに入れるだけで、タスクが後で失敗する | タスクを待つ | [`Indexer`](#the-indexer) は既定で待つ |
+| 古い状態での上書き | 同じドキュメントの 2 つの更新が競合し、古い方が最後に書かれる | キーで最新状態を読み直し、1 つのキーを 1 つのワーカーで扱う | `Indexer` は読み直す。配送をキーでパーティション分割するのは利用者側 |
+| 更新の消失 | コミットとインデックス書き込みの間のクラッシュや障害 | 変更の永続的なログ (アウトボックス、CDC) | 利用者側の配送 |
+| ずれ (drift) | バグ、取りこぼした変更、設定の変更 | インデックスを一から再構築する | [`rebuild()`](#rebuilding-an-index) |
+
+wakuwaku は、どのプロジェクトでも共通する部品を提供します。射影を記述する方法、キーで変更を適用するインデクサー、ダウンタイムのない再構築です。変更が情報源からインデクサーへどう届くかはインフラ次第であり、利用者が選びます。
+
+<MeiliSyncDiagram lang="ja" />
+
+この例では、[概要](/ja/docs/data/meilisearch) の `posts` インデックスを PostgreSQL の `post` テーブルと同期させるので、両方のフィーチャーが必要です。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["meilisearch", "sqlx-pg"] }
+```
+
+## 射影を記述する
+
+[`Projection`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/trait.Projection.html) は、情報源の行をキーで読み込む方法と、各行をドキュメントに変換する方法 (検索対象にすべきでない行なら何も返さない) を定めます。
+
+まず情報源です。`post` テーブルはそれ自体がエンティティで、普通の [sqlx クエリ](/ja/docs/data/sqlx) で読みます。
+
+```rust title="src/search/sync.rs"
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Entity, Execute, Query, Read};
+
+/// `post` テーブル: 信頼できる唯一の情報源。
+pub struct Post;
+impl Entity for Post {}
+
+/// `post` テーブルの行。
+pub struct PostRow {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub author_id: i64,
+    pub title: String,
+    pub summary: String,
+    pub tags: Vec<String>,
+    /// 下書きの間は `None`。
+    pub published_at: Option<i64>,
+}
+
+type PostTuple = (i64, i64, i64, String, String, Vec<String>, Option<i64>);
+
+impl From<PostTuple> for PostRow {
+    fn from(
+        (id, workspace_id, author_id, title, summary, tags, published_at): PostTuple,
+    ) -> Self {
+        Self { id, workspace_id, author_id, title, summary, tags, published_at }
+    }
+}
+
+/// 投稿を id で読み込む。
+pub struct LoadPosts {
+    ids: Vec<i64>,
+}
+
+impl Query for LoadPosts {
+    type Effect = Read<Post>;
+}
+
+impl Execute<PgSource> for LoadPosts {
+    type Output = Vec<PostRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
+        let rows: Vec<PostTuple> = sqlx::query_as(
+            "SELECT id, workspace_id, author_id, title, summary, tags, \
+                    EXTRACT(EPOCH FROM published_at)::bigint \
+             FROM post WHERE id = ANY($1)",
+        )
+        .bind(&self.ids)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows.into_iter().map(PostRow::from).collect())
+    }
+}
+```
+
+次に射影そのものです。
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::meilisearch::sync::Projection;
+
+/// `post` の行が `posts` のドキュメントになる方法。
+pub struct PostProjection;
+
+impl Projection for PostProjection {
+    type Index = PostIndex;
+    type Row = PostRow;
+    type Load = LoadPosts;
+
+    fn load(&self, keys: &[i64]) -> LoadPosts {
+        LoadPosts { ids: keys.to_vec() }
+    }
+
+    fn key(&self, row: &PostRow) -> i64 {
+        row.id
+    }
+
+    fn project(&self, row: PostRow) -> Option<PostDocument> {
+        // 下書きは検索対象にしない: `None` はそのドキュメントを削除する。
+        let published_at = row.published_at?;
+        Some(PostDocument {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            author_id: row.author_id,
+            title: row.title,
+            summary: row.summary,
+            tags: row.tags,
+            published_at,
+        })
+    }
+}
+```
+
+`load` は行を任意の順序で返してよく、行のないキーは結果から外れます。`project` には可視性のルールを書きます。下書き、論理削除された行、非公開のコンテンツなどです。`None` を返すと行を飛ばすだけでなく、そのドキュメントを *削除* します。そのため、投稿を非公開に戻すとインデックスからも消えます。
+
+## インデクサー [#the-indexer]
+
+[`Indexer`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/hook/struct.Indexer.html) は、[`Reindex<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/struct.Reindex.html) (ドキュメントが変わった可能性のあるキーのリスト) に変換できるものなら何でも処理する [`Processor`](/ja/docs/data/queries) です。バッチごとに次のことを行います。
+
+1. 射影の `Load` クエリで、それらのキーの行を情報源から読み込みます。
+2. ドキュメントに射影される行のドキュメントを upsert します。
+3. 行がなくなったか `None` に射影されるキーのドキュメントを削除します。
+4. 両方のタスクを待ちます (既定ではそれぞれ 30 秒。`.wait_timeout(d)` で変更できます)。
+
+出力は、upsert と削除の件数を持つ [`Reindexed`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/hook/struct.Reindexed.html) か、[`SyncError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/enum.SyncError.html) です。`SyncError` は、読み込みに失敗すると `Source(e)`、リクエストやタスクが失敗またはタイムアウトすると `Meilisearch(e)` になります。
+
+重要な設計判断は、**インデクサーは変更の内容を決して信用せず、キーだけを使う** ことです。常に情報源から現在の状態を読み直します。そのため、二重に届いた変更、遅れて届いた変更、順序の入れ替わった変更も害になりません。あるキーの最後の再インデックスが、その時点で情報源にあるものを書き込みます。
+
+`Indexer::new(source, meili, projection)` は 3 つのものを受け取ります。
+
+- `source`: 射影の `Load` クエリを処理できるもの。典型的には読み取り専用のデータベースハンドル。
+- `meili`: そのインデックスの `Upsert`、`Delete`、`WaitTask` を処理できるもの。典型的には [インデックスを書けるケーパビリティ](/ja/docs/data/meilisearch/writes#a-capability-for-the-indexer) を持つ `Db<MeiliSource, C>`。
+- `projection`: あなたの `Projection`。
+
+## 書き込みフックで変更を届ける [#delivering-changes-with-a-write-hook]
+
+最も簡単な配送方法は [書き込みフック](/ja/docs/data/hooks) です。データベースハンドルを `AfterWrite` で包み、インデクサーをフックにします。posts に対する各書き込みクエリが自分の変更を記述し、その変更が `Reindex` に変換されます。
+
+```rust title="src/search/sync.rs"
+use std::convert::Infallible;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::meilisearch::sync::{Indexer, Reindex, SyncError};
+use wakuwaku::entity::meilisearch::MeiliSource;
+use wakuwaku::entity::{AfterWrite, Db, ReadOnly, ReadWrite, Write, WriteQuery};
+
+/// 下書きを公開する。
+pub struct PublishPost {
+    pub id: i64,
+}
+
+impl Query for PublishPost {
+    type Effect = (Read<Post>, Write<Post>);
+}
+
+impl Execute<PgSource> for PublishPost {
+    type Output = u64;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+        let done = sqlx::query("UPDATE post SET published_at = now() WHERE id = $1")
+            .bind(self.id)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected())
+    }
+}
+
+/// `post` に対するすべての書き込みクエリがフックに報告するもの。
+pub struct PostChanged {
+    pub id: i64,
+}
+
+impl WriteQuery for PublishPost {
+    type Change = PostChanged;
+
+    fn change(&self) -> PostChanged {
+        PostChanged { id: self.id }
+    }
+}
+
+impl From<PostChanged> for Reindex<PostIndex> {
+    fn from(change: PostChanged) -> Self {
+        Reindex::one(change.id)
+    }
+}
+
+/// フックのエラーはここで終わる。リクエストはすでに成功している。
+pub struct LogSyncError;
+
+impl Processor<SyncError<sqlx::Error>> for LogSyncError {
+    type Output = ();
+    type Error = Infallible;
+
+    async fn process(&self, error: SyncError<sqlx::Error>) -> Result<(), Infallible> {
+        eprintln!("reindexing posts failed: {error}");
+        Ok(())
+    }
+}
+```
+
+ハンドルを組み立てる場所で一度だけ接続します。
+
+```rust title="src/search/sync.rs"
+pub type PostIndexerFor = Indexer<Db<PgSource, ReadOnly>, Db<MeiliSource, PostIndexer>, PostProjection>;
+
+pub fn wire(
+    primary: PgSource,
+    meili: Db<MeiliSource, PostIndexer>,
+) -> AfterWrite<Db<PgSource, ReadWrite>, PostIndexerFor, LogSyncError> {
+    // プライマリから読み込む: 遅延しているレプリカは古い行を返しうる。
+    let loader: Db<PgSource, ReadOnly> = Db::new(primary.clone());
+    let indexer = Indexer::new(loader, meili, PostProjection).without_waiting();
+    AfterWrite::new(Db::new(primary), indexer, LogSyncError)
+}
+```
+
+`primary` はプライマリのプールに対する `SqlxSource::new(pool)` です。包んだハンドルはそのまま差し替えられます。`Processor<PublishPost>` だけを要求するハンドラーは変更なしで動き続け、成功した `PublishPost` のたびにその投稿が再インデックスされるようになります。
+
+この構成について知っておくべきこと:
+
+- **`without_waiting()`** を使うと、フックは書き込みがキューに入った時点で戻るので、リクエストは Meilisearch を待ちません。代償として、後で失敗したタスクは報告されません。
+- **フックのエラーがリクエストを失敗させることはありません。** Meilisearch が停止していても、データベースへの書き込みは成功し、エラーは `LogSyncError` に渡ります。
+- **プライマリから読み込んでください。** インデクサーは読み込んだものを信用します。遅延しているレプリカは、書き込み *前* の行を渡してしまいます。
+- **コミットとフックの間でクラッシュすると更新は失われます。** また、同じ投稿に対する 2 つの並行リクエストが競合することがあります (両方が読み込み、古い方の書き込みが最後に届く)。どちらも次の [再構築](#rebuilding-an-index) で修復されます。
+
+<Callout type="info" title="トランザクション内のクエリは書き込みフックを通らない">
+  `AfterWrite` が見るのは単独で実行されたクエリです。[トランザクション](/ja/docs/data/transactions) 内のクエリはトランザクションのコネクション上で実行され、`AfterWrite` を通りません。代わりにトランザクションにフックを掛けます。
+</Callout>
+
+## トランザクションから変更を届ける
+
+`TxFlow` の中で行う書き込みには、ハンドルを `AfterTransaction` で包みます。そのフックは、フローのレポートとトランザクションの結末 ([`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)) を受け取ります。フローの `Report` を、触れた投稿の `Reindex` にして、インデクサーを適合させます。
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::meilisearch::sync::Reindexed;
+use wakuwaku::entity::sqlx::transaction::TxFinalState;
+use wakuwaku::entity::sqlx::transaction::hook::AfterTransaction;
+
+/// トランザクションフック: コミットされたら、トランザクションが触れたものを再インデックスする。
+pub struct ReindexCommitted<I>(pub I);
+
+impl<I> Processor<TxFinalState<Reindex<PostIndex>>> for ReindexCommitted<I>
+where
+    I: Processor<Reindex<PostIndex>, Output = Reindexed> + Sync,
+    I::Error: Send,
+{
+    type Output = ();
+    type Error = I::Error;
+
+    async fn process(&self, state: TxFinalState<Reindex<PostIndex>>) -> Result<(), I::Error> {
+        match state {
+            // 読み直しは冪等なので、コミット不明でも再インデックスして安全。
+            TxFinalState::Committed(keys) | TxFinalState::CommitUnknown(keys) => {
+                self.0.process(keys).await?;
+                Ok(())
+            }
+            TxFinalState::RolledBack(_) => Ok(()),
+        }
+    }
+}
+
+pub fn wire_transactions(
+    primary: PgSource,
+    meili: Db<MeiliSource, PostIndexer>,
+) -> AfterTransaction<Db<PgSource, ReadWrite>, ReindexCommitted<PostIndexerFor>, LogSyncError> {
+    let loader: Db<PgSource, ReadOnly> = Db::new(primary.clone());
+    let indexer = Indexer::new(loader, meili, PostProjection).without_waiting();
+    AfterTransaction::new(Db::new(primary), ReindexCommitted(indexer), LogSyncError)
+}
+```
+
+キーによる再インデックスが真価を発揮するのが `CommitUnknown` です。`COMMIT` の結果が失われると投稿が変わったかどうかは分かりませんが、読み直せばどちらの場合でも正しい結果になります。単独で実行されたクエリは `AfterTransaction` をそのまま通過するので、2 つのフックを重ねられます: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>`。
+
+## 永続的なログで変更を届ける
+
+フックは書き込みを行ったプロセス内で実行されるため、コミット直後のクラッシュで更新が失われます。それが問題になる場合は、永続的なログを使います。
+
+1. 変更と同じデータベーストランザクションで、変更されたキーを記録する *アウトボックス* 行を挿入します。
+2. アウトボックスの行を [Iggy ストリーム](/ja/docs/events) などのキューに中継するか、変更データキャプチャを使います。
+3. インデクサーでキューを消費します。各メッセージを `Reindex` に変換して処理します。
+4. **キューをキーでパーティション分割し**、1 つのキーを同時に 1 つのワーカーだけが再インデックスするようにします。これが古い状態での上書きを防ぎます。
+5. **インデクサーが成功してから初めてメッセージを確認応答 (ack) します。** ここではインデクサーの既定の待機を有効のままにし、成功が本当に「Meilisearch が適用した」を意味するようにします。
+
+インデクサーはキーで読み直すので、再配送されたメッセージは無害です。
+
+## インデックスの再構築 [#rebuilding-an-index]
+
+配送方法にかかわらず、定期的に再構築してください。配送が取りこぼしたものを修復します。[`rebuild()`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/rebuild/fn.rebuild.html) は情報源全体をページごとに読み込むので、射影が [`Scan`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/trait.Scan.html) を実装している必要があります。
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::meilisearch::sync::Scan;
+
+/// `post` の 1 ページ (id 順)。
+pub struct PostPage {
+    after: Option<i64>,
+    limit: i64,
+}
+
+impl Query for PostPage {
+    type Effect = Read<Post>;
+}
+
+impl Execute<PgSource> for PostPage {
+    type Output = Vec<PostRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
+        let rows: Vec<PostTuple> = sqlx::query_as(
+            "SELECT id, workspace_id, author_id, title, summary, tags, \
+                    EXTRACT(EPOCH FROM published_at)::bigint \
+             FROM post WHERE $1::bigint IS NULL OR id > $1 ORDER BY id LIMIT $2",
+        )
+            .bind(self.after)
+            .bind(self.limit)
+            .fetch_all(conn)
+            .await?;
+        Ok(rows.into_iter().map(PostRow::from).collect())
+    }
+}
+
+impl Scan for PostProjection {
+    type Page = PostPage;
+
+    fn page(&self, after: Option<&i64>, limit: usize) -> PostPage {
+        PostPage {
+            after: after.copied(),
+            limit: i64::try_from(limit).unwrap_or(i64::MAX),
+        }
+    }
+}
+```
+
+1 ページは、キーが `after` より *後* の行 (`None` ならすべての行) を、キーの昇順で最大 `limit` 件返します。順序は厳密かつ安定でなければなりません。`rebuild()` は各ページの最後の行のキーの後から続け、行数が `limit` 未満の最初のページで止まります。このようなキーセットページネーションは、`OFFSET` と違い大きなテーブルでも速いままです。あるページが前のページと同じキーで終わると、再構築は無限ループせずに `SyncError::StuckScan` で止まります。
+
+実行は 1 回の呼び出しです。
+
+```rust title="src/search/rebuild.rs"
+use wakuwaku::entity::meilisearch::sync::{RebuildOptions, Rebuilt, rebuild};
+
+/// `post` から `posts` を再構築する。
+pub async fn rebuild_posts(
+    source: &Db<PgSource, ReadOnly>,
+    meili: &Db<MeiliSource, PostIndexer>,
+) -> Result<Rebuilt, SyncError<sqlx::Error>> {
+    let rebuilt = rebuild(&PostProjection, source, meili, &RebuildOptions::default()).await?;
+    eprintln!("rebuilt posts with {} documents", rebuilt.documents);
+    Ok(rebuilt)
+}
+```
+
+[cron ジョブ](/ja/docs/services/cron-jobs) でスケジュールしてください。まずは毎晩が妥当です。
+
+### 再構築の仕組み
+
+1. (以前に失敗した実行の) 残っている `posts__wakuwaku_rebuild` という名前のコピーを削除し、新たに作成します。
+2. インデックスの設定をコピーに適用します。
+3. 情報源をページごとに読み込み、ドキュメントをコピーに upsert します。次のページを読む間も書き込みを 1 つ実行中にしておきます。
+4. 本番のインデックスがなければ作成し、本番のインデックスとコピーを一度に **入れ替え (swap)** ます。
+5. 古いドキュメントを持つことになったコピーを削除します。
+
+検索から見えるのは古いドキュメントか新しいドキュメントのどちらかで、途中まで埋まったインデックスが見えることはありません。どこかで失敗しても、本番のインデックスは元のまま残ります。そのため、設定や射影を変更した後にも再構築が適しています。新しい設定は、トラフィックを処理しているインデックスではなくコピーに適用されます。
+
+各再構築はコピーの削除から始まるので、1 つのインデックスの再構築は同時に 1 つしか実行できません。`meili` の API キーには、インデックスとそのコピーの両方に対する `indexes.create`、`indexes.delete`、`indexes.swap`、`settings.update`、`documents.add`、`tasks.get` のアクションが必要で、ケーパビリティはインデックスを書ける (`C: CanWrite<PostIndex>`) 必要があります。
+
+<TypeTable
+  type={{
+    batch_size: { type: 'NonZeroUsize', description: '情報源から読む 1 ページの行数で、1 回の書き込みのドキュメント数。', default: '1000' },
+    task_timeout: { type: 'Duration', description: '各タスクを待つ時間。', default: '10 分' },
+    poll_interval: { type: 'Duration', description: 'タスクの実行完了を確認する間隔。', default: '200 ms' },
+  }}
+/>
+
+### 再構築中の書き込み
+
+コピーには、各ページを読んだ時点の情報源が入ります。ある行のページを読んだ *後* にその行が変更され、その間に本番のインデックスへ再インデックスされた場合、その変更は入れ替えの時点で失われます。何もしなければ次の再構築で修復されます。すぐに追いつくには、[`Rebuilt::started_at`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/rebuild/struct.Rebuilt.html) 以降に変更されたキーを再インデックスします。これには行の変更時刻と、削除された行を見つけるための論理削除が必要です。
+
+```rust title="src/search/rebuild.rs"
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// `since` 以降に変更された投稿の id (論理削除されたものを含む)。
+pub struct ChangedSince {
+    since: SystemTime,
+}
+
+impl Query for ChangedSince {
+    type Effect = Read<Post>;
+}
+
+impl Execute<PgSource> for ChangedSince {
+    type Output = Vec<i64>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error> {
+        let since = self.since.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        sqlx::query_scalar("SELECT id FROM post WHERE updated_at >= to_timestamp($1)")
+            .bind(since)
+            .fetch_all(conn)
+            .await
+    }
+}
+
+pub async fn rebuild_and_catch_up(
+    source: &Db<PgSource, ReadOnly>,
+    meili: &Db<MeiliSource, PostIndexer>,
+) -> Result<Reindexed, SyncError<sqlx::Error>> {
+    let rebuilt = rebuild(&PostProjection, source, meili, &RebuildOptions::default()).await?;
+    let changed = source
+        .process(ChangedSince { since: rebuilt.started_at })
+        .await
+        .map_err(SyncError::Source)?;
+    let indexer = Indexer::new(source.clone(), meili.clone(), PostProjection);
+    indexer.process(Reindex::<PostIndex>::new(changed)).await
+}
+```
+
+## 戦略の選び方
+
+| 戦略 | インデックスの遅れ | クラッシュや障害の後 | 向いている用途 |
+|---|---|---|---|
+| 書き込みフックまたはトランザクションフック + 定期的な再構築 | 一瞬 | 次の再構築まで変更が欠ける | 最初の一歩、ほとんどの社内向け検索 |
+| 永続的なログ + インデクサー + 定期的な再構築 | キューの遅延 | 何も失われない。変更は再配送される | ユーザーが頼りにする検索、書き込みの多いシステム |
+| 再構築のみ | 最大で再構築の間隔 | 次の再構築で何も失われない | 小さいデータやめったに変わらないデータ、カタログ |
+
+フックと毎晩の再構築から始めるのは妥当です。障害が起きても、インデックスのずれは最大 1 日で済みます。それが許容できなくなったら永続的なログに移行します。どちらの場合も、射影、インデクサー、再構築はそのままで、変わるのは配送方法だけです。
+
+## 次のステップ
+
+<Cards>
+  <Card title="フック" href="/ja/docs/data/hooks" description="AfterWrite と BeforeWrite がハンドルを包む仕組み。" />
+  <Card title="トランザクション" href="/ja/docs/data/transactions" description="トランザクションフローと AfterTransaction。" />
+  <Card title="cron ジョブ" href="/ja/docs/services/cron-jobs" description="毎晩の再構築をスケジュールする。" />
+</Cards>

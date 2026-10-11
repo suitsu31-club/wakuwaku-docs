@@ -1,0 +1,190 @@
+---
+title: Search
+description: Build typed filters and sorts, accept them safely from client JSON, and run searches under a scope the client can't remove.
+icon: SearchCode
+---
+
+Most search requests originate with an end user: a search box, a set of facet checkboxes, a sort dropdown. The usual shortcut, concatenating user input into a Meilisearch filter string, is injection waiting to happen. wakuwaku replaces filter strings with a typed tree that can only name the fields of its index, deserializes it from client JSON, and combines it with a server-side scope that nothing in the client's filter can lift.
+
+The examples on this page use the `PostIndex` described on the [overview](/en/docs/data/meilisearch).
+
+## Typed filters
+
+A [`Filter<F>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/enum.Filter.html) is a tree of conditions on the fields `F`, which is the index's `Filterable` enum:
+
+```rust
+use wakuwaku::entity::meilisearch::filter::Filter;
+
+let recent_async_posts = Filter::And(vec![
+    Filter::In(PostFilter::Tags, vec!["async".into(), "tokio".into()]),
+    Filter::Gte(PostFilter::PublishedAt, 1_700_000_000_i64.into()),
+]);
+```
+
+| Variant | Meaning |
+|---|---|
+| `Eq(f, v)` / `Ne(f, v)` | Equal / not equal. For an array attribute, one of its elements is equal. Strings compare case-insensitively. |
+| `Gt`, `Gte`, `Lt`, `Lte` | Comparisons. |
+| `Between(f, low, high)` | Between two values, both included. |
+| `In(f, values)` | Equal to one of the values; matches nothing if there are none. |
+| `Exists(f)` | The document has the attribute, even if it is `null` or empty. |
+| `IsNull(f)` / `IsEmpty(f)` | The attribute is `null` / is `""`, `[]` or `{}`. |
+| `Not(filter)`, `And(filters)`, `Or(filters)` | Negation and groups. |
+| `DangerouslyRaw(expr)` | A raw Meilisearch expression; see [below](#raw-expressions). |
+
+Values are a [`Value`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/enum.Value.html): a boolean, an integer, a float or a string. `.into()` converts from `bool`, the integer types, `f32`/`f64`, `String` and `&str`.
+
+### The same filter as JSON
+
+Filters deserialize from JSON with external tags, so a client can send the filter above as:
+
+```json
+{"and": [{"in": ["tags", ["async", "tokio"]]}, {"gte": ["published_at", 1700000000]}]}
+```
+
+`render()` turns it into Meilisearch syntax. Every group member is parenthesized, and every attribute and value is quoted and escaped:
+
+```text
+("tags" IN ["async", "tokio"]) AND ("published_at" >= "1700000000")
+```
+
+### What can't go wrong
+
+Filters are checked at three points, from strongest to weakest:
+
+| When | What is rejected |
+|---|---|
+| Compile time | A field that isn't in the index's `Filterable` enum. A filter for one index used to scope a search of another: `Filter<UserFilter>` is not `Filter<PostFilter>`. |
+| Deserialization | Unknown attribute names (`{"exists": "password"}`), unknown operators, and raw expressions: `DangerouslyRaw` is skipped by serde, so a client can't send `{"dangerously_raw": "..."}`. |
+| Rendering | An empty `And`/`Or` (`EmptyGroup`), a NaN or infinite float (`NonFiniteNumber`), nesting deeper than `MAX_DEPTH` = 64 (`TooDeep`). |
+
+Injection through values is ruled out by construction. `"` and `\` are escaped inside the quotes, so a value can never end its string early:
+
+```rust
+let sneaky = Filter::Eq(PostFilter::Tags, r#"x" OR workspace_id EXISTS"#.into());
+// renders as: "tags" = "x\" OR workspace_id EXISTS"
+```
+
+Here is the compile-time check in action. A filter on the users index can't scope a search of posts:
+
+```rust
+let request = SearchRequest::<PostIndex>::new();
+// error[E0308]: mismatched types: expected `PostFilter`, found `UserFilter`
+let search = Search::scoped(request, Filter::Eq(UserFilter::Team, "core".into()));
+```
+
+## Sorts
+
+A [`Sort<F>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/filter/struct.Sort.html) names a field of the index's `Sortable` enum and an order. Build it with `Sort::asc(field)` / `Sort::desc(field)`, or let a client send `{"field": "published_at", "order": "desc"}`; the order defaults to ascending. Sorts are applied in order, before relevancy.
+
+## Search requests from clients
+
+A [`SearchRequest<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/search/struct.SearchRequest.html) is everything a client may ask of a search on the index `I`. It deserializes directly from the request body:
+
+```json
+{
+  "q": "rust",
+  "filter": {"gte": ["published_at", 1700000000]},
+  "sort": [{"field": "published_at", "order": "desc"}],
+  "facets": ["tags"],
+  "page": 2,
+  "hitsPerPage": 20
+}
+```
+
+Every field is optional. Without `q`, every document in scope matches. Facets must be filterable fields, and sorts must be sortable ones. Unknown top-level fields are rejected (`deny_unknown_fields`), so a client never believes an option is honored when the server ignores it. For example, `{"q": "rust", "limit": 1000}` fails with ``unknown field `limit` ``.
+
+## Running a search under a scope
+
+A [`Search<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/search/struct.Search.html) adds what the server enforces on top of the client's request:
+
+- **A scope**: `Search::scoped(request, scope)` restricts the search to documents matching `scope`. `Search::unscoped(request)` searches every document of the index; use it only for indexes that are public as a whole.
+- **A page size bound**: the requested `hitsPerPage` defaults to 20 and is capped at 100. Change the cap with `.max_hits_per_page(n)`; larger requests silently get `n`.
+
+The scope and the client's filter are sent to Meilisearch as separate elements of a filter array. Meilisearch parses each element on its own and combines them with `AND`, so nothing in the client's part, not even a stray parenthesis, can widen the scope.
+
+`Search<I>` has the effect `Read<I>` and outputs a `SearchResults<I::Document>` from the SDK. Documents are deserialized as your document type, so attributes outside it never reach the client through your server.
+
+Here is a complete handler. Keep it generic over the handle and list the query it needs, as with [any other query](/en/docs/data/queries); the capability is checked once, where the handle is wired in.
+
+```rust title="src/search/handlers.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::deps::meilisearch_sdk::search::SearchResults;
+use wakuwaku::entity::meilisearch::filter::Filter;
+use wakuwaku::entity::meilisearch::search::{Search, SearchRequest};
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Search the posts of the caller's workspace.
+///
+/// `body` is the JSON the client sent.
+pub async fn search_posts<D>(
+    meili: &D,
+    workspace_id: i64,
+    body: &str,
+) -> Result<SearchResults<PostDocument>, BoxError>
+where
+    D: Processor<Search<PostIndex>, Output = SearchResults<PostDocument>, Error = Error>,
+{
+    // Unknown fields, unknown attributes and raw filters fail here.
+    let request: SearchRequest<PostIndex> = serde_json::from_str(body)?;
+    // Empty groups, NaN and too-deep nesting fail here, as a 400.
+    if let Some(filter) = &request.filter {
+        filter.render()?;
+    }
+
+    // The client's filter is ANDed with this scope; it can't lift it.
+    let scope = Filter::Eq(PostFilter::WorkspaceId, workspace_id.into());
+    let search = Search::scoped(request, scope).max_hits_per_page(50);
+    Ok(meili.process(search).await?)
+}
+```
+
+<Callout type="info" title="Why render the filter up front?">
+  A filter that can't be rendered would otherwise fail the query itself, with `Error::Other` wrapping a `FilterError`, which is hard to tell apart from a Meilisearch outage. Calling `render()` first lets you answer with a client error instead.
+</Callout>
+
+Wire it to a read-only handle built from a search key (see [`search_handle`](/en/docs/data/meilisearch#indexes-entities-and-capabilities)): `search_posts(&search_handle(url, key)?, workspace, body)`.
+
+### Searches built on the server
+
+Nothing requires a client. `SearchRequest::new()` is an empty request you can fill in yourself:
+
+```rust title="src/search/handlers.rs"
+use wakuwaku::entity::meilisearch::filter::Sort;
+
+/// Titles of the newest posts of one author.
+pub async fn latest_titles<D>(meili: &D, workspace_id: i64, author_id: i64) -> Result<Vec<String>, Error>
+where
+    D: Processor<Search<PostIndex>, Output = SearchResults<PostDocument>, Error = Error>,
+{
+    let mut request = SearchRequest::<PostIndex>::new();
+    request.filter = Some(Filter::Eq(PostFilter::AuthorId, author_id.into()));
+    request.sort = vec![Sort::desc(PostSort::PublishedAt)];
+    request.hits_per_page = Some(10);
+
+    let scope = Filter::Eq(PostFilter::WorkspaceId, workspace_id.into());
+    let results = meili.process(Search::scoped(request, scope)).await?;
+    Ok(results.hits.into_iter().map(|hit| hit.result.title).collect())
+}
+```
+
+## Raw expressions
+
+`Filter::dangerously_raw(expr)` holds an expression in Meilisearch's own syntax and renders it as is. It exists for what the typed tree can't express, such as geo filters. Clients can't send one, but the expression itself is trusted completely:
+
+<Callout type="error" title="Rules for raw filters">
+  - **Never build it from untrusted input.** `format!("author = {name}")` with the name `x OR author EXISTS` matches every document. That is injection, as with SQL.
+  - **Parentheses don't contain it.** `AND` binds tighter than `OR`, so the raw text `a = 1) OR (b = 2`, placed inside `(scope) AND (...)`, matches `b = 2` outside the scope. A raw node can rewrite the meaning of the whole filter it is part of.
+  - **It reaches beyond the index's fields.** It may name any filterable attribute, and `_foreign()` filters on documents of joined indexes.
+</Callout>
+
+What a raw node can't do is escape a *separate* filter. In a scoped search, a raw node in the request's filter can't lift the scope. A raw node *inside the scope* can still make the scope match everything, so keep scopes typed.
+
+## Next steps
+
+<Cards>
+  <Card title="Tenant tokens" href="/en/docs/data/meilisearch/tenant-tokens" description="The same scopes, enforced by Meilisearch for frontends that query it directly." />
+  <Card title="Writes" href="/en/docs/data/meilisearch/writes" description="Put documents into the index." />
+</Cards>

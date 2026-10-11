@@ -1,0 +1,214 @@
+---
+title: ロック
+description: レプリカ間の排他ロックとリーダー・ライターロック。リースにより、クラッシュした保持者が全員をブロックし続けることを防ぎます。
+icon: Lock
+---
+
+サービスの複数のレプリカが同じもの（同じ請求書の確定、同じ cron ジョブの実行、同じインデックスの再構築）に触れる可能性があるとき、誰が先に行うかを合意する必要があります。[`collection::lock`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/lock/index.html) は名前をキーとする 2 種類のロックを提供します。
+
+- `Lock<N>`: 名前ごとに保持者は最大 1 人。
+- `RwLock<N>`: 名前ごとに、ライター 1 人か、任意の数のリーダー。
+
+どちらもリースです。保持者はロックを解放するか、ロックの TTL が尽きるまでロックを保持します。リースがあるので、クラッシュしたりネットワークから切り離されたりした保持者が全員を永遠にブロックすることはありません。
+
+## 取得は決して待たない
+
+`try_lock` は、ロックが空いていれば `Some(token)` を、そうでなければ `None` を出力します。組み込みの待機やリトライのループはありません。諦めるか、後でリトライするか、「処理中」と報告するかは呼び出し側が決めます。
+
+```rust title="src/invoice.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::lock::Lock;
+
+pub const INVOICES: Lock<u64> = Lock::new("invoice", Duration::from_secs(30));
+
+pub async fn finalize_invoice(redis: &Redis, invoice: u64) -> RedisResult<bool> {
+    let Some(token) = redis.process(INVOICES.try_lock(&invoice)).await? else {
+        // 他の誰かが確定処理中。
+        return Ok(false);
+    };
+    write_final_totals(invoice).await;
+    if !redis.process(token.release()).await? {
+        // 解放の前にリースが尽きていた: 別の保持者が
+        // 同時に実行していた可能性がある。
+    }
+    Ok(true)
+}
+```
+
+トークンは `LockToken<Lock<u64>>` です。これはロックを保持していることの証明であり、ロックを解放・延長する唯一の手段です。
+
+- `token.release()` は、このトークンがまだロックを保持していれば `true`、リースがすでに尽きていれば（そして今は別の誰かが保持しているかもしれなければ）`false` を出力します。
+- `token.extend()` はリースをもう 1 TTL 分やり直します。`true` / `false` の意味は同じです。
+
+<Callout type="info" title="トークンを drop してもロックは解放されない">
+  Redis と通信する `Drop` 実装はありません。タスクが panic したなどの理由で drop されたトークンは、リースが尽きるまでロックを保持したままにします。そのことを踏まえて TTL を選んでください。TTL は、クラッシュした保持者が全員をブロックする最長時間です。
+</Callout>
+
+### Redis 上の表現
+
+`Lock` の要素は `@@wakuwaku-entity:Lock:<namespace>:<name>` という 1 つの文字列キーで、保持者のランダムな 16 バイトのトークンを持ちます。
+
+- 取得は `SET key token NX PX ttl` で、それ自体がアトミックです。
+- 解放と延長は Lua スクリプトで、キーがまだ *このトークン* を持っている場合にだけ作用します。リースが尽きた保持者が、自分を追い越した保持者のロックを削除したり延長したりすることはできません。
+
+## TTL より長くロックを保持する
+
+リースより長くかかるかもしれない作業は、リースを延長しなければなりません。作業と並行してハートビートを走らせ、延長がリースを失ったと報告したらすぐに作業を止めます。
+
+```rust title="src/lease.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::lock::{Lock, LockToken};
+
+/// `lock` の TTL の 3 分の 1 ごとに `token` のリースを延長しながら `work` を実行する。
+/// リースを失った場合は `work` を drop して `None` を出力する。
+pub async fn while_held<F: Future>(
+    redis: &Redis,
+    lock: Lock<str>,
+    token: &LockToken<Lock<str>>,
+    work: F,
+) -> RedisResult<Option<F::Output>> {
+    let mut work = std::pin::pin!(work);
+    let mut heartbeat = tokio::time::interval(lock.ttl() / 3);
+    heartbeat.tick().await; // 最初の tick はすぐに完了する。
+    loop {
+        tokio::select! {
+            output = &mut work => return Ok(Some(output)),
+            _ = heartbeat.tick() => {
+                if !redis.process(token.extend()).await? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+```
+
+このヘルパーは `tokio` を直接使います。サービスがまだ依存していなければ `Cargo.toml` に追加してください。
+
+## リースが保証できないこと
+
+リースは、ロックが守れる範囲を制限します。停止したプロセス（ブロックされた executor スレッド、凍結した VM、ネットワーク分断）は、リースが尽きて別の誰かがロックを取った後に再開し、まだ保持しているつもりで書き込みを続けるかもしれません。延長はその時間幅を狭めるだけで、なくすことはできません。
+
+古い保持者による書き込みを「起こりにくい」ではなく「起こり得ない」ものにしたいなら、守られる側のリソース自身がそれを拒否するようにします。リソースが自分で検査する *フェンシング* 値を使うのです。ロックのトークンはランダムで単調増加しないため、フェンシングトークンとしては使えません。代わりにリソース側の値を使います。たとえば書き込み時に検査するバージョン列（`UPDATE … WHERE version = $expected`）や、判断の根拠にした状態を読み直す[トランザクション](/ja/docs/data/transactions)です。
+
+## リーダー・ライターロック
+
+`RwLock` は、任意の数のリーダーを同時に、またはライター 1 人だけを通します。`try_read` は `ReadToken` を、`try_write` は `Lock` と同じトークン型である `LockToken<RwLock<N>>` を出力します。
+
+```rust title="src/catalog.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::lock::RwLock;
+
+pub const CATALOG: RwLock<str> = RwLock::new("catalog", Duration::from_secs(10));
+
+pub async fn export(redis: &Redis, shop: &str) -> RedisResult<bool> {
+    let Some(read) = redis.process(CATALOG.try_read(shop)).await? else {
+        return Ok(false); // ライターが保持している
+    };
+    // … カタログを読む。他のリーダーも同時に読める …
+    redis.process(read.release()).await?;
+    Ok(true)
+}
+
+pub async fn reprice(redis: &Redis, shop: &str) -> RedisResult<bool> {
+    let Some(write) = redis.process(CATALOG.try_write(shop)).await? else {
+        return Ok(false); // ライターかリーダーが保持している
+    };
+    // … カタログを単独で書き換える …
+    redis.process(write.release()).await?;
+    Ok(true)
+}
+```
+
+各名前は同じクラスターハッシュスロットにある 2 つのキーからなります。ライターのトークンを持つ文字列 `…:RwLock:{<namespace>:<name>}:w` と、リースの終了時刻をスコアとするリーダーのトークンのソート済みセット `…:r` です。各リーダーは自分のリースを持ち、失効したリーダーはスクリプトが取り除くので、クラッシュしたリーダーもリースが終わればライターをブロックしなくなります。
+
+<Callout type="warn" title="ライターが飢餓状態になり得る">
+  リーダーは、取得しようとしているライターを待ちません。`try_write` はリーダーのリースが 1 つも有効でないときにだけ成功するため、重なり合うリーダーが途切れなく続くと、ライターはいつまでも入れません。
+</Callout>
+
+## Capability
+
+`try_read` を含むすべてのロックのクエリは Redis に書き込むため、エフェクトは `Write<Lock<N>>` または `Write<RwLock<N>>` です。`Db<_, ReadOnly>` はロックを取れません。ロックの型がエンティティなので、独自の capability で特定のロックだけを許可することもできます。
+
+## 複数レプリカでの cron ジョブ
+
+[cron ジョブ](/ja/docs/services/cron-jobs) は、それを起動したすべてのレプリカで、各レプリカ自身のスケジュールに従って実行されます。デプロイ全体でインターバルごとに 1 回だけ実行するには、インターバルの大部分をカバーするリースのロックを取り、*解放しない* ようにします。最初に tick したレプリカがロックを取り、他のレプリカは次のインターバルまでロックが保持されているのを見ることになります。
+
+```rust title="src/report.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisError;
+use wakuwaku::entity::redis::collection::lock::Lock;
+use wakuwaku::{CronJob, CronTick, ServiceCreation};
+
+const HOUR: Duration = Duration::from_secs(60 * 60);
+
+/// インターバルの大部分のあいだ保持し、解放しない。
+/// これによりインターバルごとに最大 1 つのレプリカだけがジョブを実行する。
+const REPORT_LEASE: Lock<str> = Lock::new("cron", Duration::from_secs(55 * 60));
+
+pub struct HourlyReport {
+    redis: Redis,
+}
+
+impl ServiceCreation for HourlyReport {
+    type Dep = Redis;
+
+    fn create_service(redis: Redis) -> Self {
+        Self { redis }
+    }
+}
+
+impl Processor<CronTick> for HourlyReport {
+    type Output = ();
+    type Error = RedisError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), RedisError> {
+        let lease = self.redis.process(REPORT_LEASE.try_lock("hourly-report")).await?;
+        if lease.is_none() {
+            return Ok(()); // この 1 時間は別のレプリカが実行した
+        }
+        build_report().await;
+        Ok(())
+    }
+}
+
+impl CronJob for HourlyReport {
+    const INTERVAL: Duration = HOUR;
+}
+```
+
+他のジョブと同じように登録します。
+
+```rust title="src/main.rs"
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::redis;
+
+pub async fn main_like() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let (services, cron) = ServiceBuilder::new(connect(&client).await?)
+        .cron_job::<HourlyReport, _>()
+        .start();
+    // … シャットダウンまでサービスを提供する …
+    cron.shutdown().await;
+    Ok(())
+}
+```
+
+なぜ実行後にロックを解放しないのでしょうか。解放で防げるのは *重なった* 実行だけです。レプリカは起動時刻が異なるため、スケジュールがずれています。解放する場合、レプリカ A が 12:00 に実行して 12:01 に解放し、グリッドが 12:20 にあるレプリカ B が空いたロックを取って、同じ時間帯のレポートをもう一度実行してしまいます。
+
+リースはインターバルより短くしなければなりません。リースが 1 時間以上だと、12:00 にロックを取ったレプリカ自身ですら 13:00 の tick でまだ保持されているのを見て、その 1 時間がスキップされることがあります。実行がリースより長くかかるかもしれないなら、上の `while_held` で包み、実行中はリースが延長され続けるようにしてください。
+
+返された `RedisError` は cron ランタイムがログに記録し、ジョブはスケジュールを維持します。それでもジョブは冪等にしておきましょう。Redis がキーを失う（永続化なしのフェイルオーバーや eviction）と、2 つのレプリカが同じインターバルで両方とも実行することがあります。
+
+## 次のステップ
+
+<Cards>
+  <Card title="レートリミッター" href="/ja/docs/data/redis/rate-limiter" description="同時にいくつかではなく、どのくらいの頻度かを制限します。" />
+  <Card title="cron ジョブ" href="/ja/docs/services/cron-jobs" description="スケジュール、重なりのルール、ジョブのテスト。" />
+</Cards>

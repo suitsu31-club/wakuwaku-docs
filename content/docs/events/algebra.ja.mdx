@@ -1,0 +1,310 @@
+---
+title: 代数
+description: イベント型が満たす代数的な法則を宣言し、ハンドラーに渡る前にコンシューマーがランをまとめたり畳み込んだりできるようにします。
+icon: Sigma
+---
+
+すべてのイベント型は、`Event::Algebra` として **代数マーカー** をひとつ選びます。マーカーは「そのイベントを適用する操作がどの法則を満たすか」を表し、コンシューマーはその法則を使って、各ランをハンドラーに渡す *前に* 小さくします。重複したロール付与はひとつにまとまり、100 件の在庫調整はひとつに畳み込まれます。イベントが減れば、結果を変えずにハンドラー呼び出し・データベースへの書き込み・リトライのトラフィックを減らせます。
+
+これは wakuwaku のバッチ処理の後半部分です。[順序保証](/ja/docs/events/ordering) がどのイベントをひとつのランにまとめてよいかを決め、代数がそのランに何をしてよいかを決めます。
+
+## 縮約が行われる場所 [#where]
+
+コンシューマーは **ラン** ごとに縮約します。ランとは、ポーリングしたひとつのバッチの、ひとつの順序セグメント内にある、ひとつのキー・ひとつの型のイベント列です。各ランについて、コンシューマーは次のことを行います。
+
+1. レコードをボディ型にデコードする。
+2. その型のマーカーで縮約する。
+3. 結果を最大 `MAX_BATCH` 件ずつのチャンクに分けて `EventHandler::handle` に渡す。
+
+ランがキーをまたぐことはないので、以下の法則はすべて **同じキーのイベントについてだけ** 成り立てば十分です。[リトライトピック](/ja/docs/events/error-handling#retryable) に送られる未処理の作業も、縮約済みの状態で書き込まれます。
+
+「状態 `s` にイベント `e` を適用する」ことを `s · e` と書くと、マーカーは次のとおりです。
+
+| マーカー                | 約束する法則                          | ボディへの境界    | ランの縮約                            |
+|-------------------------|---------------------------------------|-------------------|---------------------------------------|
+| `NonAssociative`        | なし                                  | なし              | なし                                  |
+| `Commutative`           | `s · a · b = s · b · a`               | なし              | なし。任意の順序で適用してよい        |
+| `Idempotent`            | `s · a · a = s · a`                   | `Eq`              | 隣り合う等しいイベントをまとめる      |
+| `IdempotentCommutative` | 上の 2 つの両方                       | `Ord`             | 等しいイベントをすべてまとめる        |
+| `Associative`           | `s · a · b = s · combine(a, b)`       | `EventSemigroup`  | ランをひとつのイベントに畳み込む      |
+
+<AlgebraDiagram lang="ja" />
+
+マーカーはすべて [`wakuwaku::iggy::partition::algebra`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/algebra/index.html) にあり、`wakuwaku::iggy` からも再エクスポートされています。背後のトレイトはシールされているので、選択肢はこの 5 つだけです。
+
+## `NonAssociative` [#non-associative]
+
+**何も約束しません。** すべてのイベントがログ順に適用されます。順序が重要で、すべての発生が意味を持つ場合に選びます。
+
+例: チャットルームのメッセージ。タイムラインはログ順 *そのもの* であり、同じ「こんにちは」が 2 つあれば、それは 2 つのメッセージです。
+
+```rust title="src/events/chat.rs"
+impl Event for MessagePosted {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = RoomId;
+    // タイムラインはログ順そのもの。同じ「hi」が 2 つあれば 2 つのメッセージ。
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> RoomId {
+        RoomId(self.room)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+ハンドラーは 1 回の呼び出しで最大 `MAX_BATCH` 件のイベントを受け取るので、`NonAssociative` の型もバッチ処理はできます。縮約されないだけです。
+
+## `Commutative` [#commutative]
+
+**`s · a · b = s · b · a` を約束します。** ラン内のイベントは任意の順序で適用してかまいません。何も削除されず、境界も不要です。
+
+このマーカーでは、コンシューマーは何も取り除かず、ランをそのままハンドラーに渡します。マーカーが与えるのは許可です。ハンドラーはランを任意の順序で適用してよく、たとえば複数行の `INSERT` 1 回で書き込んだり、書き込みを並行に発行したりできます。
+
+例: 注文への明細追加。明細ごとに行を挿入するので挿入順は関係ありませんが、同じ明細が 2 つあれば、それは本当に 2 回分の購入です。
+
+```rust title="src/events/orders.rs"
+impl Event for LineItemAdded {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(10);
+    type Key = OrderId;
+    // 行の挿入: 挿入順は関係ないが、明細はすべて数える。
+    type Algebra = Commutative;
+
+    fn key(&self) -> OrderId {
+        OrderId(self.order)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+## `Idempotent` [#idempotent]
+
+**`s · a · a = s · a` を約束します。** 同じイベントを続けて 2 回適用しても、1 回適用したのと同じです。ボディは `Eq` を実装している必要があります。コンシューマーは **隣り合う** 等しいイベントをまとめます（`Vec::dedup`）。
+
+まとめられるのは隣同士だけです。この法則は順序について何も言っていないからです。`a, b, a` では 2 つ目の `a` が `b` を上書きするかもしれないので、残さなければなりません。ラン `[1, 1, 2, 1, 1]` は `[1, 2, 1]` になります。
+
+例: ロールの付与と剥奪。`admin` を続けて 2 回付与するのは 1 回付与するのと同じですが、付与と剥奪は可換ではありません。
+
+```rust title="src/events/users.rs"
+#[derive(PartialEq, Eq, Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct RoleChanged {
+    pub user: u64,
+    pub role: String,
+    pub granted: bool,
+}
+
+impl EventBody for RoleChanged {}
+
+impl Event for RoleChanged {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(20);
+    type Key = UserId;
+    // `admin` を続けて 2 回付与するのは 1 回付与するのと同じ。
+    // 付与と剥奪は可換ではないので、取り除けるのは隣り合う重複だけ。
+    type Algebra = Idempotent;
+
+    fn key(&self) -> UserId {
+        UserId(self.user)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+## `IdempotentCommutative` [#idempotent-commutative]
+
+**両方の法則を約束します。** 重複は無害で、*かつ* 順序も関係ありません。ボディは `Ord` を実装している必要があります。コンシューマーはランをソートしてから重複を取り除くので、等しいイベントはどこにあってもまとめられます。ラン `[1, 1, 2, 1, 1]` は `[1, 2]` になります。
+
+可換性によって並べ替えが許されるため、ランはログ順ではなく **`Ord` の順にソートされた状態で** ハンドラーに届きます。
+
+例: 記事へのタグ追加。これは集合への挿入です。
+
+```rust title="src/events/articles.rs"
+#[derive(
+    PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe,
+)]
+pub struct TagAdded {
+    pub article: u64,
+    pub tag: String,
+}
+
+impl EventBody for TagAdded {}
+
+impl Event for TagAdded {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(30);
+    type Key = ArticleId;
+    // 集合への追加: 順序は任意で、ラン内のどこにある重複もまとめてよい。
+    type Algebra = IdempotentCommutative;
+
+    fn key(&self) -> ArticleId {
+        ArticleId(self.article)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+## `Associative` [#associative]
+
+**`s · a · b = s · combine(a, b)` を約束します。** 連続する 2 つのイベントを、同じ効果を持つひとつの結合イベントに置き換えられ、しかも `combine` は結合的です。ボディは [`EventSemigroup`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/algebra/trait.EventSemigroup.html) を実装している必要があります。コンシューマーはラン全体をログ順にひとつのイベントへ畳み込みます: `combine(combine(a, b), c)`。
+
+例: 在庫調整。ひとつの SKU に対する差分はいくつあっても、合計ひとつの差分になります。
+
+```rust title="src/events/inventory.rs"
+#[derive(Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct StockAdjusted {
+    pub sku: String,
+    pub delta: i64,
+}
+
+impl EventBody for StockAdjusted {}
+
+impl EventSemigroup for StockAdjusted {
+    fn combine(self, later: Self) -> Self {
+        // 両方とも同じキーのイベントなので、`sku` は等しい。
+        Self {
+            sku: self.sku,
+            delta: self.delta + later.delta,
+        }
+    }
+}
+
+impl Event for StockAdjusted {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(40);
+    type Key = Sku;
+    type Algebra = Associative;
+
+    fn key(&self) -> Sku {
+        Sku(self.sku.clone())
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+その結果ハンドラーは、バッチにいくつ調整が含まれていても、ランごと（SKU ごと）に `UPDATE` を 1 回実行するだけで済みます。
+
+```rust title="src/handlers/stock.rs"
+pub struct ApplyStock {
+    pub pool: PgPool,
+}
+
+impl EventHandler<StockAdjusted> for ApplyStock {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+    async fn handle(&self, run: &[StockAdjusted]) -> Result<(), HandleError> {
+        // 1 回の呼び出しはひとつのキーだけ。結合的なランは畳み込み済みなので、
+        // `run` には差分を合計したイベントがひとつだけ入っている。
+        for adjustment in run {
+            wakuwaku::deps::sqlx::query("UPDATE stock SET quantity = quantity + $1 WHERE sku = $2")
+                .bind(adjustment.delta)
+                .bind(&adjustment.sku)
+                .execute(&self.pool)
+                .await
+                .map_err(HandleError::transient)?;
+        }
+        Ok(())
+    }
+}
+```
+
+（データベースのエラーをきちんと分類する方法は [エラー処理](/ja/docs/events/error-handling#classifying) で説明します。）
+
+### 後勝ちの更新は結合的 [#last-write-wins]
+
+「フィールドをこの値にする」というイベントは冪等に見えますが、`Associative` としてモデル化するほうが適しています。`a` の次に `b` を適用すると `b` が残るので、`combine` は後のイベントを返すだけでよく、ラン全体が最後のイベントに畳み込まれます。
+
+```rust title="src/events/orders.rs"
+impl EventSemigroup for ShippingAddressChanged {
+    fn combine(self, later: Self) -> Self {
+        // 後勝ち: `a` の次に `b` を適用すると `b` が残る。
+        later
+    }
+}
+```
+
+`Idempotent` では連続する *等しい* 住所しか取り除けませんが、`Associative` なら最後以外の住所をすべて取り除けます。
+
+ランがひとつのイベントに畳み込まれた後は、冪等性や可換性でそれ以上小さくすることはできません。そのため、`Associative` には冪等版や可換版がありません。
+
+## コンパイル時のチェック [#compile-time]
+
+境界はコンパイラーがボディ型（`<E as IntoEventBody>::Target`。`EventBody` を実装しているならイベント型そのもの）に対してチェックします。`Eq` を持たないボディに `Idempotent` を宣言すると、コンパイルに失敗します。
+
+```rust
+#[derive(Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct RoleChanged {
+    pub user: u64,
+    pub role: String,
+    pub granted: bool,
+}
+
+impl Event for RoleChanged {
+    // ...
+    type Algebra = Idempotent; // RoleChanged は Eq を実装していない
+    // ...
+}
+```
+
+```text
+error[E0277]: the trait bound `RoleChanged: Eq` is not satisfied
+   |
+   |     type Algebra = Idempotent; // RoleChanged does not implement Eq
+   |                    ^^^^^^^^^^ the trait `Eq` is not implemented for `RoleChanged`
+   |
+   = note: required for `wakuwaku::wakuwaku_iggy::Idempotent` to implement `Algebra<RoleChanged>`
+```
+
+コンパイラーが確認できるのは `Eq` が存在することまでで、法則が本当に成り立つかどうかは確認できません。そこはあなたの責任です（[落とし穴](#pitfalls) を参照）。
+
+## マーカーの選び方 [#choosing]
+
+次の質問を順に考え、最初に「はい」となったところで決めます。
+
+<Accordions>
+  <Accordion title="1. 連続する 2 つのイベントを、同じ効果を持つひとつのイベントに置き換えられるか？">
+    `Associative` を使い、`EventSemigroup` を実装します。合計、カウンター、最大値、集合の併合、後勝ちの更新はすべて畳み込めます。ランごとにイベントがひとつになる、最も強い縮約です。
+  </Accordion>
+  <Accordion title="2. 同じイベントを 2 回適用しても 1 回と同じで、しかも順序が関係ないか？">
+    `IdempotentCommutative` を使い、`Ord` を derive します。集合への挿入や、同じ型で解除されることのない「X にする」フラグが典型です。
+  </Accordion>
+  <Accordion title="3. 同じイベントを続けて 2 回適用しても 1 回と同じか？">
+    `Idempotent` を使い、`Eq` を derive します。付与と剥奪のように、設定と解除をひとつの型で表す場合が典型です。
+  </Accordion>
+  <Accordion title="4. 順序は関係ないが、イベントはすべて数える必要があるか？">
+    `Commutative` を使います。行の挿入や互いに独立した通知が典型です。何も取り除かれませんが、ハンドラーはランを任意の順序で適用できます。
+  </Accordion>
+  <Accordion title="5. どれにも当てはまらない">
+    `NonAssociative` を使います。常に正しく、ただ縮約されないだけです。
+  </Accordion>
+</Accordions>
+
+## 落とし穴 [#pitfalls]
+
+<Callout type="error" title="ハンドラーが満たさない法則を宣言すると、データが黙って失われます">
+  コンシューマーはマーカーを信頼します。「1 増やす」イベントに `Idempotent` を宣言すると、連続する 2 回の加算がひとつになります。`SwitchSet { on: bool }` イベントに `IdempotentCommutative` を宣言すると、ラン「on, off, on」はソートと重複除去により「off, on」になり、スイッチは on ではなく off で終わります。部分更新（「`Some` のフィールドだけ変更する」）に後のイベントだけを残す `combine` を書くと、前のイベントが設定したフィールドが失われます。どれも実行時エラーにはならず、ただ結果が間違うだけです。
+</Callout>
+
+- **等しさは「効果が同じ」を意味しなければなりません。** `Idempotent` と `IdempotentCommutative` は `Eq`/`Ord` でボディ全体を比較します。ボディにイベント ID やタイムスタンプが含まれていると、2 つのイベントが等しくなることはなく、何もまとめられません（正しいが無意味です）。効果を変えるフィールドを無視する手書きの `Eq` はさらに危険で、異なるイベントがまとめられてしまいます。
+- **すべての発生に意味があるか。** まとめや畳み込みは、ハンドラー呼び出しが減ることを意味します。イベントごとに副作用（イベント 1 件ごとにメール 1 通、Webhook 1 回など）を起こす必要があるなら、`NonAssociative` か `Commutative` を使ってください。
+- **`combine` は結合的で、キーを保たなければなりません。** 畳み込みは `combine(combine(a, b), c)` の形で行われますが、どうグループ化しても同じ結果になる必要があります。`combine` が受け取るのは同じキーのイベントだけなので、キーのフィールドはどちら側のものを残してもかまいませんが、変更してはいけません。
+- **縮約は最適化であって、保証ではありません。** 縮約が行われるのは、ポーリングしたひとつのバッチのひとつのランの中だけです。同じキーのイベントでも、別のバッチにあるものやフェンスの反対側にあるものは、別々の呼び出しでハンドラーに届きます。ハンドラーは、縮約されていてもいなくても、どんなランに対しても正しい結果を出さなければなりません。
+- **既存の型のマーカーを変更する場合。** すべてのメッセージヘッダーにはその型の代数が記録されており、コンシューマーはヘッダーの値が登録済みの型が宣言するマーカーと一致しないレコードを破棄します（ログにも出力します）。そのため、変更前のマーカーでログに残っているメッセージは、変更後に破棄されます。先にトピックを処理し切るか、新しい意味のイベントを新しい `TYPE_TAG` で発行してください。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="順序保証" href="/ja/docs/events/ordering" description="ポーリングしたバッチからランが作られる仕組み。" />
+  <Card title="エラー処理" href="/ja/docs/events/error-handling" description="失敗を分類し、リトライトピックの動きを理解する。" />
+  <Card title="イベントの購読" href="/ja/docs/events/consuming" description="ハンドラーを登録し、MAX_BATCH を選ぶ。" />
+</Cards>

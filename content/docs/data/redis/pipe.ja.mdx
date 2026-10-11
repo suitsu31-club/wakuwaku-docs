@@ -1,0 +1,87 @@
+---
+title: パイプ
+description: 1 人の送信者からクラスター内のどこかにいる 1 人の受信者へ、websocket の片方向のように順序付きのメッセージを送ります。
+icon: ArrowRightLeft
+---
+
+[`Pipe`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/pipe/struct.Pipe.html) は、1 人の送信者から 1 人の受信者へのメッセージのキューです。受信者は各メッセージを送られた順に 1 回ずつ受け取り、送信者がパイプを閉じるまで続きます。形は websocket の片方向そのものですが、両端は別々のレプリカにいてかまいません。典型的な使い方は、ブラウザの websocket を持つレプリカが受信し、バックエンドのイベントを処理したどれかのレプリカが送信するというものです。逆方向には 2 本目のパイプを使います。
+
+受信者が待機していない間、メッセージは Redis で待つので、受信者は送信者が始める前に接続しても後に接続してもかまいません。
+
+## 送信と受信
+
+```rust title="src/push.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::entity::redis::dynamic::pipe::Pipe;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum Frame {
+    Text(String),
+    /// 送ることがない間に送り、パイプが TTL を超えて生き残るようにする。
+    Heartbeat,
+}
+
+/// バックエンドから 1 つのブラウザセッションへのフレーム。
+pub const TO_CLIENT: Pipe<str, Frame> = Pipe::new("to-client", Duration::from_secs(60));
+
+/// バックエンド: クラスター内のどこでもよい。
+pub async fn notify(redis: &Redis, session: &str, text: String) -> RedisResult<()> {
+    redis.process(TO_CLIENT.send(session, Frame::Text(text))).await
+}
+
+pub async fn hang_up(redis: &Redis, session: &str) -> RedisResult<()> {
+    redis.process(TO_CLIENT.close(session)).await
+}
+
+/// ゲートウェイ: ブラウザの websocket を持つインスタンス。
+pub async fn forward(redis: &Redis, client: &redis::Client, session: &str) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let mut receiver = redis.process(TO_CLIENT.receive(session, conn)).await?;
+    while let Some(frame) = receiver.recv().await? {
+        match frame {
+            Frame::Text(text) => write_to_websocket(&text).await,
+            Frame::Heartbeat => {}
+        }
+    }
+    // バックエンドが最後のフレームの後にパイプを閉じた。
+    Ok(())
+}
+```
+
+- `send(name, body)` はメッセージを追加します。
+- `close(name)` はパイプを終わらせます。受信者は close の前に送られたすべてのメッセージを受け取り、その後 `recv` は `None` を出力します。
+- `receive(name, conn)` は `PipeReceiver` を出力します。その `recv` は次のメッセージを待ち、`into_stream` はパイプが閉じられると終わる `Stream` に変換します。
+
+`recv` はコネクション上でブロックするため、`receive` は専用のコネクションを受け取ります。開き方と共有してはいけない理由は[専用コネクション](/ja/docs/data/redis#following-changes-dedicated-connections)を参照してください。
+
+## Redis 上の表現
+
+各名前は同じクラスターハッシュスロットにある 2 つのリストです。`…:Pipe:{<namespace>:<name>}:m` がメッセージを持ち、`…:c` は送信者が閉じたときにマーカーを受け取ります。受信者は `BLPOP` で両方を（メッセージを先に）待つので、close は必ずそれより前に送られたすべてのメッセージの後に見えます。各 send と close は、push と TTL の再設定を 1 つの `MULTI` ブロックで行います。
+
+## 寿命と TTL
+
+パイプには明示的な「開く」操作はありません。1 TTL の間何も書き込まれなければ、放棄されたものとみなされます。
+
+- 各 `send` と `close` は書き込んだものの TTL をやり直します。したがって、送信者が閉じずに止まったパイプは 1 TTL 後に消えます。
+- 1 TTL の間何も受け取らなかった受信者は、永遠に待つ代わりに "structure gone" という `RedisError` で失敗します。
+
+TTL より長く沈黙するかもしれない送信者はハートビートを送る必要があります。上の `Frame` に `Heartbeat` バリアントがあるのはそのためです。失敗した `recv` はリトライできるので、間隔が空くことを許容したい受信者はもう一度呼び出せます。
+
+## 保証と落とし穴
+
+- **順序。** メッセージは送られた順に届きます。
+- **最大 1 回。** メッセージを取り出すと Redis から削除されます。メッセージを取り出した後、処理する前に失敗した受信者はそれを失います。すべてのメッセージを確実に処理する必要があるなら、代わりに[イベントストリーム](/ja/docs/events)を使ってください。
+- **受信者は同時に 1 人。** 同じ名前に 2 人の受信者がいると、メッセージは両者に分かれ、close を見るのは片方だけになります。
+- **close 後の send** は受け付けられますが読まれることはなく、パイプとともに失効します。
+- **Capability。** `send`、`close`、`receive` はすべて書き込み（`receive` はメッセージを削除する）なので、いずれもエフェクトは `Write<Pipe<N, B>>` です。
+
+## 次のステップ
+
+<Cards>
+  <Card title="ストリームバッファ" href="/ja/docs/data/redis/stream-buffer" description="多数の購読者が、任意のインデックスから再生できます。" />
+  <Card title="ライブビュー" href="/ja/docs/data/redis/live-view" description="差分として追従する永続的なドキュメント。" />
+</Cards>

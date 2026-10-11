@@ -1,0 +1,395 @@
+---
+title: cron ジョブ
+description: ServiceBuilder から組み立てたローカルジョブを一定間隔で実行します。実行が重なることはなく、エラーや panic が起きてもスケジュールは続きます。
+icon: Clock
+---
+
+マイクロサービスにおける「cron」処理の多くはスキャンです。期限切れセッションの削除、詰まった処理の再試行、検索インデックスの整合などです。[`CronJob`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/trait.CronJob.html) はまさにそのためのもので、固定の `INTERVAL` を持つ [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html) の [`Processor`](https://docs.rs/kanau/0.6/kanau/processor/trait.Processor.html) です。間隔はカレンダー式ではなくジョブ型の定数なので、「毎日 3:00 に」のような書き方はありません。
+
+Spring でいえば、Bean のメソッドに付ける `@Scheduled(fixedRate = ...)` がいちばん近いものです。違いは後述します。時間がかかりすぎた実行は、その間の実行をキューに積まずにスキップします。また、サービスのレプリカはそれぞれがすべてのジョブを実行します。
+
+## ジョブを定義する [#defining-a-job]
+
+ジョブは依存を保持する構造体で、次の三つのトレイトを実装します。
+
+- [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html)。[サービスビルダー](/ja/docs/core/service-builder) に登録された値から組み立てるためのものです。
+- `Processor<CronTick>`。`Output = ()` で、`Error` は `Display` を実装している必要があります。これが一回の実行です。
+- `CronJob`。`INTERVAL` を追加します。
+
+ジョブは専用の Tokio タスクで動くため、`Send + Sync + 'static` でもある必要があります。
+
+```rust title="src/jobs.rs"
+use std::time::Duration;
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::{CronJob, CronTick, ServiceCreation};
+
+pub struct ExpireSessions {
+    store: SessionStore,
+}
+
+impl ServiceCreation for ExpireSessions {
+    type Dep = SessionStore;
+
+    fn create_service(store: SessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl Processor<CronTick> for ExpireSessions {
+    type Output = ();
+    type Error = StoreError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), StoreError> {
+        let deleted = self.store.delete_expired(1_000).await?;
+        tracing::info!(deleted, "expired sessions removed");
+        Ok(())
+    }
+}
+
+impl CronJob for ExpireSessions {
+    const INTERVAL: Duration = Duration::from_secs(60);
+}
+```
+
+`SessionStore` と `StoreError` は、実際のデータアクセスの代わりのダミーです。ストアは clone が安価です(ジョブを組み立てるときにサービスビルダーから clone されます)。エラーに必要なのは `Display` だけです。失敗した実行はそれでログに出力されるためです。
+
+```rust title="src/store.rs"
+/// データベースプールの代わり: clone は安価で、すべての clone がデータを共有する。
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    expired: Arc<AtomicU64>,
+}
+
+impl SessionStore {
+    pub async fn delete_expired(&self, limit: u64) -> Result<u64, StoreError> {
+        self.expired.fetch_add(1, Ordering::Relaxed);
+        Ok(limit.min(1))
+    }
+}
+
+#[derive(Debug)]
+pub struct StoreError(String);
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session store: {}", self.0)
+    }
+}
+```
+
+データ層を使うなら、`Db` ハンドルはそのまま `Dep` にできます。クエリのエラーもすでに `Display` を実装しています。[データアクセス](/ja/docs/data) を参照してください。
+
+## ティック [#the-tick]
+
+各実行は `CronTick` を受け取ります。
+
+| フィールド | 型 | 意味 |
+| --- | --- | --- |
+| `run` | `u64` | ランタイム開始以降、このジョブがそれまでに実行された回数。最初の実行では `0`。 |
+| `fired_at` | `SystemTime` | 実行を開始した時点の実時間。 |
+
+`run` は実際に行われた実行を数えます。超過によってスキップされたグリッド点([スケジュール](#the-schedule) を参照)は数えないので、`run` は「開始からの経過時間 ÷ 間隔」ではありません。「N 回に一回は全件処理する」といった用途に向いています。
+
+```rust
+impl Processor<CronTick> for ReindexSearch {
+    type Output = ();
+    type Error = StoreError;
+
+    async fn process(&self, tick: CronTick) -> Result<(), StoreError> {
+        // 24 回に一回(と初回)は全件を作り直し、
+        // それ以外は変更分だけを取り込む
+        let reindexed = if tick.run % 24 == 0 {
+            self.index.reindex_all().await?
+        } else {
+            self.index.reindex_changed().await?
+        };
+        tracing::info!(run = tick.run, fired_at = ?tick.fired_at, reindexed, "search index refreshed");
+        Ok(())
+    }
+}
+
+impl CronJob for ReindexSearch {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+}
+```
+
+## 登録と起動 [#registering-and-starting]
+
+`ServiceBuilder::cron_job::<Job, Position>()` はジョブの `Dep` を探して clone し、`create_service` でジョブを組み立て、ジョブのリストを始めます。ジョブごとに一回ずつチェーンして呼び、最後に `start` します。
+
+```rust title="src/main.rs"
+let (services, cron) = ServiceBuilder::new(SessionStore::default())
+    .push(SearchIndex::default())
+    .cron_job::<ExpireSessions, _>()
+    .cron_job::<ReindexSearch, _>()
+    .start();
+
+// `services` は返ってくる: ここから gRPC サーバーやコンシューマーを登録できる
+let _store: &SessionStore = services.provide::<SessionStore, _>();
+
+let _ = tokio::signal::ctrl_c().await;
+// 実行中の処理を終わらせてから、すべてのジョブを止める
+cron.shutdown().await;
+```
+
+- `Position` は、`Dep` 型が複数回登録されていない限り `_` で構いません(複数回登録している場合は `Here` / `There` を使います。[サービスビルダー](/ja/docs/core/service-builder) を参照)。登録されていない `Dep` はコンパイルエラーになります。
+- `start` は **ジョブごとに一つの Tokio タスク** を起動し、サービスビルダーと [`CronRuntime`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html) を返します。Tokio ランタイムの中で呼ぶ必要があり、外で呼ぶと panic します。
+- ジョブは、gRPC サーバーやサービスビルダー自体と同じく型レベルのリストに保持されます。Box 化も動的ディスパッチもありません。
+
+## スケジュール [#the-schedule]
+
+<CronScheduleDiagram lang="ja" />
+
+各ジョブは自分専用のグリッド `start + k × INTERVAL` に沿って動きます。`start` は `start` を呼んだ時点です。
+
+- **最初の実行は `start` の時点です。** 一間隔待ってからではありません。
+- **同じジョブの実行が重なることはありません。** `INTERVAL` より長くかかった実行は、その間に過ぎたグリッド点をスキップします。次の実行は、実行が終わった時点より前ではない最初のグリッド点です。実行がちょうどグリッド点で終わった場合は、次の実行がすぐに始まります。
+- したがって、連続する二つの実行の開始時刻は必ず間隔の整数倍(0 ではない)だけ離れ、スケジュールがずれていくことはありません。
+
+たとえば間隔が 10 秒で、最初の実行に 25 秒かかった場合、実行は 0 秒、30 秒、40 秒、50 秒、… に始まります。10 秒と 20 秒の点はキューに積まれるのではなく、スキップされます。
+
+ジョブ同士は独立しています。`ReindexSearch` が遅くても `ExpireSessions` が遅れることはありません。
+
+### エラーと panic [#errors-and-panics]
+
+`Err` を返した実行は、[`tracing`](https://docs.rs/tracing) で error レベルとしてログに出力されます(`cron job failed` とエラーの `Display` 出力)。**panic** した実行も捕捉され、同様にログに出力されます(`cron job panicked` と panic メッセージ)。どちらの場合もジョブのスケジュールは保たれ、次の実行はいつもどおり次のグリッド点で行われます。
+
+各実行は `job`(ジョブの型名)と `run` のフィールドを持つ `cron_job` という tracing スパンの中で動くので、ジョブが出力したログはどの実行のものか追跡できます。これらのログを見るには、`main` で `tracing` のサブスクライバーを設定してください。
+
+<Callout type="warn" title={'panic = "abort"'}>
+panic の捕捉はアンワインドに依存しています。リリースプロファイルで `panic = "abort"` を設定していると、panic したジョブはプロセス全体を停止させます。
+</Callout>
+
+## 間隔 0 はビルドできない [#a-zero-interval-does-not-build]
+
+`INTERVAL` が 0 ではスケジュールが成り立たないため、そのようなジョブの登録はコンパイル時に拒否されます。ここで `Busy` は通常どおり `ServiceCreation` と `Processor<CronTick>` を実装しています。
+
+```rust
+impl CronJob for Busy {
+    const INTERVAL: Duration = Duration::ZERO; // no schedule
+}
+
+#[tokio::main]
+async fn main() {
+    let (_services, cron) = ServiceBuilder::new(Config)
+        .cron_job::<Busy, _>() // `cargo build` fails: INTERVAL is zero
+        .start();
+    cron.shutdown().await;
+}
+```
+
+`cargo build` は次のエラーで止まります(抜粋)。
+
+```text
+error[E0080]: evaluation panicked: CronJob::INTERVAL must not be zero
+   --> wakuwaku/src/services/cron_job.rs:250:17
+    |
+250 |         const { assert_interval::<Job>() };
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `wakuwaku::services::cron_job::CronRegisterCenter::<Busy>::new::{constant#0}` failed inside this call
+...
+note: the above error was encountered while instantiating `fn CronRegisterCenter::<Busy>::new`
+```
+
+エラーが指すのは自分の `cron_job` の呼び出しではなく wakuwaku のソースです。どのジョブを直せばよいかは `CronRegisterCenter::<Busy>` のジョブ型でわかります。
+
+<Callout type="info" title="cargo check では検出されない">
+この検査は、コード生成の際に登録がインスタンス化されるときに評価される `const` アサーションです。`cargo build` と `cargo run` では報告されますが、**`cargo check`、`cargo clippy`、エディターでは報告されません**。`cargo test` も、テストが実際にその登録に到達しない限り報告しません(テストハーネスは `main` を呼ばないので、そこにある登録はインスタンス化されません)。CI で check、clippy、テストしか実行していないなら、`cargo build` のステップを追加してください。
+</Callout>
+
+## 複数のレプリカで動かす [#running-on-several-replicas]
+
+ジョブは **ローカルで** 動きます。ジョブを起動したプロセスはすべてそれを実行します。サービスのレプリカが三つあれば各実行は三回行われ、各レプリカのグリッドはそのレプリカが起動した時点から始まるため、三つの実行の時刻も揃いません。
+
+ジョブはこれを前提に設計します。おすすめ順に挙げます。
+
+1. **冪等にする。** 「期限切れのセッションを削除する」は三回実行しても安全です。二回目と三回目は何もすることがありません。
+2. **作業を分割する。** 各レプリカがキーの自分の担当分だけをスキャンするようにします(たとえば ID のハッシュをレプリカ数で割った余りで分ける)。
+3. **実行の中でロックを取る。** たとえば `redis` feature の Redis [`Lock`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/lock/struct.Lock.html) を使います([Redis](/ja/docs/data/redis) と [ロック](/ja/docs/data/redis/lock) を参照)。
+
+ロックを使うと、すべてのレプリカが取得を試み、成功するのは多くても一つだけです。ほかのレプリカはその回の実行をスキップします。
+
+```rust title="src/jobs/digest.rs"
+use std::time::Duration;
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisError;
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::redis::collection::lock::Lock;
+use wakuwaku::entity::{Db, ReadWrite};
+use wakuwaku::{CronJob, CronTick, ServiceCreation};
+
+/// ジョブ名ごとに一つのロック。リースは一回の実行より長くする。
+const CRON_LOCKS: Lock<str> = Lock::new("cron", Duration::from_secs(5 * 60));
+
+pub struct SendDailyDigest {
+    db: Db<RedisSource, ReadWrite>,
+}
+
+impl ServiceCreation for SendDailyDigest {
+    type Dep = Db<RedisSource, ReadWrite>;
+
+    fn create_service(db: Db<RedisSource, ReadWrite>) -> Self {
+        Self { db }
+    }
+}
+
+impl Processor<CronTick> for SendDailyDigest {
+    type Output = ();
+    type Error = RedisError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), RedisError> {
+        // すべてのレプリカが試し、トークンを得るのは多くても一つ
+        let Some(token) = self.db.process(CRON_LOCKS.try_lock("send-daily-digest")).await? else {
+            return Ok(()); // 別のレプリカがちょうど実行中
+        };
+
+        // ... ダイジェストを作って送る。長い処理なら `token.extend()` を呼ぶ ...
+
+        self.db.process(token.release()).await?;
+        Ok(())
+    }
+}
+
+impl CronJob for SendDailyDigest {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+}
+```
+
+取得は決して待ちません。`try_lock` はロックが空いていれば `Some(token)` を、そうでなければ `None` を出力します。保持者がクラッシュしたときにロックを解放するのはリース(ロックの TTL)なので、リースより長くかかる可能性のある処理では `token.extend()` を呼ぶ必要があります。
+
+<Callout type="warn" title="ロックが防ぐのは重複実行ではなく同時実行">
+実行の最後にロックを解放する方式で保証されるのは、二つのレプリカがジョブを **同時に** 実行しないことだけです。レプリカ同士のグリッドはずれているので、数秒後に別のレプリカが空いたロックを取り、同じ間隔のうちにもう一度実行するかもしれません。全レプリカを通じて一間隔に一回程度に抑えたいなら、ロックを解放せず、リースを `INTERVAL` より少し短く設定して自然に切れるのを待ちます。こうするとロック自体が「最近だれかが実行した」という記録になります。その場合、処理はリースより十分短い時間で終わる必要があります。
+</Callout>
+
+## 複数の依存が必要なジョブ [#jobs-that-need-several-dependencies]
+
+gRPC サーバーと同じく、`cron_job` で組み立てるジョブが受け取れる登録値は **一つ** です。必要なものをまとめた構造体を登録して `Dep` にするか、ジョブを手作業で組み立てます。後者の場合はチェーンを `into_parts` で締めます。サービスビルダーと、まだ起動していない [`CronRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRegisterCenter.html) が返るので、ジョブを `push` してから `start` します。
+
+```rust
+/// 二つの登録値が必要なので、手作業で組み立てる。
+pub struct ReconcileIndex {
+    store: SessionStore,
+    index: SearchIndex,
+}
+```
+
+```rust title="src/main.rs"
+let (services, jobs) = ServiceBuilder::new(SessionStore::default())
+    .push(SearchIndex::default())
+    .cron_job::<ExpireSessions, _>()
+    .into_parts();
+
+let reconcile = ReconcileIndex {
+    store: services.provide::<SessionStore, _>().clone(),
+    index: services.provide::<SearchIndex, _>().clone(),
+};
+let cron = jobs.push(reconcile).start();
+```
+
+手作業で組み立てるジョブも `Processor<CronTick>` と `CronJob` は実装します。省けるのは `ServiceCreation` だけです。`CronRegisterCenter` はサービスビルダーなしでも使えます。
+
+```rust
+use wakuwaku::services::cron_job::CronRegisterCenter;
+
+let store = SessionStore::default();
+let cron = CronRegisterCenter::new(ExpireSessions::create_service(store.clone()))
+    .push(ReconcileIndex { store, index: SearchIndex::default() })
+    .start();
+cron.shutdown().await;
+```
+
+`new` と `push` のどちらにも [間隔 0 の検査](#a-zero-interval-does-not-build) が適用されます。
+
+## 停止する [#shutting-down]
+
+`CronRuntime` にはジョブを止める方法が二つあります。
+
+| | 何が起きるか |
+| --- | --- |
+| `cron.shutdown().await` | 新しい実行はスケジュールされなくなります。次のグリッド点を待っているジョブはすぐに止まり、実行中の処理は **最後まで終わります**。すべてのジョブが止まると戻ります。 |
+| `cron` を drop する | 実行中の処理も含め、すべてのジョブが次の `.await` で **中断** されます。 |
+
+バッチ処理の途中で打ち切られないよう、`shutdown` を使いましょう。`shutdown` は実行中の処理を待つので、処理がハングすると永遠に戻りません。問題になる場合はタイムアウトで上限を設けます。
+
+```rust
+if tokio::time::timeout(Duration::from_secs(30), cron.shutdown()).await.is_err() {
+    // タイムアウトすると `CronRuntime` が drop され、止まらない実行は中断される
+    tracing::warn!("cron jobs did not stop within 30s; aborted");
+}
+```
+
+gRPC も公開するサービスでは、ジョブを起動し、`start` が返したサービスビルダーからサーバーを組み立て、サーバーが処理を終えてからジョブを止めます。
+
+```rust title="src/main.rs"
+let (services, cron) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .cron_job::<ExpireSessions, _>()
+    .start();
+
+let (_services, register) = services
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .into_router_fn();
+
+let router = Server::builder().add_routes(Routes::default());
+register(router)
+    .serve_with_shutdown("[::1]:50051".parse()?, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+
+// サーバーは処理を終えた。次にジョブの実行中の処理を終わらせる
+cron.shutdown().await;
+```
+
+サーバー側は [gRPC サービス](/ja/docs/services/grpc) を、サービス全体での順序は [ライフサイクル](/ja/docs/core/lifecycle) を参照してください。
+
+## ジョブをテストする [#testing-a-job]
+
+ジョブはただの値なので、ユニットテストではジョブを組み立て、手作りの `CronTick` で `process` を呼びます。ランタイムも、間隔が過ぎるのを待つ必要もありません。
+
+```rust title="src/jobs.rs"
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn expire_sessions_deletes_from_the_store() {
+        let store = SessionStore::default();
+        let job = ExpireSessions::create_service(store.clone());
+
+        let tick = CronTick { run: 0, fired_at: SystemTime::now() };
+        job.process(tick).await.unwrap();
+
+        assert_eq!(store.expired.load(Ordering::Relaxed), 1);
+    }
+}
+```
+
+スケジュール自体をテストしたい場合は、Tokio の一時停止したクロックの下で本物のランタイムを起動します。この状態では `sleep` が仮想時間を瞬時に進めます。`[dev-dependencies]` で Tokio の `test-util` feature が必要です(`tokio = { version = "1", features = ["test-util"] }`)。
+
+```rust
+#[tokio::test(start_paused = true)]
+async fn the_first_run_happens_at_start() {
+    let store = SessionStore::default();
+    let (_services, cron) = ServiceBuilder::new(store.clone())
+        .cron_job::<ExpireSessions, _>()
+        .start();
+
+    tokio::time::sleep(ExpireSessions::INTERVAL / 2).await;
+    cron.shutdown().await;
+
+    assert_eq!(store.expired.load(Ordering::Relaxed), 1);
+}
+```
+
+ほとんどのジョブには一つ目のテストで十分です。スケジュールは wakuwaku の責任で、wakuwaku 側でテストされています。全体的な方針は [テスト](/ja/docs/core/testing) を参照してください。
+
+<Cards>
+  <Card title="gRPC サービス" href="/ja/docs/services/grpc" description="同じサービスビルダーから組み立てた tonic サーバーを公開します。" />
+  <Card title="Redis" href="/ja/docs/data/redis" description="レプリカ間で共有するロック、キャッシュ、レートリミッター。" />
+  <Card title="サービスビルダー" href="/ja/docs/core/service-builder" description="依存を登録し、型で検索する仕組み。" />
+  <Card title="ライフサイクル" href="/ja/docs/core/lifecycle" description="サービス全体の起動と停止の順序。" />
+</Cards>

@@ -1,0 +1,86 @@
+---
+title: Events on Apache Iggy
+description: How wakuwaku publishes and consumes typed events on Apache Iggy with per-key ordering, concurrent keys and algebraic batching.
+icon: Radio
+---
+
+`wakuwaku::iggy` (the [`wakuwaku-iggy`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/) crate) is the event layer of wakuwaku. You describe each event type once, as a Rust type, and the framework handles the rest: which Iggy topic and partition it goes to, how its body is encoded, which events must be processed in order, which can be batched or folded, and what happens when a handler fails.
+
+If you come from Spring, think of it as the role Spring for Apache Kafka plays there: a typed publisher plus listener methods. The difference is where the decisions live. With wakuwaku, ordering and batching rules are declared on the **event type** and checked by the compiler, and the consumer uses them to process a partition concurrently without breaking any order the events ask for.
+
+## Why order per key, not per partition
+
+An Iggy partition is a totally ordered log. The simplest consumer processes it strictly one record at a time, which has two costs:
+
+- **One key stalls the others.** A partition carries events of many keys (users, orders, …). If processing the events of order 17 is slow, or keeps failing, every other order in the partition waits behind it.
+- **Nothing can be combined.** Ten consecutive "points granted" events for one user are ten handler calls, even when a single call with the sum would do.
+
+Business logic almost never needs the whole partition in order. It needs the events **of one key** in order: an order must be placed before it is paid, but order 17 and order 18 have nothing to do with each other. wakuwaku therefore orders events per key:
+
+- Events of different keys are never ordered against each other, even when they share a partition. Their keys are processed concurrently.
+- Within one key, events of the same type always keep their log order.
+- Between events of different types of one key, each event's `EventAtomicOrdering` (`Relaxed`, `Acquire`, `Release`, `AcqRel`) decides what may move past what. See [Ordering](/en/docs/events/ordering).
+- Inside one polled batch, all events of one type and one key between two ordering fences form a *run*, and the event type's algebra (`NonAssociative`, `Commutative`, `Idempotent`, `IdempotentCommutative`, `Associative`) says how a run may be reduced before the handler sees it. See [Algebra](/en/docs/events/algebra).
+
+Because ordering is scoped to a key, a failing key can also be moved aside: its unfinished work goes to a retry topic and the rest of the partition keeps flowing. See [Error handling](/en/docs/events/error-handling).
+
+## The model
+
+Three types decide where an event goes and how it is recognised:
+
+| You declare | It becomes | Source of truth |
+|---|---|---|
+| A key type implementing `PartitionKey` | Its *super partition*: the Iggy **topic** that carries every event keyed by this type (`SUPER_PARTITION_NAME`) | the key type |
+| The value of the key, hashed with the key type's `PartitionMerge` hasher | The Iggy **partition** inside that topic; equal keys always land in the same partition | `key_hash` |
+| An event type implementing `Event` | A record in that topic, tagged with its `TYPE_TAG` so several event types can share the topic | the event type |
+
+The **stream** is not part of the types. It comes from configuration: the stream name you pass to `Publisher::new` and to `ConsumerConfig`. One topic per key type means every event about orders (placed, paid, shipped, …) lives in one topic, keyed by `OrderId`, so a single consumer sees all of them in their log order and can respect the order between them.
+
+<EventFlowDiagram lang="en" />
+
+## What the consumer does
+
+`IggyConsumerRegisterCenter::start` spawns one task per configured partition. Each task loops over these stages:
+
+1. **Retry first.** It reads its partition of the retry topic `retry_<topic>` and re-runs the keys whose retry delay has elapsed.
+2. **Poll.** It fetches up to `poll_count` records from its partition of the main topic.
+3. **Plan.** It groups the batch by key hash, splits each key's events into segments at the ordering fences, and groups each segment's events by type into runs.
+4. **Execute.** It processes keys concurrently; inside a key, segments run in order, and inside a segment the head run, then the body runs concurrently, then the tail run.
+5. **Reduce and handle.** It decodes each run, reduces it with the event type's algebra, and calls the handler in chunks of at most `MAX_BATCH` events.
+6. **Isolate failures.** A retryable failure moves the key's unfinished work to the retry topic and quarantines the key, so its later events queue behind it there.
+7. **Commit.** It stores the consumer offset either before or after processing, depending on the `DeliveryMode`.
+
+[Consuming events](/en/docs/events/consuming) walks through the API and every configuration option.
+
+## Enabling the feature
+
+Events are behind the `iggy` feature, which is off by default:
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["iggy"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+The feature enables:
+
+- `wakuwaku::iggy`: the re-exported `wakuwaku-iggy` crate (events, publisher, handlers, consumer runtime).
+- `wakuwaku::deps::iggy`: the Apache Iggy client SDK (`iggy` 0.11) that wakuwaku is built against. Use it for `IggyClient` and for creating streams and topics, instead of adding `iggy` yourself, so the versions always match.
+- `ServiceBuilder::iggy_consumer`: building event handlers from your service's shared dependencies.
+
+Event bodies are serialized with the `kanau::message` traits. Deriving them with serde JSON needs two extra dependencies; see [Serializing the body](/en/docs/events/defining-events#serializing-the-body).
+
+<Callout type="info" title="An Iggy server is required">
+  The examples connect to an Apache Iggy server with `iggy://iggy:iggy@localhost:8090`, the default credentials and TCP port of a local Iggy server. The stream and the main topic must exist before you publish or consume; see [What must exist on the server](/en/docs/events/publishing#what-must-exist-on-the-server).
+</Callout>
+
+## In this section
+
+<Cards>
+  <Card title="Defining events" href="/en/docs/events/defining-events" description="Partition keys, event types, type tags and body serialization." />
+  <Card title="Publishing" href="/en/docs/events/publishing" description="Sending events with Publisher, the headers it writes, and server setup." />
+  <Card title="Consuming" href="/en/docs/events/consuming" description="Event handlers, registration, ConsumerConfig and delivery guarantees." />
+  <Card title="Ordering" href="/en/docs/events/ordering" description="Relaxed, Acquire, Release and AcqRel within one key." />
+  <Card title="Algebra" href="/en/docs/events/algebra" description="Collapsing and folding runs of events before they reach the handler." />
+  <Card title="Error handling" href="/en/docs/events/error-handling" description="Transient, retryable and unrecoverable failures, and the retry topic." />
+</Cards>

@@ -1,0 +1,5 @@
+{
+  "title": "サービスを作る",
+  "icon": "Server",
+  "pages": ["grpc", "cron-jobs"]
+}

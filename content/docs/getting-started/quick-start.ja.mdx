@@ -1,0 +1,476 @@
+---
+title: クイックスタート
+description: gRPC API と後片付け用の cron ジョブを持つ小さなゲストブックサービスを作り、動かし、grpcurl で呼び出し、ジョブをユニットテストします。
+icon: Rocket
+---
+
+このチュートリアルでは、次の要素を持つ小さなサービス **guestbook** を作ります。
+
+- ゲストブックに署名し、署名の一覧を返す gRPC API
+- 1 時間より古い署名を削除する cron ジョブ
+- 両方のコンポーネントの元になる、1 つの共有依存
+- Ctrl-C によるグレースフルシャットダウン
+- cron ジョブのユニットテスト
+
+インフラなしで動かせるよう、データはメモリ上に置きます。あとでストアをデータベースに差し替えても、サービスの配線は変わりません。
+
+完成したプロジェクトは次の構成になります。
+
+<Files>
+  <Folder name="guestbook" defaultOpen>
+    <File name="Cargo.toml" />
+    <File name="build.rs" />
+    <Folder name="proto" defaultOpen>
+      <File name="guestbook.proto" />
+    </Folder>
+    <Folder name="src" defaultOpen>
+      <File name="main.rs" />
+      <File name="state.rs" />
+      <File name="jobs.rs" />
+      <File name="grpc.rs" />
+    </Folder>
+  </Folder>
+</Files>
+
+最近の stable Rust ツールチェーンと `protoc` が必要です ([インストール](/ja/docs/getting-started/installation) を参照)。
+
+<Steps>
+<Step>
+
+### プロジェクトを作る
+
+```bash
+cargo new guestbook
+cd guestbook
+```
+
+`Cargo.toml` を次の内容に置き換えます。
+
+```toml title="Cargo.toml"
+[package]
+name = "guestbook"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wakuwaku = "1.0.0-rc1"
+tokio = { version = "1.53", features = ["full"] }
+# Required by the code that tonic-prost-build generates.
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+```
+
+ここでは `wakuwaku` のデフォルトフィーチャー (`grpc` と `proof`) で足ります。自分で書くコードは tonic を `wakuwaku::deps::tonic` からインポートします。一方、`.proto` ファイルから生成されるコードは `tonic`、`tonic_prost`、`prost` というクレート名で参照するため、この 3 つは直接の依存にする必要があります。`0.14` と指定すれば、Cargo は wakuwaku が使うものと同じ `tonic` に解決し、生成されたサーバーをサービスビルダーが受け付けます。
+
+</Step>
+<Step>
+
+### API を定義する
+
+サービスを `.proto` ファイルに記述します。
+
+```proto title="proto/guestbook.proto"
+syntax = "proto3";
+
+package guestbook.v1;
+
+service Guestbook {
+  rpc Sign(SignRequest) returns (SignReply);
+  rpc List(ListRequest) returns (ListReply);
+}
+
+message SignRequest {
+  string name = 1;
+  string message = 2;
+}
+
+message SignReply {
+  uint64 id = 1;
+}
+
+message ListRequest {}
+
+message Signature {
+  uint64 id = 1;
+  string name = 2;
+  string message = 3;
+}
+
+message ListReply {
+  repeated Signature signatures = 1;
+}
+```
+
+ビルド時にここから Rust のコードを生成します。
+
+```rust title="build.rs"
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::compile_protos("proto/guestbook.proto")?;
+    Ok(())
+}
+```
+
+これにより、メッセージ型、実装すべき `guestbook_server::Guestbook` トレイト、その実装を提供する `GuestbookServer` が生成されます。
+
+</Step>
+<Step>
+
+### 共有依存を定義する
+
+wakuwaku のコンポーネントは、`ServiceBuilder` に登録された依存から組み立てられます。各コンポーネントが受け取る依存はちょうど 1 つなので、複数のものが必要な場合は構造体にまとめます。このサービスでは 2 つのコンポーネントがどちらもストアを必要とし、cron ジョブはさらに保持期間も必要とするため、両者で `AppState` を共有します。
+
+```rust title="src/state.rs"
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
+
+/// One entry in the guestbook.
+#[derive(Debug, Clone)]
+pub struct Signature {
+    pub id: u64,
+    pub name: String,
+    pub message: String,
+    pub signed_at: SystemTime,
+}
+
+/// In-memory storage. Cloning it clones the `Arc`, not the data.
+#[derive(Clone, Default)]
+pub struct Store {
+    inner: Arc<Mutex<Entries>>,
+}
+
+#[derive(Default)]
+struct Entries {
+    next_id: u64,
+    signatures: Vec<Signature>,
+}
+
+impl Store {
+    fn lock(&self) -> MutexGuard<'_, Entries> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn sign(&self, name: String, message: String, signed_at: SystemTime) -> u64 {
+        let mut entries = self.lock();
+        entries.next_id += 1;
+        let id = entries.next_id;
+        entries.signatures.push(Signature { id, name, message, signed_at });
+        id
+    }
+
+    pub fn list(&self) -> Vec<Signature> {
+        self.lock().signatures.clone()
+    }
+
+    /// Removes every signature older than `cutoff` and returns how many were removed.
+    pub fn remove_signed_before(&self, cutoff: SystemTime) -> usize {
+        let mut entries = self.lock();
+        let before = entries.signatures.len();
+        entries.signatures.retain(|s| s.signed_at >= cutoff);
+        before - entries.signatures.len()
+    }
+}
+
+/// The shared dependency every component is built from.
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Store,
+    /// How long a signature is kept.
+    pub retention: Duration,
+}
+```
+
+ビルダーは依存を各コンポーネントへクローンして渡すので、依存は `Clone` を実装し、安価にクローンできるもの (ハンドル、`Arc`、コネクションプールなど) であるべきです。
+
+</Step>
+<Step>
+
+### cron ジョブを書く
+
+cron ジョブは、定数 `INTERVAL` を持つ `CronTick` の [`Processor`](https://docs.rs/kanau) です。`ServiceCreation` は、ジョブをどの依存からどう組み立てるかをビルダーに伝えます。
+
+```rust title="src/jobs.rs"
+use std::convert::Infallible;
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::{CronJob, CronTick, ServiceCreation};
+
+use crate::state::AppState;
+
+/// Deletes signatures older than the retention period.
+pub struct PruneGuestbook {
+    state: AppState,
+}
+
+impl ServiceCreation for PruneGuestbook {
+    type Dep = AppState;
+
+    fn create_service(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+impl Processor<CronTick> for PruneGuestbook {
+    type Output = ();
+    type Error = Infallible;
+
+    async fn process(&self, tick: CronTick) -> Result<(), Infallible> {
+        // `fired_at` is the time of this run; tests pass any time they like.
+        let Some(cutoff) = tick.fired_at.checked_sub(self.state.retention) else {
+            return Ok(());
+        };
+        let removed = self.state.store.remove_signed_before(cutoff);
+        if removed > 0 {
+            println!("run {}: pruned {removed} signature(s)", tick.run);
+        }
+        Ok(())
+    }
+}
+
+impl CronJob for PruneGuestbook {
+    const INTERVAL: Duration = Duration::from_secs(60);
+}
+```
+
+このジョブは `SystemTime::now()` を呼ばずに `tick.fired_at` から現在時刻を読みます。こうすると「現在」をテスト側が決められるので、ジョブの結果が決定的になります。最初の実行はジョブの開始直後で、その後は `INTERVAL` ごとに 1 回実行されます。スケジュール、エラー、複数レプリカでの実行については [cron ジョブ](/ja/docs/services/cron-jobs) で説明しています。
+
+</Step>
+<Step>
+
+### gRPC サービスを実装する
+
+生成された `Guestbook` トレイトを実装し、さらにビルダーが `AppState` から実装を生成できるよう `ServiceCreation` も実装します。
+
+```rust title="src/grpc.rs"
+use std::time::SystemTime;
+use wakuwaku::ServiceCreation;
+use wakuwaku::deps::tonic::{self, Request, Response, Status};
+
+use crate::pb::guestbook_server::Guestbook;
+use crate::pb::{ListReply, ListRequest, SignReply, SignRequest, Signature};
+use crate::state::AppState;
+
+pub struct GuestbookService {
+    state: AppState,
+}
+
+impl ServiceCreation for GuestbookService {
+    type Dep = AppState;
+
+    fn create_service(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+#[tonic::async_trait]
+impl Guestbook for GuestbookService {
+    async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignReply>, Status> {
+        let SignRequest { name, message } = request.into_inner();
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("name must not be empty"));
+        }
+        let id = self.state.store.sign(name, message, SystemTime::now());
+        Ok(Response::new(SignReply { id }))
+    }
+
+    async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListReply>, Status> {
+        let signatures = self
+            .state
+            .store
+            .list()
+            .into_iter()
+            .map(|s| Signature { id: s.id, name: s.name, message: s.message })
+            .collect();
+        Ok(Response::new(ListReply { signatures }))
+    }
+}
+```
+
+</Step>
+<Step>
+
+### すべてを配線する
+
+`main.rs` では生成コードを取り込み、`AppState` を登録し、そこから 2 つのコンポーネントを組み立てて、Ctrl-C まで動かします。
+
+```rust title="src/main.rs"
+mod grpc;
+mod jobs;
+mod state;
+
+pub mod pb {
+    wakuwaku::deps::tonic::include_proto!("guestbook.v1");
+}
+
+use std::time::Duration;
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::tonic::service::Routes;
+use wakuwaku::deps::tonic::transport::Server;
+
+use crate::grpc::GuestbookService;
+use crate::jobs::PruneGuestbook;
+use crate::pb::guestbook_server::GuestbookServer;
+use crate::state::{AppState, Store};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Register the shared dependency.
+    let state = AppState {
+        store: Store::default(),
+        retention: Duration::from_secs(60 * 60),
+    };
+
+    // 2. Build and start the cron jobs.
+    let (services, cron) = ServiceBuilder::new(state)
+        .cron_job::<PruneGuestbook, _>()
+        .start();
+
+    // 3. Build the gRPC servers from the same builder.
+    let (_services, add_grpc) = services
+        .grpc_service::<GuestbookServer<_>, GuestbookService, _>(GuestbookServer::new)
+        .into_router_fn();
+
+    // 4. Serve until Ctrl-C, then stop the cron jobs.
+    let addr = "127.0.0.1:50051".parse()?;
+    println!("guestbook listening on {addr}");
+    add_grpc(Server::builder().add_routes(Routes::default()))
+        .serve_with_shutdown(addr, async {
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await?;
+
+    cron.shutdown().await;
+    Ok(())
+}
+```
+
+ここで行っていることは次のとおりです。
+
+- `ServiceBuilder::new(state)` が `AppState` を登録します。依存を追加するには `.push(value)` を使います。
+- `.cron_job::<PruneGuestbook, _>()` は `PruneGuestbook::Dep` (`AppState`) を探し、クローンして `create_service` を呼び出します。`_` はビルダー内での依存の位置で、コンパイラが推論します。`.start()` はジョブを起動し、ビルダーと `CronRuntime` を返します。
+- `.grpc_service::<GuestbookServer<_>, GuestbookService, _>(GuestbookServer::new)` は gRPC の実装について同じことを行い、生成されたサーバーで包みます。`.into_router_fn()` は、登録済みのすべてのサーバーを tonic のルーターに追加する関数を返します。
+- Ctrl-C を受けると、`serve_with_shutdown` は新しい接続の受け付けをやめ、処理中のリクエストを完了させます。続いて `cron.shutdown().await` が実行中のジョブを最後まで走らせてから停止します。`shutdown` を呼ばずに `CronRuntime` を drop すると、ジョブは中断されます。
+
+`AppState` の登録を消したり別の型を登録したりすると、プログラムはコンパイルできなくなります。エラーメッセージは、ビルダーが `ProvideAt<AppState, _>` を実装していない、つまりビルダーが `AppState` を保持していないことを示します。依存解決の仕組みは [サービスビルダー](/ja/docs/core/service-builder) で説明しています。
+
+</Step>
+<Step>
+
+### 動かして呼び出す
+
+サービスを起動します。
+
+```bash
+cargo run
+```
+
+```text
+guestbook listening on 127.0.0.1:50051
+```
+
+別のターミナルから [grpcurl](https://github.com/fullstorydev/grpcurl) で呼び出します。このサービスは gRPC リフレクションを有効にしていないので、`.proto` ファイルを渡します。
+
+```bash
+grpcurl -plaintext -import-path proto -proto guestbook.proto \
+  -d '{"name": "Haruki", "message": "Hello from grpcurl"}' \
+  127.0.0.1:50051 guestbook.v1.Guestbook/Sign
+```
+
+```json
+{
+  "id": "1"
+}
+```
+
+```bash
+grpcurl -plaintext -import-path proto -proto guestbook.proto \
+  127.0.0.1:50051 guestbook.v1.Guestbook/List
+```
+
+```json
+{
+  "signatures": [
+    {
+      "id": "1",
+      "name": "Haruki",
+      "message": "Hello from grpcurl"
+    }
+  ]
+}
+```
+
+`id` が文字列で表示されるのは、protobuf の JSON マッピングが 64 ビット整数を文字列として表すためです。空の名前は拒否されます。
+
+```bash
+grpcurl -plaintext -import-path proto -proto guestbook.proto \
+  -d '{"name": ""}' 127.0.0.1:50051 guestbook.v1.Guestbook/Sign
+```
+
+```text
+ERROR:
+  Code: InvalidArgument
+  Message: name must not be empty
+```
+
+最初のターミナルで Ctrl-C を押すと、サーバーが停止し、cron ジョブがシャットダウンして、プロセスは終了コード 0 で終了します。
+
+</Step>
+<Step>
+
+### ジョブをテストする [#test-the-job]
+
+cron ジョブはただの値なので、テストのためにサービスを起動する必要はありません。`create_service` で生成し、好きな時刻を入れた `CronTick` を渡して、ストアの中身を確認します。`src/jobs.rs` の末尾に次を追加します。
+
+```rust title="src/jobs.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Store;
+    use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn prunes_only_expired_signatures() {
+        let state = AppState {
+            store: Store::default(),
+            retention: Duration::from_secs(60 * 60),
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        state.store.sign("old".into(), "hi".into(), now - Duration::from_secs(2 * 60 * 60));
+        state.store.sign("new".into(), "hello".into(), now - Duration::from_secs(60));
+
+        let job = PruneGuestbook::create_service(state.clone());
+        job.process(CronTick { run: 0, fired_at: now }).await.unwrap();
+
+        let names: Vec<String> = state.store.list().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["new"]);
+    }
+}
+```
+
+```bash
+cargo test
+```
+
+```text
+running 1 test
+test jobs::tests::prunes_only_expired_signatures ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+これが証明駆動プログラミングにおける役割分担です。ジョブとサーバーが登録済みの依存に配線されていることはコンパイラがすでに検査しており、ジョブが何をするかはユニットテストが検査します。
+
+</Step>
+</Steps>
+
+## 次に読むもの
+
+<Cards>
+  <Card title="サービスビルダー" href="/ja/docs/core/service-builder" description="複数の依存の登録、位置の指定、コンポーネントを手で組み立てる方法。" />
+  <Card title="gRPC サービス" href="/ja/docs/services/grpc" description="複数のサーバー、ミドルウェアのレイヤー、手で組み立てたサーバー。" />
+  <Card title="cron ジョブ" href="/ja/docs/services/cron-jobs" description="スケジュール、エラー処理、複数レプリカでのジョブ。" />
+  <Card title="テスト" href="/ja/docs/core/testing" description="サービスを起動せずにコンポーネントをユニットテストする方法。" />
+</Cards>

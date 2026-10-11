@@ -1,13 +1,71 @@
 ---
-title: Hello World
-description: Your first document
+title: Introduction
+description: wakuwaku is a proof-driven microservice framework for Rust that wires gRPC servers, event handlers, and cron jobs from one compile-time registry.
+icon: BookOpen
 ---
 
-Welcome to the docs! You can start writing documents in `/content/docs`.
+**wakuwaku** is a proof-driven microservice framework for Rust. Its goal is to become for Rust what Spring is for Java: one framework that covers the everyday needs of a backend service, with Rust's compiler doing most of the checking.
 
-## What is Next?
+A wakuwaku service is assembled from plain values. You register shared dependencies (a connection pool, a client, a config struct) in a `ServiceBuilder`. Every component, whether a gRPC server, an event handler, or a cron job, declares the one dependency it is built from, and the builder creates it. Lookups go through the trait solver, not a runtime container, so a component that asks for something you never registered fails to compile.
+
+The crates that do the actual work are re-exported behind feature flags. A service depends on `wakuwaku` alone.
+
+<ArchitectureDiagram lang="en" />
+
+## Proof-driven programming
+
+wakuwaku splits correctness in two:
+
+- **Macro correctness**: how components fit together. Traits prove it and the compiler checks it. A component whose dependency was never registered, a write query sent through a read-only database handle, or a cron job with a zero interval does not build.
+- **Micro correctness**: what a single component does. Unit tests prove it. Every component is a plain value that implements a [`kanau`](https://docs.rs/kanau) `Processor` (or a trait built on it), so a test constructs it and calls it directly, without starting the service.
+
+As a result, most wiring mistakes surface when you build, and the remaining tests stay small and fast. [Proof-driven programming](/en/docs/core/proof-driven) explains the idea in depth.
+
+## Crates
+
+| Crate             | Imported as         | Provides                                                                   |
+| ----------------- | ------------------- | -------------------------------------------------------------------------- |
+| `wakuwaku`        | `wakuwaku`          | `ServiceBuilder`, gRPC registration, cron jobs, Iggy consumer registration |
+| `wakuwaku-entity` | `wakuwaku::entity`  | Capability-typed queries and transactions over sqlx, Redis, Meilisearch    |
+| `wakuwaku-iggy`   | `wakuwaku::iggy`    | Typed events on Apache Iggy with per-key ordering and algebraic batching   |
+| `wakuwaku-proof`  | `wakuwaku::proof`   | Proof-carrying validation                                                  |
+
+Third-party crates that appear in these APIs (`kanau`, `tonic`, `iggy`, `sqlx`, `redis`, `meilisearch_sdk`) are re-exported under [`wakuwaku::deps`](https://docs.rs/wakuwaku/latest/wakuwaku/deps/index.html). Import them from there so their versions always match the ones wakuwaku was built against.
+
+## Feature flags
+
+| Feature       | Default | Enables                                                     |
+| ------------- | ------- | ----------------------------------------------------------- |
+| `grpc`        | yes     | gRPC server registration, `deps::tonic`                     |
+| `proof`       | yes     | `wakuwaku::proof`                                           |
+| `iggy`        | no      | `wakuwaku::iggy`, Iggy consumer registration, `deps::iggy`  |
+| `entity`      | no      | `wakuwaku::entity` without a data source                    |
+| `sqlx-pg`     | no      | `entity` with PostgreSQL through sqlx, `deps::sqlx`         |
+| `sqlx-mysql`  | no      | `entity` with MySQL through sqlx, `deps::sqlx`              |
+| `redis`       | no      | `entity` with Redis, `deps::redis`                          |
+| `meilisearch` | no      | `entity` with Meilisearch, `deps::meilisearch_sdk`          |
+
+Cron jobs and the `ServiceBuilder` itself are always available. [Installation](/en/docs/getting-started/installation) shows common feature combinations.
+
+## What you can build today
+
+- **gRPC services** built from tonic-generated servers: [gRPC services](/en/docs/services/grpc).
+- **Cron jobs** that run inside the process on a fixed interval: [Cron jobs](/en/docs/services/cron-jobs).
+- **Event-driven services** on Apache Iggy, with per-key ordering, batching, and retries: [Events](/en/docs/events).
+- **Data access** to PostgreSQL, MySQL, Redis, and Meilisearch, where the type of the handle says what it is allowed to touch: [Data access](/en/docs/data).
+- **Validation** whose result is a type, so unvalidated input cannot reach code that requires validated input: [Validation](/en/docs/validation).
+
+## Version status
+
+The current release is **1.0.0-rc1**, a release candidate. The API is what 1.0.0 is expected to ship, but 1.0.0 will be released only after end-to-end tests on real-world projects pass, so details may still change. The [roadmap](/en/docs/roadmap) describes what comes after that.
+
+The API reference for every item lives on [docs.rs](https://docs.rs/wakuwaku). These pages explain how to build things with it.
+
+## Next steps
 
 <Cards>
-  <Card title="Learn more about Next.js" href="https://nextjs.org/docs" />
-  <Card title="Learn more about Fumadocs" href="https://fumadocs.dev" />
+  <Card title="Installation" href="/en/docs/getting-started/installation" description="Toolchain, Cargo.toml, feature flags, and the infrastructure each feature needs." />
+  <Card title="Quick start" href="/en/docs/getting-started/quick-start" description="Build a small gRPC service with a cron job, run it, call it, and test it." />
+  <Card title="Proof-driven programming" href="/en/docs/core/proof-driven" description="Why wiring is checked by the compiler and behavior by unit tests." />
+  <Card title="Coming from Spring" href="/en/docs/guides/coming-from-spring" description="How Spring concepts map onto wakuwaku." />
 </Cards>

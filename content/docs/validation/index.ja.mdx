@@ -1,0 +1,223 @@
+---
+title: バリデーション (Proof)
+description: 生の値ではなく検証済みの証明を受け渡すことで、「検証し忘れ」をコンパイルエラーにします。
+icon: ShieldCheck
+---
+
+`wakuwaku::proof` ([`wakuwaku-proof`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/) クレート) は、証明を持ち運ぶバリデーションの仕組みです。ルールを **述語 (predicate)** として記述し、`prove` で一度だけ実行すると、`Proven<T, P>` が返ります。これは値そのものと、ルールが成り立ったという証拠 (evidence) の組です。検証済みの値を必要とするコードはシグネチャで `Proven<T, P>` を要求するので、未検証の値はそこに届きません。
+
+## 防げるバグ [#the-bug-this-prevents]
+
+バリデーションのバグの多くは、ルールが間違っていることではなく、ルールが実行されなかったことから生まれます。
+
+```rust
+// 呼び出し側は必ず先に `name` を検証しなければならない
+fn register(name: String) { /* ... */ }
+```
+
+検証済みの `String` と未検証の `String` は同じ型なので、新しいエンドポイントやバックグラウンドジョブ、リファクタリング後のコードが生の入力で `register` を呼んでも何も止めてくれません。Spring でいえば、コントローラーの引数に `@Valid` を付け忘れる典型的なケースです。制約は宣言されていても、それがチェックされることを強制するものがありません。
+
+`wakuwaku::proof` では、この要件を型に移します。
+
+```rust
+fn register(name: Proven<String, ValidUsername>) { /* ... */ }
+```
+
+`Proven<String, ValidUsername>` を手に入れる方法は、`ValidUsername` のチェックを実行する (または別の証明から導出する) ことだけです。検証のし忘れは型エラーになります。
+
+<ProofDiagram lang="ja" />
+
+## セットアップ [#setup]
+
+`proof` フィーチャーはデフォルトで有効なので、`wakuwaku` だけで使えます。述語は普通の非同期コードです。`tokio` を直接依存に加える必要があるのは `#[tokio::main]` や `#[tokio::test]` を使うときだけで、wakuwaku のサービス内では gRPC ハンドラーがすでにランタイム上で動いています。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = "1.0.0-rc1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+## 構成要素 [#the-pieces]
+
+| 項目 | 役割 |
+| --- | --- |
+| [`ValidateContext`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.ValidateContext.html) | 判定中にチェックが参照するもの (設定、接続ハンドル、キャッシュなど) と、「判定できなかった」ときのエラー型。 |
+| [`Predicate<T>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.Predicate.html) | 実行時に判定される `T` についての命題。述語の型そのものが証拠になります。 |
+| [`prove`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/fn.prove.html) | 対象 (subject) に述語を適用し、成功すれば両者を `Proven` に包みます。 |
+| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | 対象と、`P` が成り立った証拠。`prove` か別の証明からしか得られません。 |
+| [`ValidateError<E>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.ValidateError.html) | ルールが偽なら `Deny(DeniedReason)`、判定できなければ `IoError(E)`。 |
+| [`DeniedReason`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.DeniedReason.html) | 拒否の理由を表す `&'static str`。同一性で比較されます。 |
+
+### コンテキスト [#a-context]
+
+すべての述語は自分のコンテキスト型を指定します。コンテキストは `ValidateContext` を実装し、判定に失敗したときのエラー型を決めます。純粋なチェックはそのような失敗をしないので `Infallible` を使います。
+
+```rust title="src/validation.rs"
+use std::convert::Infallible;
+use wakuwaku::proof::{
+    And, CheckOrder, DeniedReason, Predicate, Proven, ValidateContext, ValidateError, prove,
+};
+
+/// チェックが参照するもの。ここでは設定だけ
+#[derive(Clone)]
+pub struct Limits {
+    pub max_len: usize,
+}
+
+impl ValidateContext for Limits {
+    // 純粋なチェックは判定に失敗しない
+    type IoError = Infallible;
+}
+```
+
+### 述語 [#predicates]
+
+述語とは `Predicate<T>` を実装した型です。`check` は `self` を取りません。判定に必要なものはすべて対象とコンテキストから得ます。ルールが成り立つと、`check` は述語の型そのものの値を返します。この値が **証拠** です。報告することがないルールはユニット構造体に、判定中に何かを知るルールはそれをフィールドに保持します。
+
+```rust title="src/validation.rs"
+pub static EMPTY: DeniedReason = DeniedReason("username is empty");
+pub static TOO_LONG: DeniedReason = DeniedReason("username is too long");
+
+/// 「名前が空でない」。報告することがないのでユニット構造体
+pub struct NonEmpty;
+
+impl Predicate<String> for NonEmpty {
+    type Ctx = Limits;
+
+    async fn check(
+        name: &String,
+        _: &Limits,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<Infallible>> {
+        if name.is_empty() {
+            Err(ValidateError::Deny(EMPTY))
+        } else {
+            Ok(NonEmpty)
+        }
+    }
+}
+
+/// 「名前が `max_len` バイトに収まる」。残りの余裕を記録する
+pub struct ShortEnough {
+    pub spare: usize,
+}
+
+impl Predicate<String> for ShortEnough {
+    type Ctx = Limits;
+
+    async fn check(
+        name: &String,
+        limits: &Limits,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<Infallible>> {
+        match limits.max_len.checked_sub(name.len()) {
+            Some(spare) => Ok(ShortEnough { spare }),
+            None => Err(ValidateError::Deny(TOO_LONG)),
+        }
+    }
+}
+```
+
+`check` が返す Future は `Send` でなければならないので、どの tonic ハンドラーの中でもチェックを実行できます。`CheckOrder` 引数は他の述語を組み合わせる述語にとってだけ意味があり、末端の述語は無視して構いません ([述語の合成](/ja/docs/validation/composition#check-order) を参照)。
+
+### 証明する [#proving]
+
+`prove` は対象を値で受け取り、チェックを実行して、証明かエラーを返します。`And<NonEmpty, ShortEnough>` は両方が成り立つときに成り立つ述語で、詳しくは [述語の合成](/ja/docs/validation/composition) で扱います。
+
+```rust title="src/validation.rs"
+/// 両方が成り立つ必要がある
+pub type ValidUsername = And<NonEmpty, ShortEnough>;
+
+/// `prove` を通った名前でしか呼べない
+pub fn register(name: Proven<String, ValidUsername>) -> String {
+    let And(_, short_enough) = name.evidence();
+    format!("{} ({} bytes to spare)", name.subject(), short_enough.spare)
+}
+
+pub async fn handle(input: String) -> Result<String, &'static str> {
+    let limits = Limits { max_len: 16 };
+
+    match prove::<_, ValidUsername>(input, &limits, CheckOrder::Sequential).await {
+        Ok(name) => Ok(register(name)),
+        Err(ValidateError::Deny(reason)) => Err(reason.0),
+        // `Infallible` には値が存在しないので、このアームは決して実行されない
+        Err(ValidateError::IoError(never)) => match never {},
+    }
+}
+```
+
+`handle("haruki".into())` は `Ok("haruki (10 bytes to spare)")` を返し、空文字列なら `Err("username is empty")` を返します。チェックが失敗すると、対象はエラーとともに破棄されます。
+
+## 3 つの結果 [#three-outcomes]
+
+チェックの結果は必ず次の 3 つのうちどれか 1 つです。
+
+| 結果 | 意味 | 典型的な扱い |
+| --- | --- | --- |
+| `Ok(evidence)` | 命題が成り立つ。`prove` は `Proven<T, P>` を返す。 | 証明を持って処理を続ける。 |
+| `Err(ValidateError::Deny(reason))` | 命題は判定され、偽だった。 | 入力を拒否する (`INVALID_ARGUMENT`、`ALREADY_EXISTS` など)。 |
+| `Err(ValidateError::IoError(e))` | 命題を判定できなかった。例: データベースに到達できない。 | 不正な入力ではなく、サーバー側の障害として扱う (`UNAVAILABLE`)。 |
+
+<Callout type="warn" title="I/O エラーは拒否ではありません">
+`IoError` は対象が正しいかどうかについて何も語りません。これをクライアントに「不正な入力」として返すと、障害の責任をユーザーに押し付けることになります。2 つのアームは分けて扱ってください。`tonic::Status` への変換例は [サービスでの証明の利用](/ja/docs/validation/in-services#mapping-validateerror-to-a-grpc-status) にあります。
+</Callout>
+
+### 拒否の理由 [#denied-reasons]
+
+`DeniedReason` は `&'static str` を包んだ型で、等価性は文字列の内容ではなく **ポインタの同一性** で判定されます。同じテキストでもアドレスが異なれば等しくならず、文字列リテラルや `const` への参照が同じアドレスを共有する保証もありません。理由はそれぞれ一度だけ `static` として宣言し、その `static` と比較してください。
+
+```rust
+pub static TAKEN: DeniedReason = DeniedReason("username is already taken");
+
+// 後でエラーを変換するとき
+if reason == TAKEN { /* ... */ }
+```
+
+表示用のテキストは `reason.0` で取り出せます。
+
+## 証拠 [#evidence]
+
+述語の型がそのまま証拠になります。`Proven::evidence()` はそれを **参照で** 返します。
+
+- `NonEmpty` は何も持ちません。証明を持っていること自体が情報です。
+- `ShortEnough { spare }` は残りの余裕を記録しているので、`register` は長さを測り直さずに `short_enough.spare` を読めます。
+- I/O を行う述語は検索したデータベースの行を持てるので ([I/O を行う述語](/ja/docs/validation/composition#io-predicates) を参照)、後続のコードで同じクエリを繰り返す必要がありません。
+
+`Proven`、`And`、`Or` の中では、各証拠は [`Evidence<P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Evidence.html) に包まれています。これは `&P` に Deref でき、値として取り出すことはできず、`P` が `Clone` でも **`Clone` ではありません**。証拠を複製するのはクレートが提供するブール代数の法則のうち、結果に同じ証明を 2 回含むものだけで、それらは `P: Clone` を要求します ([証明の導出](/ja/docs/validation/derivation#when-evidence-must-be-clone) を参照)。
+
+対象も `Proven::subject()` を通して `&T` としてしか公開されないため、チェック後に変更することはできません (内部可変性を除く)。対象を値で返すメソッドはないので、所有権が必要な場合はクローンしてください。
+
+<Callout type="info" title="証明はスナップショットです">
+対象も証拠も、チェックした瞬間の状態を表しています。「このユーザー名は空いている」のように外部の状態に依存する述語では、その状態がすでに変わっている可能性があります。最終的な防御としてデータベース自身の制約 (一意インデックスなど) を残してください。
+</Callout>
+
+## 述語そのものを受け取らない [#never-accept-a-bare-predicate]
+
+証拠の型を直接要求したくなるかもしれません。
+
+```rust
+// これは何も証明しない
+fn register(name: String, _proof: NonEmpty) { /* ... */ }
+```
+
+`NonEmpty` は誰でも書けますし、`Predicate::check` を直接呼べばどの対象とも結び付いていない証拠が得られます。シグネチャでは常に `Proven<T, P>` を受け取り、`P` 単体は受け取らないでください。
+
+`Proven` を要求するのが安全なのは、フィールドが private だからです。クレートの外で `Proven` を得る方法は `prove` か、既存の証明から `Proven::from_a`、`from_b`、`from_both`、`into_a`、`into_b`、`derive` を通すことだけです。近道はどちらもコンパイルできません。
+
+```rust
+let input = String::from("haruki");
+register(input); // error[E0308]: mismatched types
+                 // expected `Proven<String, And<NonEmpty, ShortEnough>>`, found `String`
+
+let fake = Proven { subject: String::new(), evidence: todo!() };
+// error[E0451]: fields `subject` and `evidence` of struct `Proven` are private
+```
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="述語の合成" href="/ja/docs/validation/composition" description="And、Or、チェック順序、I/O を行う述語。" />
+  <Card title="証明の導出" href="/ja/docs/validation/derivation" description="再チェックせずに、証明をより弱い、または同値な証明に変換します。" />
+  <Card title="サービスでの証明の利用" href="/ja/docs/validation/in-services" description="gRPC リクエストを検証し、証明をドメインロジックやクエリに渡します。" />
+  <Card title="証明駆動の設計" href="/ja/docs/core/proof-driven" description="wakuwaku がコンパイラとテストで正しさを分担する方法。" />
+</Cards>

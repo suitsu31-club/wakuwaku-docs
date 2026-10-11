@@ -1,47 +1,41 @@
 # wakuwaku-docs
 
-This is a Next.js application generated with
-[Create Fumadocs](https://github.com/fuma-nama/fumadocs).
+Source of [www.wakuwaku.rs](https://www.wakuwaku.rs), the usage guide for the
+[wakuwaku](https://github.com/suitsu31-club/wakuwaku) microservice framework. The API reference
+lives on [docs.rs](https://docs.rs/wakuwaku).
 
-It is a Next.js app with [Static Export](https://nextjs.org/docs/app/guides/static-exports) configured.
-
-Run development server:
+Built with [Fumadocs](https://fumadocs.dev) on Next.js as a static export (`out/`).
 
 ```bash
-npm run dev
-# or
-pnpm dev
-# or
-yarn dev
+bun install
+bun run dev          # http://localhost:3000
+bun run build        # static export into out/
+bun run types:check
+bun run lint
 ```
 
-Open http://localhost:3000 with your browser to see the result.
+## Layout
 
-## Explore
+| Path                     | Contents                                                                 |
+| ------------------------ | ------------------------------------------------------------------------ |
+| `content/docs/`          | Pages. `foo.mdx` is English, `foo.ja.mdx` is Japanese; `meta.json` / `meta.ja.json` order the sidebar. |
+| `app/[lang]/`            | Landing page, docs layout, OG images and per-page Markdown, per locale.  |
+| `app/(redirect)/`        | `/` picks `/en` or `/ja` from the browser language (no middleware in a static export). |
+| `components/diagrams/`   | Inline SVG diagrams used in MDX, e.g. `<OrderingDiagram lang="ja" />`.   |
+| `lib/i18n.ts`            | Locales (`en`, `ja`).                                                    |
+| `lib/layout.shared.tsx`  | Navigation and the Japanese UI translations.                             |
+| `public/banner.svg`      | Landing page banner.                                                     |
 
-In the project, you can see:
+## Writing pages
 
-- `lib/source.ts`: Code for content source adapter, [`loader()`](https://fumadocs.dev/docs/headless/source-api) provides the interface to access your content.
-- `lib/layout.shared.tsx`: Shared options for layouts, optional but preferred to keep.
-
-| Route                     | Description                                            |
-| ------------------------- | ------------------------------------------------------ |
-| `app/(home)`              | The route group for your landing page and other pages. |
-| `app/docs`                | The documentation layout and pages.                    |
-| `app/api/search/route.ts` | The Route Handler for search.                          |
-
-### Fumadocs MDX
-
-Collections are defined with the [Macro API](https://fumadocs.dev/docs/mdx/macro) in `lib/source.ts`.
-
-Read the [Introduction](https://fumadocs.dev/docs/mdx) for further details.
-
-## Learn More
-
-To learn more about Next.js and Fumadocs, take a look at the following
-resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js
-  features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-- [Fumadocs](https://fumadocs.dev) - learn about Fumadocs
+- Every page exists in both languages with the same headings, code and diagrams. Japanese headings
+  that are link targets carry the English anchor, e.g. `## 隔離 [#quarantine]`.
+- Internal links are absolute and include the locale: `/en/docs/core/service-builder`,
+  `/ja/docs/core/service-builder`.
+- Items of the `wakuwaku` crate link to `docs.rs/wakuwaku`; items of the sub-crates link to their own
+  crates (`docs.rs/wakuwaku-entity`, `wakuwaku-iggy`, `wakuwaku-proof`), because docs.rs does not
+  inline re-exported crates.
+- Diagrams only use theme CSS variables (`--color-fd-*`, `--color-waku-*`), so they follow light and
+  dark mode. Labels are kept in an `{ en, ja }` dictionary inside each component.
+- Rust snippets are meant to compile against the current wakuwaku release; check new ones in a
+  scratch crate before publishing.

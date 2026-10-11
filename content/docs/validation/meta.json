@@ -1,0 +1,5 @@
+{
+  "title": "Validation (Proof)",
+  "icon": "ShieldCheck",
+  "pages": ["index", "composition", "derivation", "in-services"]
+}

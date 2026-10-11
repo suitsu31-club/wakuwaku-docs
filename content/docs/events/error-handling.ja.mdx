@@ -1,0 +1,247 @@
+---
+title: エラー処理
+description: ハンドラーの失敗を Transient・Retryable・Unrecoverable に分類し、リトライトピック、キーの隔離、そして何が破棄されるのかを理解します。
+icon: ShieldAlert
+---
+
+本番環境のコンシューマーは、性質のまったく異なる 3 種類の失敗に出会います。データベースが落ちている、ある特定のキーが競合した、あるいはそのイベントは決して適用できない、のいずれかです。wakuwaku はどれが起きたのかを明示させ、それに応じて対応します。ハンドラーは [`HandleError`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/struct.HandleError.html) を返し、その [`ErrorClass`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.ErrorClass.html) によってコンシューマーの次の動きが決まります。
+
+## `HandleError` [#handle-error]
+
+`HandleError` は、`anyhow::Error` に変換できる任意のエラー（`std::error::Error + Send + Sync + 'static` を満たすものはすべて変換できます）を、分類と一緒に包んだものです。次のコンストラクターで作ります。
+
+```rust
+HandleError::transient(error)      // ErrorClass::Transient
+HandleError::retryable(error)      // ErrorClass::Retryable
+HandleError::unrecoverable(error)  // ErrorClass::Unrecoverable
+HandleError::new(ErrorClass::Retryable, error)
+```
+
+どちらの型も `wakuwaku::iggy::error` にあります。`HandleError::class` と `HandleError::source` で分類と包んだエラーを取り出せるので、テストで便利です。
+
+## 3 つの分類 [#classes]
+
+| 分類            | 失敗の範囲           | コンシューマーの動作                                                       | パーティションの進行 | 失われるイベント                     |
+|-----------------|----------------------|----------------------------------------------------------------------------|----------------------|--------------------------------------|
+| `Transient`     | インフラ             | 同じチャンクを、成功するまでその場で再試行する                             | 停止する             | なし                                 |
+| `Retryable`     | このキー             | キーの未処理の作業を `retry_<topic>` に移し、キーを隔離する                | 継続する             | すべてのリトライが失敗した場合のみ   |
+| `Unrecoverable` | このチャンク         | チャンクを破棄してログに出力し、ランの残りを続行する                       | 継続する             | そのチャンク                         |
+
+<RetryDiagram lang="ja" />
+
+### Transient [#transient]
+
+`Transient` は **今は何をやっても成功しない** ときに使います。データベースや必須のサービスに到達できない場合です。コンシューマーは *同じチャンク* でハンドラーを再度呼び出し、試行の間は [`ConsumerConfig::retry_delays`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/struct.ConsumerConfig.html#structfield.retry_delays) に従って待機します。1 回目の失敗の後は `retry_delays[0]`、2 回目の失敗の後は `retry_delays[1]` というように待ち、リストを使い切った後は最後の値が永遠に繰り返されます。デフォルトでは 2 秒、4 秒、8 秒、16 秒、16 秒、16 秒、… です。
+
+試行回数に上限はありません。チャンクを再試行している間、そのキーは先に進めず、バッチも完了できないため、パーティションのタスクはメイントピックもリトライトピックもポーリングしません。同じバッチの他のキーは今の作業を終えたうえで待機します。これは意図的な設計です。データベースが落ちているときに先へ進んでも、他のキーがすべて失敗するだけだからです。
+
+コンシューマー自身の Iggy 呼び出し（ポーリング、オフセットの保存、リトライレコードの書き込み）も、同じ待機時間で同じように再試行されます。
+
+<Callout type="warn" title="不正なイベントに Transient を返してはいけません">
+  イベントそのものが原因の `Transient` エラー（不正なデータ、存在しない行など）は永遠に再試行され、パーティション全体を止めてしまいます。イベントに依存しない失敗にだけ使ってください。
+</Callout>
+
+### Retryable [#retryable]
+
+`Retryable` は **このキーは失敗したが他は問題なく**、後で試せば成功しうるときに使います。デッドロック、シリアライゼーション失敗、別のストリームがまだ作っていない行などです。
+
+メイントピックの処理中にランが `Retryable` で失敗すると、次のことが起こります。
+
+1. **キーが停止します。** 同じステージの他のランは最後まで実行されます（ボディのランは並行実行のため）が、そのキーの後続のステージやセグメントは開始されません。
+2. **未処理の作業がリトライトピックに送られます。** コンシューマーは `retry_<topic>` のパーティション *p*（メインのパーティション *p* に対応）に次のものを書き込みます。
+   - 失敗したチャンクと、失敗したランのそれ以降のチャンクすべて。
+   - 失敗したセグメントの後続ステージのラン、およびそのキーの後続セグメントすべて。
+
+   完了したランは再度書き込まれません。すべて [縮約](/ja/docs/events/algebra) 済みの状態で書き込まれ、順序は書き換えられます。そのため、レコードを改めて計画しても、元の計画が守っていた順序はすべて保たれます。
+3. **キーが隔離されます。** キーのレコードがリトライトピックに残っている間、メイントピックから来たそのキーの新しいイベントは実行されず、失敗したイベントの後ろに並ぶようリトライトピックへ回されます。したがって [順序保証](/ja/docs/events/ordering) で説明したキーごとの順序は保たれます。
+4. **キーが再試行されます。** パーティションのタスクはメイントピックをポーリングする前に毎回、期限が来たリトライキーそれぞれについて 1 回ずつ試行します。1 回の試行では、そのキーの保留中のレコードをすべて、新しいバッチであるかのように計画して実行します。
+
+スケジュールはここでも `retry_delays` から決まります。最初の試行は失敗から `retry_delays[0]` 後に、それ以降は試行が失敗するたびに次の待機時間の後に行われます。つまりキーは、待機時間ひとつにつき 1 回再試行されます。デフォルトの [`DEFAULT_RETRY_DELAYS`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/constant.DEFAULT_RETRY_DELAYS.html)（2・4・8・16 秒）では次のようになります。
+
+| 試行 | 前回からの待機 | 失敗からの経過時間 |
+|------|----------------|--------------------|
+| 1    | 2 秒           | 2 秒               |
+| 2    | 4 秒           | 6 秒               |
+| 3    | 8 秒           | 14 秒              |
+| 4    | 16 秒          | 30 秒              |
+
+試行はこれより早く行われることはなく、メイントピックのポーリングの合間に実行されます。4 回目の試行も失敗すると、コンシューマーは **諦めます**。失敗したランのレコードを破棄し、error レベルで `giving up retry` をログに出力します。そのキーの残りの保留レコード（隔離中に回されてきたイベントなど）は破棄されず、すぐに試行され、試行回数のカウンターは最初からやり直しになります。保留レコードがなくなると、キーの隔離は解除されます。
+
+知っておくとよい細かな点があります。
+
+- リトライトピックは `start` の時点で、メイントピックと同じパーティション数で作成されます。すでに異なるパーティション数で存在する場合、`start` は `Error::PartitionCountMismatch` で失敗します。
+- 失敗した時刻は各リトライレコードのヘッダーに記録されるので、再起動後も最初の試行は元の失敗から `retry_delays[0]` 後（すでに過ぎていれば即座）に行われます。一方、試行回数のカウンターはメモリ上にしかないため、再起動後の保留キーはスケジュールを最初からやり直します。
+- [`ConsumerConfig::max_pending_retry`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/struct.ConsumerConfig.html#structfield.max_pending_retry)（デフォルト 100 000）は、ひとつのリトライパーティションで待機するレコード数の上限です。新たに失敗したキーがこれを超える場合、そのキーの失敗したイベントは書き込まれずに破棄され、ログ（`retry backlog full`）に出力されます。すでに隔離されているキーのイベントは、引き続きリトライトピックへ回されます。
+
+### Unrecoverable [#unrecoverable]
+
+`Unrecoverable` は **再試行しても決して解決しない** ときに使います。イベントが不正である、決して存在しないものを参照している、あるいはバグに当たった場合です。コンシューマーはチャンクを破棄し、error レベルで `dropping chunk after unrecoverable handler failure` をログに出力して、ランの次のチャンクへ進みます。キーは停止しません。
+
+<Callout type="warn" title="チャンク全体が破棄されます">
+  失敗の単位は、1 回の `handle` 呼び出しに渡されるチャンク（最大 `MAX_BATCH` 件）です。100 件のチャンク中の不正なイベント 1 件が `Unrecoverable` を返すと、100 件すべてが破棄されます。イベントが個別に失敗しうる型では `MAX_BATCH = 1` にするか、ハンドラーの中で不正なイベントを読み飛ばし、チャンク全体に関わる場合にだけエラーを返してください。
+</Callout>
+
+## ハンドラーに届かないレコード [#dropped-records]
+
+一部のレコードは、どのハンドラーにも渡る前にコンシューマーが破棄します。いずれも [`tracing`](https://docs.rs/tracing) で error レベルのログが出力されます。
+
+- **不正なヘッダー**: 型タグ・キー・プロパティのヘッダーが欠けているか壊れている、またはヘッダーのバージョンが未知。
+- **未知の型タグ**: そのレコードの型に対応するハンドラーが登録されていない。
+- **代数の不一致**: ヘッダーの代数が、登録された型のマーカーと異なる（[代数の落とし穴](/ja/docs/events/algebra#pitfalls) を参照）。
+- **デコードできないボディ**: `MessageDe::from_bytes` が失敗した。ランの残りは処理されます。
+- **シリアライズできないリトライレコード**: リトライトピックに書き込むべきイベントを再びシリアライズできなかった。
+
+これらは再試行されずに破棄されるので、ボディのシリアライズとデシリアライズはテストし、スキーマの変更は後方互換に保ってください（[イベントの定義](/ja/docs/events/defining-events#serializing-the-body) を参照）。
+
+## よくあるエラーの分類 [#classifying]
+
+| 失敗                                                              | 分類            | 理由                                                         |
+|-------------------------------------------------------------------|-----------------|--------------------------------------------------------------|
+| 接続拒否、プールのタイムアウト、TLS/IO エラー                     | `Transient`     | どのキーも同じように失敗する。                               |
+| デッドロック、シリアライゼーション失敗、ロックタイムアウト        | `Retryable`     | このキーが競合に負けただけで、すぐに成功する可能性が高い。   |
+| 行が見つからないが、別のストリームが作る予定（プロジェクションの遅れ） | `Retryable`     | 後で現れる可能性がある。遅れを吸収できる `retry_delays` にする。 |
+| 行が見つからず、今後も決して存在しない                            | `Unrecoverable` | 再試行しても作られない。                                     |
+| イベントのデータに対するバリデーション失敗                        | `Unrecoverable` | データは変わらない。発行前にバリデーションする。             |
+| 下流の HTTP 429 / 503（このリクエストについて）                   | `Retryable`     | 他のキーを止めずに間隔を空けられる。                         |
+| 下流のサービスが完全に停止している                                | `Transient`     | データベースの停止と同じ。                                   |
+| 下流の HTTP 400 / 422                                             | `Unrecoverable` | リクエストそのものが誤っている。                             |
+
+「後で存在するはずの行」については補足が必要です。異なるキーのイベントには [順序がなく](/ja/docs/events/ordering#guarantees)、異なるトピックのイベントならなおさらです。ある SKU の在庫行が別のキーの `ProductCreated` イベントで作られるなら、`StockAdjusted` イベントのほうが先に届くことがあります。その差がリトライのスケジュール内に解消されるなら、`Retryable` で吸収できます。
+
+PostgreSQL 上の `sqlx` のエラーを分類する関数は、たとえば次のようになります。
+
+```rust title="src/handlers/errors.rs"
+/// データベースのエラーを、コンシューマーが取るべき対応の分類に振り分ける。
+fn classify(error: sqlx::Error) -> HandleError {
+    match &error {
+        // データベースに到達できない: どのキーも同じように失敗する。
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_) => HandleError::transient(error),
+        // シリアライゼーション失敗、デッドロック、ロックタイムアウト
+        // (PostgreSQL の SQLSTATE 40001 / 40P01 / 55P03):
+        // このキーが競合に負けただけで、後で成功する可能性が高い。
+        sqlx::Error::Database(db)
+            if matches!(db.code().as_deref(), Some("40001" | "40P01" | "55P03")) =>
+        {
+            HandleError::retryable(error)
+        }
+        // それ以外はバグか不正なデータ。再試行しても変わらない。
+        _ => HandleError::unrecoverable(error),
+    }
+}
+```
+
+これを使うハンドラーでは、「更新された行がない」ことを `Retryable` なドメインエラーに変換します（`StockAdjusted` は [代数](/ja/docs/events/algebra#associative) のページのイベントです）。
+
+```rust title="src/handlers/stock.rs"
+/// イベントが指す SKU の在庫行が（まだ）ない。
+#[derive(Debug)]
+struct UnknownSku(String);
+
+impl fmt::Display for UnknownSku {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no stock row for SKU {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownSku {}
+
+pub struct ApplyStock {
+    pool: PgPool,
+}
+
+impl EventHandler<StockAdjusted> for ApplyStock {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::MIN;
+
+    async fn handle(&self, run: &[StockAdjusted]) -> Result<(), HandleError> {
+        for adjustment in run {
+            let updated = sqlx::query("UPDATE stock SET quantity = quantity + $1 WHERE sku = $2")
+                .bind(adjustment.delta)
+                .bind(&adjustment.sku)
+                .execute(&self.pool)
+                .await
+                .map_err(classify)?;
+            if updated.rows_affected() == 0 {
+                // `ProductCreated` のプロジェクションが追いついていないだけかもしれない。
+                return Err(HandleError::retryable(UnknownSku(adjustment.sku.clone())));
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+このページのコードで使う import は次のとおりです。
+
+```rust
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::time::Duration;
+use wakuwaku::deps::sqlx::{self, PgPool};
+use wakuwaku::iggy::error::{ErrorClass, HandleError};
+use wakuwaku::iggy::{ConsumerConfig, EventHandler};
+```
+
+（`sqlx` は `sqlx-pg` または `sqlx-mysql` フィーチャーを有効にすると `wakuwaku::deps::sqlx` として使えます。[sqlx](/ja/docs/data/sqlx) を参照してください。）
+
+## リトライスケジュールの調整 [#configuration]
+
+その場での `Transient` の再試行と `Retryable` の試行は、どちらも同じリストからスケジュールが決まります。このリストとバックログの上限は [`ConsumerConfig`](/ja/docs/events/consuming) で設定します。
+
+```rust title="src/main.rs"
+const RETRY_DELAYS: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(10),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
+
+pub fn config() -> ConsumerConfig {
+    let mut config = ConsumerConfig::new("shop", "inventory", vec![0, 1, 2]);
+    config.retry_delays = RETRY_DELAYS;
+    config.max_pending_retry = 10_000;
+    config
+}
+```
+
+<TypeTable
+  type={{
+    retry_delays: {
+      type: "&'static [Duration]",
+      description: 'Retryable なキーの試行間隔（要素ひとつにつき 1 回試行）。Transient の再試行間隔にも使われ、その場合は最後の要素が永遠に繰り返される。空にはできず、空なら start が Error::InvalidConfig で失敗する。',
+      default: 'DEFAULT_RETRY_DELAYS: 2 秒・4 秒・8 秒・16 秒',
+    },
+    max_pending_retry: {
+      type: 'usize',
+      description: 'ひとつのパーティションについて、リトライパーティションで待機できるレコード数の上限。これを超えて新たに失敗したキーは破棄される。',
+      default: '100_000',
+    },
+  }}
+/>
+
+上のスケジュールでは、`Retryable` なキーは約 6 分の間に 4 回試行されます。`Transient` な障害は、最初の 3 つの待機時間が過ぎた後は 5 分ごとに再試行されます。
+
+## ハンドラーを冪等に設計する [#idempotency]
+
+バグがなくても、ハンドラーは同じイベントを複数回受け取ることがあります。
+
+- **クラッシュ後の再配信。** デフォルトの [`DeliveryMode::NoEventLose`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/enum.DeliveryMode.html) ではバッチの完了後にオフセットを保存するため、クラッシュすると最後に保存したオフセット以降に処理したイベントが再び処理されます。
+- **Transient の再試行。** 同じチャンクが再び渡されます。失敗する前にハンドラーが書き込んだ内容は、もう一度書き込まれます。
+- **リトライの試行。** リトライの試行中に、いくつかのチャンクが成功した後でランが失敗すると、次の試行ではそれらのチャンクがもう一度適用されます。
+
+したがって、次のようにしてください。
+
+- **`handle` の 1 回の呼び出しを all-or-nothing にする。** たとえば呼び出しごとにひとつのデータベーストランザクションを使います。そうすれば、失敗した呼び出しは再実行されて困るものを何も残しません。
+- **できる限り効果を冪等にする。** upsert（`INSERT … ON CONFLICT DO NOTHING`）、「加算する」ではなく「この値にする」、バージョン列を条件にした更新などです。
+- **冪等にできない場合**（カウンター、メール送信など）は、イベントのボディに一意な ID を持たせ、処理済みの ID を同じトランザクション内で記録します。ただし一意な ID があると 2 つのイベントが等しくなることはないため、`Idempotent` によるまとめは働かなくなります。また `Associative` の `combine` では、畳み込んだイベントがどの ID を表すのかを決める必要があります。
+- クラッシュ時にイベントを失うのは許容できるが重複は許容できない場合は、処理の前にオフセットを保存する `DeliveryMode::NoDoubleConsume` を使えます。[イベントの購読](/ja/docs/events/consuming) を参照してください。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="イベントの購読" href="/ja/docs/events/consuming" description="ConsumerConfig、DeliveryMode、コンシューマーの起動。" />
+  <Card title="順序保証" href="/ja/docs/events/ordering" description="セグメントとラン、そして隔離によって順序が保たれる理由。" />
+  <Card title="代数" href="/ja/docs/events/algebra" description="ランがハンドラーに届く前にどう縮約されるか。" />
+</Cards>

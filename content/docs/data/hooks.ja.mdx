@@ -1,0 +1,300 @@
+---
+title: 書き込みフック
+description: 書き込みを発行するハンドラを変えずに、すべての書き込みクエリの前後で、監査ログ・キャッシュ無効化・検索同期などの処理を実行します。
+---
+
+書き込みフックはハンドルをラップし、そのハンドルを通るすべての**書き込み**クエリの前後でプロセッサを実行します。ハンドラ側の変更は不要です。ラップしたハンドルは元のハンドルと同じ出力・同じエラーを返すので、`D: Processor<RenameUser>` を受け取る関数はどちらも受け付けます。
+
+ラッパーは 2 つあり、どちらも [`wakuwaku::entity`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/index.html) にあります。
+
+- [`BeforeWrite`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/struct.BeforeWrite.html) はフックを実行してからクエリを実行します。
+- [`AfterWrite`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/struct.AfterWrite.html) はクエリを実行し、成功したときだけフックを実行します。
+
+Spring ならアスペクトや JPA のエンティティリスナーを使う場面です。wakuwaku ではフックはハンドルを包む明示的なラッパー型であり、すべての書き込みクエリに対応しているかどうかがコンパイル時に検査されます。
+
+## フックの用途
+
+| 用途 | ラッパー | 補足 |
+|---|---|---|
+| 監査ログ | `AfterWrite` | 実際に起きた変更だけを記録する |
+| キャッシュ無効化 | `AfterWrite` | 変更されたキーのキャッシュを削除する。[Redis](/ja/docs/data/redis) を参照 |
+| 検索インデックスの同期 | `AfterWrite` | Meilisearch の `Indexer` をフックとして使う。[Meilisearch](/ja/docs/data/meilisearch) を参照 |
+| メトリクス、書き込み意図のログ | `BeforeWrite` | 書き込みが失敗しても実行される |
+| アウトボックスの中継 | `AfterWrite` | ベストエフォートのみ。下の注意を参照 |
+
+<Callout type="warn" title="フックは書き込みとアトミックではない">
+フックは、クエリがコミットされた後（または開始される前）に単独で実行されます。その間にプロセスがクラッシュすると、フックは実行されません。失われてはならない変更は、変更と同じ[トランザクション](/ja/docs/data/transactions)でアウトボックスに行を書き込み、そこから配信してください。フックは、検索インデックスの再構築やキャッシュエントリの期限切れのように、定期的な修復で取り戻せる処理に使います。
+</Callout>
+
+## 変更を記述する: `WriteQuery`
+
+フックが受け取るのはクエリそのものではなく、クエリが自分自身から作る**変更**（change）です。フック付きのハンドルを通るすべての書き込みクエリは [`WriteQuery`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/trait.WriteQuery.html) を実装します。複数のクエリが 1 つの変更型を共有できるので、1 つのフックでそれらすべてをまかなえます。
+
+[クエリとハンドル](/ja/docs/data/queries)のユーザーサービスを続けます。
+
+```rust title="src/hooks.rs"
+/// `users` への書き込みで何が変わったか。users へのすべての書き込みクエリで共有する
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserChanged {
+    pub ids: Vec<i64>,
+    pub action: &'static str,
+}
+
+impl WriteQuery for RenameUser {
+    type Change = UserChanged;
+
+    fn change(&self) -> UserChanged {
+        UserChanged { ids: vec![self.id], action: "rename" }
+    }
+}
+
+impl WriteQuery for DeactivateUsers {
+    type Change = UserChanged;
+
+    fn change(&self) -> UserChanged {
+        UserChanged { ids: self.ids.clone(), action: "deactivate" }
+    }
+}
+```
+
+<Callout type="info" title="変更はクエリの実行前に作られる">
+`change(&self)` が見られるのはクエリだけで、`AfterWrite` であってもクエリの実行前に呼ばれます。生成された ID や影響行数など、データベースが生み出す値は含められません。フックが現在の状態を必要とするなら、Meilisearch の `Indexer` と同じように、変更にはキーを持たせ、フックの中でキーから読み直します。新しい行の ID が必要なら、ID はアプリケーション側で生成してください。
+</Callout>
+
+## フックを書く
+
+フックは変更型の [`Processor`](https://docs.rs/kanau/latest/kanau/processor/trait.Processor.html) であれば何でもよく、出力とエラーも自由に決められます。次のフックは、プライマリへの専用のハンドルを使って、変更されたユーザーごとに監査行を 1 行書き込みます。
+
+```rust title="src/hooks.rs"
+/// `audit_log` テーブル
+pub struct AuditLog;
+impl Entity for AuditLog {}
+
+pub struct RecordAudit {
+    pub subject: i64,
+    pub action: &'static str,
+}
+
+impl Query for RecordAudit {
+    type Effect = Write<AuditLog>;
+}
+
+impl Execute<PgSource> for RecordAudit {
+    type Output = ();
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO audit_log (subject, action, at) VALUES ($1, $2, now())")
+            .bind(self.subject)
+            .bind(self.action)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+}
+
+/// 変更されたユーザーごとに監査行を 1 行書き込む
+#[derive(Clone)]
+pub struct AuditTrail {
+    db: Db<PgSource, ReadWrite>,
+}
+
+impl Processor<UserChanged> for AuditTrail {
+    type Output = ();
+    type Error = sqlx::Error;
+
+    async fn process(&self, change: UserChanged) -> Result<(), sqlx::Error> {
+        for subject in change.ids {
+            self.db.process(RecordAudit { subject, action: change.action }).await?;
+        }
+        Ok(())
+    }
+}
+```
+
+フックにはフック付きのハンドルではなく、素のハンドルを渡してください。そうすれば、フック自身の書き込みはフックを通りません。
+
+## フックのエラーを処理する
+
+フックがクエリの結果を変えることはありません。フックが失敗すると、そのエラーは**エラーハンドラ**に渡されます。エラーハンドラはフックのエラーを処理するプロセッサで、自身のエラー型は `Infallible` です。ログに書く、リトライする、後で処理するために保存するなど、失敗への対処はハンドラ自身が行います。ハンドラをジェネリックにすれば、すべてのフックで共用できます。
+
+```rust title="src/hooks.rs"
+/// エラーハンドラ。フックの失敗はここで止まり、呼び出し元には届かない
+#[derive(Clone)]
+pub struct LogHookError;
+
+impl<E: Display + Send + 'static> Processor<E> for LogHookError {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn process(&self, error: E) -> Result<(), std::convert::Infallible> {
+        eprintln!("write hook failed: {error}");
+        Ok(())
+    }
+}
+```
+
+実際のサービスでは `eprintln!` ではなく、使っているトレーシングの仕組みでログを書いてください。
+
+## フックを取り付ける
+
+`AfterWrite::new(inner, hook, on_error)` でハンドルをラップします。
+
+```rust title="src/hooks.rs"
+/// 監査付きのプライマリハンドル
+pub type AuditedPrimary = AfterWrite<Db<PgSource, ReadWrite>, AuditTrail, LogHookError>;
+
+pub fn audited(dbs: &Databases) -> AuditedPrimary {
+    let audit = AuditTrail { db: dbs.primary.clone() };
+    AfterWrite::new(dbs.primary.clone(), audit, LogHookError)
+}
+
+pub async fn use_it(dbs: &Databases) -> Result<(), sqlx::Error> {
+    let users = audited(dbs);
+
+    // 素のハンドルと同じ出力・同じエラー。そのまま置き換えられる
+    let renamed: bool = rename_user(&users, 7, "Haruki".into()).await?;
+
+    // 読み取りはフックに触れずに素通りする
+    let user: Option<UserRow> = users.process(FindUser { id: 7 }).await?;
+    println!("{renamed} {user:?}");
+    Ok(())
+}
+```
+
+ラッパーは `Clone` を derive しています。内側のハンドル、フック、エラーハンドラがすべて `Clone` なら、ラップしたハンドルも `Clone` になります。ほかのハンドルと同じように [`ServiceBuilder`](/ja/docs/core/service-builder) に登録したり、依存をまとめた構造体に入れたりできます。`AuditedPrimary` のような型エイリアスを用意すると、シグネチャが読みやすくなります。ラップされたハンドルには `inner()` でアクセスできます。
+
+## 実行順序とエラー
+
+| | `BeforeWrite` | `AfterWrite` |
+|---|---|---|
+| 順序 | 変更、フック、クエリ | 変更、クエリ、フック |
+| クエリが失敗した | フックは実行済み。呼び出し元にはクエリのエラーが返る | フックは実行されない。呼び出し元にはクエリのエラーが返る |
+| フックが失敗した | エラーハンドラが実行され、クエリはそのまま実行される | エラーハンドラが実行され、呼び出し元にはクエリの出力が返る |
+| 読み取りクエリ（`ReadKind`） | そのまま転送 | そのまま転送 |
+
+クエリが書き込みかどうかは、エフェクトの [`Kind`](/ja/docs/data#effects) で決まります。エフェクトが `()` のクエリも含め、読み取りはフックに届かず、`WriteQuery` を実装する必要もありません。
+
+フックは `process` の一部として await されるので、呼び出し元はフックの完了を待ちます。フックは軽く保つか、処理をほかへ渡してください。たとえば Meilisearch の `Indexer` には、Meilisearch が更新を反映するのをリクエストが待たないようにする `without_waiting()` モードがあります。
+
+## フックを重ねる
+
+ラッパーは、ほかのラッパーも含めて、クエリを処理できるものなら何でも包めます。実行前に書き込みを数える 2 つ目のフックは、失敗しません。
+
+```rust title="src/hooks.rs"
+/// これから実行される書き込みを数える。失敗しない
+#[derive(Clone, Default)]
+pub struct CountWrites(Arc<AtomicU64>);
+
+impl Processor<UserChanged> for CountWrites {
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    async fn process(&self, _: UserChanged) -> Result<(), std::convert::Infallible> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+```
+
+これを監査フックの内側に入れます。
+
+```rust title="src/hooks.rs"
+pub type Instrumented =
+    AfterWrite<BeforeWrite<Db<PgSource, ReadWrite>, CountWrites, LogHookError>, AuditTrail, LogHookError>;
+
+pub fn instrumented(dbs: &Databases, counter: CountWrites) -> Instrumented {
+    let counted = BeforeWrite::new(dbs.primary.clone(), counter, LogHookError);
+    AfterWrite::new(counted, AuditTrail { db: dbs.primary.clone() }, LogHookError)
+}
+```
+
+`LogHookError` はジェネリックで、`Infallible` も `Display` を実装しているので、`CountWrites` のエラーハンドラとしても使えます。書き込みでは、外側の `AfterWrite` がクエリを `BeforeWrite` に渡し、`BeforeWrite` が数えてから `Db` で実行します。クエリが成功すると監査フックが実行されます。`change()` は層ごとに 1 回ずつ呼ばれます。
+
+## コンパイラが検査すること
+
+**すべての書き込みクエリには変更が必要です。** `WriteQuery` を実装していない書き込みクエリは、フック付きのハンドルでは実行できません。
+
+```rust
+users.process(DeletePost { id: 1 }).await
+```
+
+```text
+error[E0277]: the trait bound `DeletePost: WriteQuery` is not satisfied
+   = note: required for `WriteKind` to implement `HookDispatch<DeletePost, Db<SqlxSource<Postgres>, ReadWrite>, AuditTrail, LogHookError>`
+   = note: required for `AfterWrite<Db<SqlxSource<Postgres>, ReadWrite>, AuditTrail, LogHookError>` to implement `Processor<DeletePost>`
+```
+
+**フックは変更を受け付けなければなりません。** `DeletePost` が自分を `PostChanged` として記述するなら、監査フックはそれも処理する必要があります。
+
+```text
+error[E0277]: the trait bound `AuditTrail: Processor<PostChanged>` is not satisfied
+```
+
+フックに `Processor<PostChanged>` を実装するか、投稿への書き込みを別のハンドルで実行してください。書き込みがフックを黙って素通りすることはありません。
+
+**ケイパビリティの検査はそのまま働きます。** ラッパーが `Processor<Q>` を実装するのは、内側のハンドルが実装している場合だけです。`Db<_, ReadOnly>` をラップしても書き込めるようにはなりません。
+
+## トランザクションは書き込みフックを通らない
+
+[トランザクション](/ja/docs/data/transactions)内のクエリはトランザクションのコネクションで実行されるので、`BeforeWrite` / `AfterWrite` を通りません。トランザクションに反応したいときは、`AfterTransaction` で最終状態にフックします。そのフックは、フローのレポートと、トランザクションがどうなったか（コミット、ロールバック、コミット結果不明）を受け取ります。2 つは組み合わせられます。`AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>` とすれば、単独で実行されるクエリとトランザクションの*両方*にフックできます。トランザクションのフックには `AfterWrite::inner()` で戻れます。
+
+## フックをテストする
+
+ラッパーはどんなプロセッサでも包めるので、データベースなしでフックの振る舞いをテストできます。`Db` の代わりにフェイクを、フックの代わりに記録用のプロセッサを置きます。
+
+```rust title="src/hooks.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+    use tokio::sync::Mutex;
+
+    /// データベースの代役
+    struct FakeUsers;
+
+    impl Processor<RenameUser> for FakeUsers {
+        type Output = u64;
+        type Error = &'static str;
+
+        async fn process(&self, query: RenameUser) -> Result<u64, &'static str> {
+            if query.id == 0 { Err("no such user") } else { Ok(1) }
+        }
+    }
+
+    /// 受け取った変更をすべて記録する
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<UserChanged>>);
+
+    impl Processor<UserChanged> for Recorder {
+        type Output = ();
+        type Error = Infallible;
+
+        async fn process(&self, change: UserChanged) -> Result<(), Infallible> {
+            self.0.lock().await.push(change);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_runs_only_after_successful_writes() {
+        let recorder = Recorder::default();
+        let users = AfterWrite::new(FakeUsers, &recorder, LogHookError);
+
+        assert_eq!(users.process(RenameUser { id: 7, name: "Haruki".into() }).await, Ok(1));
+        assert_eq!(users.process(RenameUser { id: 0, name: "Nobody".into() }).await, Err("no such user"));
+
+        let seen = recorder.0.lock().await;
+        assert_eq!(*seen, [UserChanged { ids: vec![7], action: "rename" }]);
+    }
+}
+```
+
+kanau はプロセッサへの参照にも `Processor` を実装しているので、`&recorder` をそのままフックとして渡せます。フック本体（`AuditTrail`）もプロセッサなので、単体でテストできます。[テスト](/ja/docs/core/testing)を参照してください。
+
+## 次のステップ
+
+<Cards>
+  <Card title="トランザクション" href="/ja/docs/data/transactions" description="複数クエリのアトミックな書き込みと、AfterTransaction フック。" />
+  <Card title="Meilisearch" href="/ja/docs/data/meilisearch" description="AfterWrite フックで検索インデックスを同期させます。" />
+  <Card title="Redis" href="/ja/docs/data/redis" description="フックから無効化するキャッシュ。" />
+</Cards>

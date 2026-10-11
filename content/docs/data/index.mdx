@@ -1,0 +1,146 @@
+---
+title: Data Access
+description: Capability-typed data access, where every query declares what it reads and writes and the compiler checks that the handle running it may do so.
+icon: Database
+---
+
+wakuwaku's data layer lives in `wakuwaku::entity` (the `wakuwaku-entity` crate). It runs on PostgreSQL and MySQL through sqlx, on Redis, and on Meilisearch. The same three ideas apply to all of them:
+
+1. **Queries are values.** A query is a plain struct such as `FindUser { id: 7 }` that describes one operation. It is not a method on a repository object.
+2. **Handles are processors.** A [`Db<S, C>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html) handle implements kanau's `Processor<Q>` for every query `Q` it may run, so running a query is `db.process(query).await`. Cron jobs and event handlers use the same trait. Hooks, transactions and test doubles all build on it.
+3. **Capability types must cover effects.** Each query declares its `Effect`, the entities it reads and writes. Each handle carries a capability type `C`. `Db<S, C>` implements `Processor<Q>` only when `C: Covers<Q::Effect>`. If a write query is sent to a read-only handle, the program doesn't compile.
+
+<CapabilityDiagram lang="en" />
+
+In Spring you would usually split reads and writes with `@Transactional(readOnly = true)` and a routing `DataSource` that picks the replica at runtime. If the routing is wrong, you find out from an error raised by the replica. wakuwaku puts the routing decision in the handle's type, so a handler wired to the replica handle can't issue a write query at all.
+
+## Entities
+
+An [`Entity`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/markers/trait.Entity.html) is a name at the type level for something a query can read or write: a table, a Redis key space, a search index.
+
+```rust title="src/entities.rs"
+use wakuwaku::entity::Entity;
+
+/// The `users` table.
+pub struct User;
+impl Entity for User {}
+
+/// The `posts` table.
+pub struct Post;
+impl Entity for Post {}
+```
+
+Entity types are never constructed, and they aren't tied to a data source. The same `User` can live in PostgreSQL and be cached in Redis. Choose whatever granularity you want the compiler to check. One entity per table is a good default.
+
+## Capabilities
+
+A capability is a type that is never constructed. It describes what a handle may do through two marker traits:
+
+| Trait | Meaning |
+|---|---|
+| `CanRead<E>` | may run queries that read `E` |
+| `CanWrite<E>` | may run queries that write `E`; it requires `CanRead<E>`, because writing implies reading |
+
+Two capabilities come with the crate, and both cover every entity:
+
+| Capability | Reads | Writes | Typical use |
+|---|---|---|---|
+| `ReadOnly` | every entity | none | a handle connected to a read replica |
+| `ReadWrite` | every entity | every entity | a handle connected to the primary |
+
+When a component may write only some entities, define your own capability by implementing the markers:
+
+```rust title="src/overview.rs"
+use wakuwaku::entity::{CanRead, CanWrite, Covers, Entity, Read, ReadOnly, ReadWrite, Write};
+
+pub struct Order;
+impl Entity for Order {}
+
+pub struct AuditLog;
+impl Entity for AuditLog {}
+
+/// Reads everything, writes only the audit log.
+pub enum Auditor {}
+impl<E: Entity> CanRead<E> for Auditor {}
+impl CanWrite<AuditLog> for Auditor {}
+```
+
+A `Db<_, Auditor>` handle can run any read query and any query that writes only `AuditLog`. A query that writes `Order` fails to compile on it.
+
+## Effects
+
+A query's `Effect` is a type-level set of entity accesses:
+
+| Effect | Meaning | Kind |
+|---|---|---|
+| `Read<E>` | reads `E` | `ReadKind` |
+| `Write<E>` | writes `E` | `WriteKind` |
+| `()` | touches nothing (`SELECT 1`, `PING`) | `ReadKind` |
+| `(A, B, …)` | the union of its elements; up to 12 elements, and tuples nest | `WriteKind` if any element writes |
+
+Every effect has a [`Kind`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/io/trait.Kind.html): `WriteKind` if it writes anything, `ReadKind` otherwise. The kind decides whether [write hooks](/en/docs/data/hooks) run for a query and whether a [transaction](/en/docs/data/transactions) starts as read-only.
+
+`C: Covers<X>` holds when the capability `C` has the `CanRead` / `CanWrite` marker for every access in `X`. It is implemented automatically from the markers; don't implement it by hand. You can use it to state facts about your capabilities as compile-time assertions:
+
+```rust title="src/overview.rs"
+// Compile-time checks of which capability covers which effect.
+fn covers<C: Covers<X>, X>() {}
+
+pub fn checks() {
+    covers::<ReadOnly, (Read<Order>, Read<AuditLog>)>();
+    covers::<ReadWrite, (Read<Order>, Write<Order>)>();
+    covers::<Auditor, (Read<Order>, Write<AuditLog>)>();
+    covers::<ReadOnly, ()>();
+    // Nested tuples are unions too.
+    covers::<Auditor, ((Read<Order>,), (Read<AuditLog>, Write<AuditLog>))>();
+}
+```
+
+Adding `covers::<ReadOnly, Write<Order>>()` to that list would fail to compile.
+
+## What the types prove, and what they don't
+
+The capability check proves **routing**: code wired to a `Db<_, ReadOnly>` never issues a query that is *declared* as a write. Some things are outside what the compiler can see:
+
+- **The declaration itself.** The SQL inside a query is not checked against its `Effect`. A query declared as `Read<User>` that runs an `UPDATE` compiles fine. Declare every entity the statement touches.
+- **Where the connection points.** `Db::new` takes the capability from the type you write. It can't know whether the pool behind it is connected to a primary or a replica. Only build a capability that writes from a source connected to a writable database, and do the wiring in one place.
+
+<Callout type="warn" title="Keep the database's own guard on replicas">
+Because a query declared as a read might still write, keep the database's own protection in place. A PostgreSQL hot standby rejects writes. On a primary, a role used for read-only access can get the same protection:
+
+```sql
+ALTER ROLE app_reader SET default_transaction_read_only = on;
+```
+</Callout>
+
+The check can't be bypassed through the handle. `Db` keeps its data source private, and the sqlx source keeps its pool private, so the only way to run something is a query whose effect the capability covers. Run migrations and other setup on the pool *before* you wrap it.
+
+## Features
+
+Turn on the data sources you need as `wakuwaku` features. Each one enables the `entity` module.
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+```
+
+| Feature | Data source | Third-party crate | Guide |
+|---|---|---|---|
+| `entity` | none: entities, effects, queries, `Db`, hooks | | this section |
+| `sqlx-pg` | `entity::sqlx::backend::PgSource` | `wakuwaku::deps::sqlx` | [sqlx](/en/docs/data/sqlx), [Transactions](/en/docs/data/transactions) |
+| `sqlx-mysql` | `entity::sqlx::backend::MySqlSource` | `wakuwaku::deps::sqlx` | [sqlx](/en/docs/data/sqlx), [Transactions](/en/docs/data/transactions) |
+| `redis` | `entity::redis::RedisSource` | `wakuwaku::deps::redis` | [Redis](/en/docs/data/redis) |
+| `meilisearch` | `entity::meilisearch::MeiliSource` | `wakuwaku::deps::meilisearch_sdk` | [Meilisearch](/en/docs/data/meilisearch) |
+
+`entity` alone is useful for a crate that only defines entities and queries, or for implementing your own `DataSource`. Import the third-party crates through `wakuwaku::deps` so their versions always match the ones wakuwaku was built against.
+
+## In this section
+
+<Cards>
+  <Card title="Queries and handles" href="/en/docs/data/queries" description="Define queries, build Db handles, route reads to a replica, and inject handles into components." />
+  <Card title="Write hooks" href="/en/docs/data/hooks" description="Audit, invalidate caches, and sync search indexes around every write." />
+  <Card title="sqlx" href="/en/docs/data/sqlx" description="PostgreSQL and MySQL data sources." />
+  <Card title="Transactions" href="/en/docs/data/transactions" description="Transactions written as pure state machines." />
+  <Card title="Redis" href="/en/docs/data/redis" description="Caches, locks, rate limiters, and live structures." />
+  <Card title="Meilisearch" href="/en/docs/data/meilisearch" description="Search indexes as entities, kept in sync with their source." />
+</Cards>

@@ -1,0 +1,296 @@
+---
+title: Service builder
+description: Register shared dependencies in a type-level registry, build every component from it, and let the compiler check that nothing is missing.
+icon: Boxes
+---
+
+Every wakuwaku service starts with a [`ServiceBuilder`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html): a registry of the dependencies your components share, such as database handles, clients, and configuration. Cron jobs, event handlers, and gRPC services are then built from it.
+
+If you know Spring, the builder plays the role of the application context, with two differences. Dependencies are looked up by type **while compiling**, not when the application starts. And there is no scanning, no annotations, and no proxies: you register values explicitly, and each component says which one it is built from.
+
+<ServiceBuilderDiagram lang="en" />
+
+## Registering and looking up
+
+`ServiceBuilder::new` registers the first value, `push` registers each further one, and `provide` borrows a registered value by its type:
+
+```rust title="src/main.rs"
+use wakuwaku::ServiceBuilder;
+
+#[derive(Clone)]
+pub struct AppConfig {
+    pub grpc_addr: SocketAddr,
+}
+
+pub fn basics() {
+    let services = ServiceBuilder::new(AppConfig { grpc_addr: "[::]:50051".parse().unwrap() })
+        .push(AccountStore::default())
+        .push(Mailer::default());
+
+    let config: &AppConfig = services.provide::<AppConfig, _>();
+    let mailer: &Mailer = services.provide::<Mailer, _>();
+    let _ = (config, mailer);
+}
+```
+
+The second type parameter of `provide` is the *position* of the value in the builder. Pass `_` and the compiler infers it, as long as the type is registered exactly once.
+
+### How it works
+
+Each `push` wraps the builder in a new node, so the builder above has the type
+
+```rust
+ServiceBuilder<Mailer, ServiceBuilder<AccountStore, ServiceBuilder<AppConfig>>>
+```
+
+The registry is a linked list at the type level. Positions are counted from the most recent push: [`Here`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.Here.html) is the head (`Mailer`), `There<Here>` is one step back (`AccountStore`), `There<There<Here>>` is `AppConfig`. A lookup is the trait bound [`ProvideAt<T, Position>`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/trait.ProvideAt.html), which is implemented only at the positions where a `T` is stored. Resolving it is the trait solver's job. There is no `Any`, no downcasting, and no hash map at run time; `provide` compiles to a field access.
+
+The consequence is the important part: asking for a type that was never registered **does not compile** (see [below](#reading-the-compile-errors)).
+
+## Building components: `ServiceCreation`
+
+A component does not look its dependencies up itself. It declares the one registered type it is built from by implementing [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html):
+
+```rust
+pub trait ServiceCreation {
+    type Dep: Clone;
+
+    fn create_service(dep: Self::Dep) -> Self;
+}
+```
+
+```rust title="src/components.rs"
+pub struct ExpireSessions {
+    sessions: SessionStore,
+}
+
+impl ServiceCreation for ExpireSessions {
+    type Dep = SessionStore;
+    fn create_service(sessions: SessionStore) -> Self {
+        Self { sessions }
+    }
+}
+```
+
+When you register the component, the builder finds `Dep` by type, clones it, and passes the clone to `create_service`. That is why `Dep` must be `Clone`, and why it should be **cheap** to clone: a handle that shares the underlying resource, not the resource itself. Good `Dep` types are:
+
+- `Db<S, C>` handles of `wakuwaku::entity` (their sources wrap pools or multiplexed connections);
+- `sqlx::Pool`, `redis::aio::MultiplexedConnection`, `Arc<IggyClient>`, and other pool or client handles;
+- your own state behind an `Arc`, like the `SessionStore` used on these pages:
+
+```rust title="src/components.rs"
+/// Login sessions and when they expire.
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    expires_at: Arc<Mutex<HashMap<String, SystemTime>>>,
+}
+```
+
+<Callout type="info" title="Each component gets its own clone">
+Every component built from the same `Dep` receives a separate clone, taken once, when the component is registered. Shared state must therefore live behind the handle (an `Arc`, a pool), so that all clones see it.
+</Callout>
+
+### Several dependencies in one struct
+
+`Dep` is a single type. When a component needs more than one dependency, register a struct (or a tuple) that groups them and use it as `Dep`:
+
+```rust title="src/billing.rs"
+/// Everything the billing components need, registered as one value.
+#[derive(Clone)]
+pub struct BillingDeps {
+    pub accounts: AccountStore,
+    pub mailer: Mailer,
+}
+
+pub struct SendInvoices {
+    deps: BillingDeps,
+}
+
+impl ServiceCreation for SendInvoices {
+    type Dep = BillingDeps;
+    fn create_service(deps: BillingDeps) -> Self {
+        Self { deps }
+    }
+}
+```
+
+```rust title="src/main.rs"
+let accounts = AccountStore::default();
+let mailer = Mailer::default();
+
+let (_services, cron) = ServiceBuilder::new(accounts.clone())
+    .push(mailer.clone())
+    .push(BillingDeps { accounts, mailer })
+    .cron_job::<SendInvoices, _>()
+    .start();
+```
+
+The parts are still registered on their own here, so other components can be built from just an `AccountStore` or just a `Mailer`. Because the parts are handles, `BillingDeps` shares their state.
+
+## Register centers take the builder and give it back
+
+Each kind of component has a *register center*: a type-level list of components, filled from the builder. You enter one with a method on `ServiceBuilder`, chain more registrations, and finish with a method that hands the builder back:
+
+| Component | Start with | Chain | Finish with | You get back |
+|---|---|---|---|---|
+| Cron job | `.cron_job::<Job, _>()` | `.cron_job::<Job, _>()` | `.start()` | `(ServiceBuilder, CronRuntime)` |
+| Event handler | `.iggy_consumer::<Handler, _, _>()` | `.iggy_consumer::<Handler, _, _>()` | `.start(client, config).await?` | `(ServiceBuilder, ConsumerRuntime)` |
+| gRPC service | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)` | same | `.into_router_fn()` | `(ServiceBuilder, impl FnOnce(Router<L>) -> Router<L>)` |
+| any of them | | | `.into_parts()` | `(ServiceBuilder, the unstarted register center)` |
+
+Every registration method takes the builder **by value** and stores it in the returned register-center builder (as its public `builder` field), so the next registration can look up its dependency too. The finishing method returns it, and you pass it on to the next kind of component:
+
+```rust title="src/main.rs"
+let services = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .push(Mailer::default());
+
+let (services, consumers) = services
+    .iggy_consumer::<SendWelcomeMail, _, _>()
+    .start(iggy.clone(), ConsumerConfig::new("shop", "accounts", vec![0]))
+    .await?;
+
+let (services, add_grpc) = services
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .into_router_fn();
+
+let (_services, cron) = services.cron_job::<ExpireSessions, _>().start();
+```
+
+Components are created **eagerly**, at the registration call: that is when `Dep` is cloned and `create_service` runs. The complete program, including the order in which these steps should run and how to stop everything, is on the [Lifecycle](/en/docs/core/lifecycle) page. Details of each register center are on [Cron jobs](/en/docs/services/cron-jobs), [gRPC](/en/docs/services/grpc), and [Consuming events](/en/docs/events/consuming).
+
+`into_parts` is the escape hatch: it returns the builder and the register center separately, so you can `push` a component you built by hand onto the list before starting it.
+
+## Duplicate types
+
+Registering two values of the same type is allowed, but `_` can no longer pick one, so name the position with `Here` and `There`:
+
+```rust
+use wakuwaku::services::builder::{Here, There};
+
+#[derive(Clone)]
+pub struct HttpClient {
+    pub base_url: &'static str,
+}
+
+let services = ServiceBuilder::new(HttpClient { base_url: "https://payments.example" })
+    .push(HttpClient { base_url: "https://mail.example" });
+
+// `Here` is the most recent push; each `There` steps one push back.
+let mail = services.provide::<HttpClient, Here>();
+let payments = services.provide::<HttpClient, There<Here>>();
+```
+
+Registration methods take the same position parameter:
+
+```rust
+let (_services, cron) = ServiceBuilder::new(HttpClient { base_url: "https://payments.example" })
+    .push(HttpClient { base_url: "https://mail.example" })
+    .cron_job::<PingPayments, There<Here>>() // the payments client
+    .start();
+```
+
+Positions shift whenever you add a `push`, so in application code prefer giving each role its own type. A newtype costs nothing and keeps `_` working:
+
+```rust
+#[derive(Clone)]
+pub struct PaymentsClient(pub HttpClient);
+
+#[derive(Clone)]
+pub struct MailClient(pub HttpClient);
+
+let services = ServiceBuilder::new(PaymentsClient(HttpClient { base_url: "https://payments.example" }))
+    .push(MailClient(HttpClient { base_url: "https://mail.example" }));
+
+let payments = services.provide::<PaymentsClient, _>();
+```
+
+Handles that differ in their type parameters are different types already: a `Db<PgSource, ReadOnly>` for the replica and a `Db<PgSource, ReadWrite>` for the primary can both be registered and looked up with `_`.
+
+## Writing generic code with `ProvideAt`
+
+Functions that only need *some* builder containing a type can be generic over the builder. Bound it with `ProvideAt` and a position parameter; callers never name the position:
+
+```rust title="src/config.rs"
+use wakuwaku::services::builder::{ProvideAt, ServiceBuilderPosition};
+
+/// Works with any builder that has exactly one `AppConfig` somewhere in it.
+pub fn grpc_addr<S, I>(services: &S) -> SocketAddr
+where
+    S: ProvideAt<AppConfig, I>,
+    I: ServiceBuilderPosition,
+{
+    services.provide_at().grpc_addr
+}
+```
+
+A function can also register a group of dependencies on top of any builder, which is a convenient way to split wiring into modules (similar in spirit to a Spring `@Configuration` class):
+
+```rust title="src/sessions.rs"
+/// Registers the session infrastructure on top of any builder.
+pub fn with_sessions<H, C>(
+    services: ServiceBuilder<H, C>,
+) -> ServiceBuilder<Mailer, ServiceBuilder<SessionStore, ServiceBuilder<H, C>>> {
+    services.push(SessionStore::default()).push(Mailer::default())
+}
+```
+
+```rust title="src/main.rs"
+let services = with_sessions(ServiceBuilder::new(AppConfig {
+    grpc_addr: "[::]:50051".parse().unwrap(),
+}));
+let addr = grpc_addr(&services);
+```
+
+## Reading the compile errors
+
+The two errors you will meet are short once you know what they mean. Both outputs below are real, with paths and `help:` lists trimmed.
+
+**A dependency that was never registered.** Here `ExpireSessions` needs a `SessionStore`, but only a `Mailer` was registered:
+
+```rust
+let (_services, cron) = ServiceBuilder::new(Mailer) // no SessionStore registered
+    .cron_job::<ExpireSessions, _>()
+    .start();
+```
+
+```text
+error[E0277]: the trait bound `(): ProvideAt<SessionStore, _>` is not satisfied
+   |
+37 |         .cron_job::<ExpireSessions, _>()
+   |          ^^^^^^^^ the trait `ProvideAt<SessionStore, _>` is not implemented for `()`
+   |
+   = note: required for `ServiceBuilder<Mailer>` to implement `ProvideAt<SessionStore, There<_>>`
+note: required by a bound in `ServiceBuilder::<Head, Chain>::cron_job`
+```
+
+Read it as "the search for `SessionStore` reached `()`, the end of the list". The first type in `ProvideAt<…>` is the missing dependency. `provide::<Mailer, _>()` on a builder without a `Mailer` produces the same error.
+
+**An ambiguous lookup.** Two values of the same type are registered and `_` is used:
+
+```rust
+#[derive(Clone)]
+struct Db(&'static str);
+
+let services = ServiceBuilder::new(Db("primary")).push(Db("replica"));
+let _db: &Db = services.provide::<Db, _>();
+```
+
+```text
+error[E0283]: type annotations needed
+  |
+8 |     let _db: &Db = services.provide::<Db, _>();
+  |                             -------       ^ cannot infer type of the type parameter `I` declared on the method `provide`
+  |
+  = note: multiple `impl`s satisfying `ServiceBuilder<Db, ServiceBuilder<Db>>: ProvideAt<Db, _>` found in the `wakuwaku` crate:
+          - impl<Head, T, Chain, I> ProvideAt<T, There<I>> for ServiceBuilder<Head, Chain>
+          - impl<T, Chain> ProvideAt<T, Here> for ServiceBuilder<T, Chain>;
+```
+
+Fix it with an explicit position or, better, a [newtype](#duplicate-types).
+
+<Cards>
+  <Card title="Lifecycle" href="/en/docs/core/lifecycle" description="Compose cron jobs, consumers and gRPC servers from one builder in main." />
+  <Card title="Testing" href="/en/docs/core/testing" description="Build components with create_service and test them directly." />
+  <Card title="Proof-driven programming" href="/en/docs/core/proof-driven" description="What else the compiler checks for you." />
+</Cards>

@@ -1,0 +1,159 @@
+---
+title: Caches
+description: Store typed bodies with a TTL in Redis, and revalidate copies by their BLAKE3 hash without downloading the body.
+icon: HardDrive
+---
+
+A cache keeps the result of an expensive read close at hand for a while. wakuwaku has two caches in [`collection::cache`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/cache/index.html):
+
+- `Cache<N, B>`: a body `B` per name `N`, each expiring a fixed TTL after it was put.
+- `HashedCache<N, B>`: the same, plus the BLAKE3 hash of each body, so a reader that already holds a copy can check it without downloading the body.
+
+Both are `Copy` values, usually declared as `const`, and their methods build queries for a [`Db`](/en/docs/data/redis). Compared with Spring's `@Cacheable`, there is no proxy and no annotation: the cache is a value, reading it is an explicit query, and the capability of the handle decides who may fill it.
+
+## Bodies
+
+A body is any type implementing kanau's `MessageSer` (to put it) and `MessageDe` (to get it). The JSON derives are the simplest choice (see [Setup](/en/docs/data/redis#setup) for the `Cargo.toml` lines):
+
+```rust title="src/profile.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Profile {
+    pub name: String,
+    pub avatar: Option<String>,
+}
+```
+
+## Cache-aside with `Cache`
+
+`Cache::new(namespace, ttl)` declares the cache. `get` outputs `Option<B>`, `put` stores a body and restarts its TTL, and `remove` outputs whether a body was present.
+
+```rust title="src/profile.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::cache::Cache;
+
+pub const PROFILES: Cache<u64, Profile> = Cache::new("profile", Duration::from_secs(300));
+
+pub async fn load_profile(redis: &Redis, user: u64) -> RedisResult<Profile> {
+    if let Some(profile) = redis.process(PROFILES.get(&user)).await? {
+        return Ok(profile);
+    }
+    let profile = fetch_profile_from_database(user).await;
+    redis.process(PROFILES.put(&user, profile.clone())).await?;
+    Ok(profile)
+}
+
+pub async fn rename(redis: &Redis, user: u64, name: String) -> RedisResult<()> {
+    update_name_in_database(user, name).await;
+    // The next `load_profile` reads the new name from the database.
+    redis.process(PROFILES.remove(&user)).await?;
+    Ok(())
+}
+```
+
+`Redis` is the `Db<RedisSource, ReadWrite>` alias from [Connecting](/en/docs/data/redis#connecting).
+
+### In Redis
+
+Each item is one string key, `@@wakuwaku-entity:Cache:profile:7`, written with `SET … PX <ttl>`. A TTL under a millisecond counts as one. Expiry is Redis' own, so a body is gone exactly one TTL after its last `put`, whether or not it was read; reads don't extend it.
+
+### Keeping handlers generic
+
+Handlers that only read from the cache can stay generic over the handle and list the query they need. The capability is then checked once, where the handle is wired in, and a unit test can pass a fake:
+
+```rust
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisError;
+use wakuwaku::entity::redis::collection::cache::CacheGet;
+
+pub async fn cached_name<D>(redis: &D, user: u64) -> Result<Option<String>, RedisError>
+where
+    D: Processor<CacheGet<u64, Profile>, Output = Option<Profile>, Error = RedisError>,
+{
+    let profile = redis.process(PROFILES.get(&user)).await?;
+    Ok(profile.map(|profile| profile.name))
+}
+```
+
+## Revalidating with `HashedCache`
+
+A `HashedCache` stores each body with its BLAKE3 hash. Besides `get` (body and hash) it has:
+
+- `hash(name)`: only the 32-byte hash, `None` if absent.
+- `get_if_changed(name, known)`: compares `known` with the stored hash inside Redis and transfers the body only if they differ. It outputs a `Freshness`: `Missing`, `Unchanged` or `Changed(Hashed { body, hash })`.
+
+`put` outputs the hash it stored. This maps directly onto HTTP's `ETag` / `If-None-Match`:
+
+```rust title="src/pages.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Page {
+    pub html: String,
+}
+
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::collection::cache::{Freshness, Hash, HashedCache};
+
+pub const RENDERED: HashedCache<str, Page> =
+    HashedCache::new("rendered-page", Duration::from_secs(3600));
+
+pub enum Reply {
+    NotModified,
+    Page { html: String, etag: String },
+    NotFound,
+}
+
+pub async fn serve(redis: &Redis, path: &str, if_none_match: Option<&str>) -> RedisResult<Reply> {
+    let known = if_none_match.and_then(|etag| Hash::from_hex(etag).ok());
+    let Some(known) = known else {
+        // The client holds no copy: download the body.
+        return Ok(match redis.process(RENDERED.get(path)).await? {
+            Some(page) => Reply::Page { html: page.body.html, etag: page.hash.to_hex().to_string() },
+            None => Reply::NotFound,
+        });
+    };
+    Ok(match redis.process(RENDERED.get_if_changed(path, known)).await? {
+        Freshness::Unchanged => Reply::NotModified,
+        Freshness::Changed(page) => Reply::Page {
+            html: page.body.html,
+            etag: page.hash.to_hex().to_string(),
+        },
+        Freshness::Missing => Reply::NotFound,
+    })
+}
+
+pub async fn publish(redis: &Redis, path: &str, html: String) -> RedisResult<Hash> {
+    redis.process(RENDERED.put(path, Page { html })).await
+}
+```
+
+The same pattern saves bandwidth between services: a replica that keeps a large body in memory asks `get_if_changed` with the hash of its copy, and gets the body back only when someone published a new one.
+
+### In Redis
+
+Each item is a Redis hash `@@wakuwaku-entity:HashedCache:<namespace>:<name>` with the fields `body` and `hash`. `put` writes both fields and the expiry in one `MULTI` block, so readers never see a body with a stale hash. `get_if_changed` is a Lua script, so the comparison and the read happen atomically. The hash is computed over the serialized bytes, so two bodies that serialize identically have the same hash.
+
+## Pitfalls
+
+<Callout type="warn" title="Cache-aside races">
+  `get`, then a database read, then `put` is not atomic. A writer that updates the database and calls `remove` between a reader's database read and its `put` lets the reader store a stale body, which then lives for a whole TTL. Keep TTLs short enough for that to be acceptable, or serialize writers of the same item with a [lock](/en/docs/data/redis/lock).
+</Callout>
+
+- **Namespaces.** Two caches of the same kind with the same namespace share keys; a `Cache` and a `HashedCache` never collide because the kind is part of the key.
+- **Schema changes.** A body written by an older version of your service may fail to deserialize after you change `B`. The query then fails with a "failed to deserialize a stored body" `RedisError`. Either keep the format compatible or change the namespace when you change the type.
+- **Errors are not misses.** `get` outputs `Ok(None)` for a missing body and `Err` when Redis is unreachable. Decide explicitly whether your service falls back to the database or fails when Redis is down.
+
+## Next steps
+
+<Cards>
+  <Card title="Locks" href="/en/docs/data/redis/lock" description="Serialize writers of the same item across replicas." />
+  <Card title="Live views" href="/en/docs/data/redis/live-view" description="When readers must follow every change instead of polling a cache." />
+</Cards>

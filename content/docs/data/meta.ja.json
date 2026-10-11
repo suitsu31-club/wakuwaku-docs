@@ -1,0 +1,13 @@
+{
+  "title": "データアクセス",
+  "icon": "Database",
+  "pages": [
+    "index",
+    "queries",
+    "hooks",
+    "sqlx",
+    "transactions",
+    "redis",
+    "meilisearch"
+  ]
+}

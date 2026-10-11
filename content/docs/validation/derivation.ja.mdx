@@ -1,0 +1,177 @@
+---
+title: 証明の導出
+description: ブール代数の法則を使い、再チェックせずに証明を同値な、またはより弱い証明に変換します。
+icon: Workflow
+---
+
+関数は自分の要件を自分の形で表します。ある関数は `Proven<String, ShortEnough>` を、別の関数は `Proven<String, And<ShortEnough, NonEmpty>>` を要求します。それ以上に強い証明をすでに持っているなら、チェックを再実行する必要はないはずですし、I/O を行う述語では再実行する余裕がないことも多いでしょう。[`Proven::derive`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html#method.derive) は論理法則に沿って証明を変換します。I/O を行わず、失敗せず、コンテキストも必要ありません。
+
+このページでは [概要](/ja/docs/validation) の `NonEmpty`、`ShortEnough`、`ValidUsername = And<NonEmpty, ShortEnough>` を使います。
+
+## 証明を弱める [#weakening-a-proof]
+
+最もよくあるのは、より強い証明を、より少ない要件の関数や、同じ事実を別の並びで要求する関数に渡したい場面です。
+
+```rust title="src/derivation.rs"
+use wakuwaku::proof::{And, Or, Proven};
+
+/// 長さのルールだけが必要
+pub fn reserve_buffer(name: &Proven<String, ShortEnough>) -> usize {
+    name.evidence().spare
+}
+
+/// 同じ事実を逆の順序で要求する
+pub fn audit(name: Proven<String, And<ShortEnough, NonEmpty>>) -> String {
+    name.subject().clone()
+}
+
+/// どちらかの事実があればよい
+pub fn greet(name: Proven<String, Or<NonEmpty, ShortEnough>>) -> String {
+    format!("hello, {}", name.subject())
+}
+
+pub fn reserve(name: Proven<String, ValidUsername>) -> usize {
+    // A ∧ B ⇒ B: 除去。固有メソッドで行う
+    reserve_buffer(&name.into_b())
+}
+
+pub fn log_signup(name: Proven<String, ValidUsername>) -> String {
+    // `Commute` による A ∧ B ⇒ B ∧ A。変換先の型は `audit` のシグネチャから決まる
+    audit(name.derive())
+}
+
+pub fn welcome(name: Proven<String, ValidUsername>) -> String {
+    // A ∧ B ⇒ A のあと A ⇒ A ∨ B: 除去と導入
+    greet(Proven::from_a(name.into_a()))
+}
+```
+
+どの変換も証明を消費し、同じ対象についての新しい証明を返します。`Proven` は `Clone` ではないので、1 つの証明は 1 つの経路でしか使えません。独立した 2 つの証明が必要なら、もう一度証明してください。
+
+## 除去と導入 [#elimination-and-introduction]
+
+オペランドを落としたり加えたりするのは `derive` ではなく、`Proven` の固有メソッドです。
+
+| 規則 | メソッド |
+| --- | --- |
+| `A ∧ B ⇒ A`、`A ∧ B ⇒ B` | `proof.into_a()`、`proof.into_b()`。もう一方の証拠は破棄される。 |
+| `A ⇒ A ∨ B`、`B ⇒ A ∨ B` | `Proven::from_a(proof)`、`Proven::from_b(proof)`。証拠は `Or::Left` / `Or::Right`。 |
+| `A`、`B` ⇒ `A ∧ B` | `Proven::from_both(a, b)`。`T: Eq` と等しい対象が必要 ([述語の合成](/ja/docs/validation/composition#cheap-checks-before-io) を参照)。 |
+
+## 法則 [#the-laws]
+
+それ以外の変換はすべて [`TermDerive<P, T, R>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.TermDerive.html) を通ります。意味は「`T` について `Self` が成り立つなら、法則 `R` により `P` も成り立つ」です。規則型 `R` は [`wakuwaku::proof::boolean_algebra`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/boolean_algebra/index.html) にあります。表中の `∧` は `And`、`∨` は `Or` で、`⇔` はそれぞれ方向ごとに 1 つずつ、計 2 つの impl です。
+
+| `R` | 法則 |
+| --- | --- |
+| `Commute` | `A ∧ B ⇒ B ∧ A`、`A ∨ B ⇒ B ∨ A` |
+| `Associate` | `(A ∧ B) ∧ C ⇔ A ∧ (B ∧ C)`、`(A ∨ B) ∨ C ⇔ A ∨ (B ∨ C)` |
+| `Idempotence` | `A ∧ A ⇔ A`、`A ∨ A ⇔ A` |
+| `Absorb` | `A ∧ (A ∨ B) ⇔ A`、`A ∨ (A ∧ B) ⇔ A` |
+| `Distribute` | `A ∧ (B ∨ C) ⇔ (A ∧ B) ∨ (A ∧ C)`、`A ∨ (B ∧ C) ⇔ (A ∨ B) ∧ (A ∨ C)` |
+
+`Commute` は結合子ごとに 1 つの impl で、2 回適用すると元に戻ります。`Absorb` の `⇐` 方向 (`A ⇒ A ∧ (A ∨ B)`、`A ⇒ A ∨ (A ∧ B)`) では `B` は任意で、変換先の型によって決まります。
+
+**用意されていない** もの:
+
+- **否定。** 否定の述語がないので、補元を含む法則 (ド・モルガンの法則、排中律) はありません。
+- **オペランド内部の書き換え。** 法則は命題全体を書き換えます。`And` の左半分をそのままにして右半分だけに `Commute` を適用する規則はありません。
+- **チェックできない命題からの導出。** `Self` 自体が `Predicate<T>` を実装している必要があるので、法則を適用できるのは変換元のオペランドのコンテキストが互換性を持つ場合だけです ([コンテキストの組み合わせ](/ja/docs/validation/composition#mixing-contexts) を参照)。変換先はチェックできなくても構いません。
+
+## derive の呼び出し方 [#calling-derive]
+
+`derive` には変換先 `Q` と法則 `R` の 2 つの型パラメーターがあります。通常はどちらも推論されます。変換先は結果の行き先から、法則は変換元と変換先の型から決まります。変換先を明示したいときは `proof.derive::<Q, _>()` と書きます。
+
+### 法則を指定する [#naming-the-law]
+
+複数の法則が当てはまることがあります。`Commute` と `Associate` はどちらも `(A ∧ A) ∧ A` を `A ∧ (A ∧ A)` に変換するため、コンパイラは選べません。
+
+```rust
+let name: Proven<String, And<NonEmpty, And<NonEmpty, NonEmpty>>> = name.derive();
+// error[E0283]: type annotations needed
+//   multiple `impl`s satisfying `And<And<NonEmpty, NonEmpty>, NonEmpty>: TermDerive<..., String, _>`
+```
+
+2 つ目の型パラメーターで法則を指定します。
+
+```rust title="src/derivation.rs"
+use wakuwaku::proof::boolean_algebra::Associate;
+
+// `Commute` と `Associate` のどちらも (A ∧ A) ∧ A を A ∧ (A ∧ A) にする: 1 つを指定する
+let _name: Proven<String, And<NonEmpty, And<NonEmpty, NonEmpty>>> =
+    name.derive::<_, Associate>();
+```
+
+## 証拠はどうなるか [#what-happens-to-the-evidence]
+
+法則は証拠を変換先の対応する位置に移すので、変換後も証拠を読めます。
+
+```rust title="src/derivation.rs"
+let swapped: Proven<String, And<ShortEnough, NonEmpty>> = name.derive();
+let And(short_enough, _) = swapped.evidence();
+assert_eq!(short_enough.spare, 10);
+```
+
+変換先に入る場所がない証拠は破棄されます。
+
+- `A ∧ A ⇒ A` は左の証明を残します。`A ∨ A ⇒ A` も両方ある場合は左を残します。
+- `A ∧ (B ∨ C) ⇒ (A ∧ B) ∨ (A ∧ C)` は、`B` と `C` の両方が成り立っていた場合 `A ∧ B` だけを残します。
+- `(A ∧ B) ∨ (A ∧ C) ⇒ A ∧ (B ∨ C)` は、両側が成り立っていた場合 1 つ目の `A` を残します。
+- 1 つの証明から選言を作る法則 (`A ⇒ A ∨ A`、`A ⇒ A ∨ (A ∧ B)`) は `Or::Left` を作ります。
+
+### 証拠が Clone である必要があるとき [#when-evidence-must-be-clone]
+
+`Evidence` は決して `Clone` ではありません。次の 3 つの法則は同じ証明を 2 回含む変換先を作るため、証拠を複製し、`A: Clone` を要求します。
+
+- `A ⇒ A ∧ A` (`Idempotence`)
+- `A ⇒ A ∧ (A ∨ B)` (`Absorb`)
+- `A ∨ (B ∧ C) ⇒ (A ∨ B) ∧ (A ∨ C)` (`Distribute`)
+
+`Clone` がなければ導出はコンパイルできません。
+
+```rust
+let twice: Proven<String, And<NonEmpty, NonEmpty>> = name.derive();
+// error[E0277]: the trait bound `NonEmpty: TermDerive<And<NonEmpty, NonEmpty>, String, Idempotence>`
+//               is not satisfied
+//   the trait `Clone` is not implemented for `NonEmpty`
+//   help: consider annotating `NonEmpty` with `#[derive(Clone)]`
+```
+
+述語に `Clone` を derive しても害はありません。クローンした述語の値はそれだけでは何も証明しないからです ([述語そのものを受け取らない](/ja/docs/validation#never-accept-a-bare-predicate) を参照)。複製を `Proven` の中に入れられるのは法則だけです。大きな行のようにクローンが高価な証拠の場合は、これら 3 つの法則が本当に必要かを検討してください。
+
+## 独自の法則を書く [#writing-your-own-laws]
+
+`R` に独自の規則型を使って `TermDerive` を実装すれば、法則を追加できます。実装は `Proven<T, P>` を返さなければならず、クレートの外で `Proven` を得るには `prove` か既存の証明の変換しかありません。そのため独自の法則が証拠をでっち上げることはできず、実際には既存のステップの連鎖に名前を付けたものになります。
+
+```rust title="src/derivation.rs"
+use wakuwaku::proof::boolean_algebra::{Associate, Commute};
+use wakuwaku::proof::{And, Predicate, Proven, TermDerive};
+
+/// ユーザー名についての `A ∧ (B ∧ C) ⇒ C ∧ (A ∧ B)`: `Associate` のあと `Commute`
+pub enum RotateRight {}
+
+impl<A, B, C> TermDerive<And<C, And<A, B>>, String, RotateRight> for And<A, And<B, C>>
+where
+    Self: Predicate<String>,
+    And<And<A, B>, C>: Predicate<String>,
+{
+    fn term_derive(proof: Proven<String, Self>) -> Proven<String, And<C, And<A, B>>> {
+        proof
+            .derive::<And<And<A, B>, C>, Associate>()
+            .derive::<_, Commute>()
+    }
+}
+```
+
+組み込みの法則と同じように `proof.derive::<_, RotateRight>()` で使えます。`And<And<A, B>, C>: Predicate<String>` という境界があるのは、途中のステップ自体も法則の適用であり、チェック可能な変換元を必要とするからです。
+
+<Callout type="warn" title="独自の法則では対象の型を固定してください">
+上の例の対象の型はジェネリックな `T` ではなく `String` です。Rust のオーファンルールは `impl<T, …> TermDerive<…, T, RotateRight> for And<…>` を拒否します。トレイトも `And` も外部の型で、カバーされていない `T` がローカルな規則型より前に現れるためです (`error[E0210]: type parameter T must be covered by another type when it appears before the first local type`)。必要な対象の型ごとに impl を書いてください。
+</Callout>
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="サービスでの証明の利用" href="/ja/docs/validation/in-services" description="gRPC の境界で検証し、証明をドメインロジックに渡します。" />
+  <Card title="述語の合成" href="/ja/docs/validation/composition" description="And、Or、チェック順序、コンテキスト。" />
+</Cards>

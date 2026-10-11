@@ -1,0 +1,233 @@
+---
+title: Redis
+description: Redis を capability で検査されるデータソースとして使い、型付きのキャッシュ、ロック、レートリミッター、パイプ、ライブビュー、ストリームバッファを利用します。
+icon: Zap
+---
+
+Redis は、レプリカ間で共有したいがメインのデータベースに置くほどではない状態を保持する場所です。キャッシュした読み取り結果、ロック、レート制限のカウンター、websocket へ届ける途中のメッセージ、ストリーミングされる LLM の回答のチャンクなどがこれに当たります。wakuwaku の `redis` feature は、Redis を PostgreSQL と同じ[データソース](/ja/docs/data/queries)にします。すべてのコマンドは型付きのクエリであり、`Db` ハンドルは自身の capability が許可するクエリしか実行しません。
+
+データソースの上に、wakuwaku は既製のデータ構造を提供します。いずれも小さな `const` 値で、そのメソッドがクエリを組み立てます。
+
+| 構造 | モジュール | 用途 |
+| --- | --- | --- |
+| [`Cache`、`HashedCache`](/ja/docs/data/redis/cache) | `collection::cache` | TTL 付きの本体。ハッシュ版は本体をダウンロードせずに「変わったか」を判定できます。 |
+| [`Lock`、`RwLock`](/ja/docs/data/redis/lock) | `collection::lock` | リースによるレプリカ間の排他制御。 |
+| [`TokenBucket`](/ja/docs/data/redis/rate-limiter) | `collection::token_bucket_limiter` | バーストを許すレート制限。 |
+| [`Pipe`](/ja/docs/data/redis/pipe) | `dynamic::pipe` | 受信者が 1 人の一方向メッセージキュー。websocket の片方向に相当します。 |
+| [`LiveView`](/ja/docs/data/redis/live-view) | `dynamic::live_view` | バージョン付きのコミットを持つ永続的なドキュメント。購読者は差分として追従します。 |
+| [`StreamBuffer`](/ja/docs/data/redis/stream-buffer) | `dynamic::stream_buffer` | 終端を持つ追記専用の配列。任意の数の購読者が追従できます。 |
+
+*collection* は必要なときに問い合わせる構造です。*dynamic* な構造は、変化に合わせて追従することもできます。
+
+Spring から来た方向けに言えば、このページは Spring Data Redis の接続設定に相当する内容を扱います。各サブページは、`RedisCacheManager`、分散ロックのレジストリ、レート制限ライブラリといった寄せ集めを、ひとつの型の規律で置き換えます。
+
+## セットアップ [#setup]
+
+`redis` feature を有効にします。Redis に保存する本体は [kanau](https://docs.rs/kanau) の `MessageSer` / `MessageDe` でシリアライズします。JSON の derive を使うには、`serde_json` feature を有効にした `kanau` への直接の依存と、`serde` が必要です。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["redis"] }
+kanau = { version = "0.6", features = ["serde_json"] }  # JsonMessageSer / JsonMessageDe
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+Cargo はこの `kanau` を wakuwaku が使うものと統合するため、`wakuwaku::deps::kanau` と `kanau` は同じクレートになります。derive の仕組みや、`MessageSer` / `MessageDe` を手書きする方法は [本体のシリアライズ](/ja/docs/events/defining-events#serializing-the-body) を参照してください。
+
+Redis クライアント自体は `wakuwaku::deps::redis` として再エクスポートされているので、`Cargo.toml` に `redis` を追加する必要はありません。
+
+### 接続する [#connecting]
+
+[`RedisSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/struct.RedisSource.html) はクローン可能な非同期コネクションをラップし、各クエリをそのクローン上で実行します。デフォルトの `MultiplexedConnection` ではクローン同士がひとつのソケットを共有するため、このコストは小さくて済みます。ソースを capability 付きの `Db` で包みます。
+
+```rust title="src/redis.rs"
+use wakuwaku::deps::redis;
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Db, ReadWrite};
+
+/// このサービスのすべてのコンポーネントが共有する Redis ハンドル。
+pub type Redis = Db<RedisSource, ReadWrite>;
+
+pub async fn connect(client: &redis::Client) -> redis::RedisResult<Redis> {
+    let connection = client.get_multiplexed_async_connection().await?;
+    Ok(Db::new(RedisSource::new(connection)))
+}
+```
+
+`RedisSource<C>` は `C: ConnectionLike + Clone + Send + Sync` を満たす任意の型を受け付けるので、クラスターコネクションや `ConnectionManager` も同じように使えます。
+
+### 登録する
+
+`Db` はソースが `Clone` であれば `Clone` です。[`ServiceBuilder`](/ja/docs/core/service-builder) に登録し、そこからコンポーネントを組み立てます。
+
+```rust title="src/main.rs"
+use wakuwaku::{ServiceBuilder, ServiceCreation};
+
+pub struct SessionService {
+    redis: Redis,
+}
+
+impl ServiceCreation for SessionService {
+    type Dep = Redis;
+
+    fn create_service(redis: Redis) -> Self {
+        Self { redis }
+    }
+}
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let services = ServiceBuilder::new(connect(&client).await?);
+    let redis: &Redis = services.provide::<Redis, _>();
+    Ok(())
+}
+```
+
+このセクションのクエリはすべて `redis.process(query).await` で実行します。これは、capability がカバーする各クエリについて `Db` が実装する [`Processor`](https://docs.rs/kanau) のメソッドです。
+
+## 独自の Redis クエリ
+
+組み込みの構造も、ほかと変わらないクエリです。それらがカバーしないコマンドが必要なら、クエリを自分で書きます。[`Query`](/ja/docs/data/queries) が触れるエンティティを宣言し、`Execute<RedisSource<C>>` がコネクション上で実行します。
+
+```rust title="src/session.rs"
+use wakuwaku::deps::redis::aio::ConnectionLike;
+use wakuwaku::deps::redis::{self, AsyncCommands};
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Entity, Execute, Query, Write};
+
+/// エンティティ: ログインセッション（保存先は問わない）。
+pub struct Session;
+impl Entity for Session {}
+
+pub struct StoreSession {
+    pub token: String,
+    pub user: u64,
+}
+
+impl Query for StoreSession {
+    type Effect = Write<Session>;
+}
+
+impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for StoreSession {
+    type Output = ();
+
+    async fn execute(self, conn: &mut C) -> redis::RedisResult<()> {
+        conn.set_ex(format!("session:{}", self.token), self.user, 3600).await
+    }
+}
+```
+
+Redis のクエリのエラー型はすべて `RedisError` です。組み込みの構造は、本体の（デ）シリアライズの失敗や、構造が書き込んだ内容と一致しないキー（`"corrupted item"`）も `RedisError` として報告します。
+
+## 名前とキー
+
+各構造は、要素の名前となる型 `N` についてジェネリックです。`Cache<u64, Profile>` はユーザー ID を、`Lock<str>` は文字列をキーにします。名前は [`Name`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/trait.Name.html) を実装する必要があり、文字列、バイト列、すべての整数型はすでに実装しています。識別子の newtype には、正規の表現を書き出す実装を与えます。
+
+```rust
+use wakuwaku::entity::redis::Name;
+
+pub struct UserId(pub u64);
+
+impl Name for UserId {
+    fn write_name(&self, key: &mut Vec<u8>) {
+        self.0.write_name(key);
+    }
+}
+```
+
+要素は次のキーに保存されます。
+
+```text
+@@wakuwaku-entity:<kind>:<namespace>:<name>
+```
+
+`<kind>` は構造の型（`Cache`、`Lock`、`TokenBucket` など）、`<namespace>` はその `new` の第 1 引数です。複数のキーからなる要素（`RwLock`、`Pipe`、`LiveView`）は `<namespace>:<name>` を波括弧で囲み、キーごとにサフィックスを付けます。これによりすべてのキーが同じ Redis Cluster のハッシュスロットに入り、Lua スクリプトや `MULTI` ブロックがクラスター上でも動作します。
+
+<Callout type="warn" title="構造ごとに別の namespace を">
+  同じ種類で同じ namespace を持つ 2 つの構造はキーを共有します。どちらも `"user"` という名前の `Cache<u64, Profile>` と `Cache<u64, Settings>` は互いの本体を上書きし、その後デシリアライズに失敗します。`const` ごとに固有の namespace を与えてください。
+</Callout>
+
+## Capability
+
+各構造の型は、そのクエリが読み書きする[エンティティ](/ja/docs/data/queries)でもあります。したがって `Cache<u64, Profile>` と `Cache<str, Page>` は別のエンティティです。どのクエリが書き込みに数えられるかは、見た目ではなく Redis 上で実際に行うことで決まります。
+
+| 構造 | 読み取りクエリ | 書き込みクエリ |
+| --- | --- | --- |
+| `Cache` | `get` | `put`、`remove` |
+| `HashedCache` | `get`、`hash`、`get_if_changed` | `put`、`remove` |
+| `Lock` | | `try_lock`、`release`、`extend` |
+| `RwLock` | | `try_read`、`try_write`、`release`、`extend` |
+| `TokenBucket` | | `acquire`、`reset` |
+| `Pipe` | | `send`、`close`、`receive`（メッセージを取り出すと削除される） |
+| `LiveView` | `get`、`version`、`history`、`subscribe`、`resume` | `create`、`commit`、`remove` |
+| `StreamBuffer` | `read`、`subscribe` | `append`、`finish`、`remove` |
+
+そのため `Db<_, ReadOnly>` はロックを取ることもレート制限のトークンを消費することもできず、本体を put しようとするとコンパイルが通りません。
+
+```rust
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Db, ReadOnly};
+
+async fn warm(replica: &Db<RedisSource, ReadOnly>, user: u64, profile: Profile) -> RedisResult<()> {
+    // error: `ReadOnly: CanWrite<Cache<u64, Profile>>` is not satisfied
+    replica.process(PROFILES.put(&user, profile)).await
+}
+```
+
+Capability で一部の構造だけにアクセスを許可することもできます。次のゲートウェイはすべてのキャッシュを読めますが、書き込めるのはセッションのキャッシュだけです。
+
+```rust
+use wakuwaku::entity::redis::collection::cache::Cache;
+use wakuwaku::entity::{CanRead, CanWrite};
+
+pub struct SessionToken(String);
+pub struct Session {
+    user: u64,
+}
+
+/// すべてのキャッシュを読み、セッションのキャッシュだけに書き込む。
+pub enum Gateway {}
+impl<N: ?Sized, B> CanRead<Cache<N, B>> for Gateway {}
+impl CanWrite<Cache<SessionToken, Session>> for Gateway {}
+```
+
+## 変化への追従: 専用コネクション [#following-changes-dedicated-connections]
+
+パイプからの受信や、ライブビュー・ストリームバッファの購読もクエリなので、capability は通常どおり検査されます。これらは受信者や購読を出力し、それはクエリに渡したコネクション上でブロッキングな Redis コマンド（`BLPOP`、`XREAD BLOCK`）を使って待機します。
+
+ブロッキングコマンドは同じソケットに送られた他のすべてのコマンドを止めてしまうため、そのコネクションは他の用途に使ってはいけません。`RedisSource` の中のマルチプレクスコネクションのクローンを渡すのは厳禁です。また、ブロックが終わる前にレスポンスをタイムアウトさせてもいけません。受信者ごとに、レスポンスタイムアウトを無効にしたコネクションを開きます。
+
+```rust title="src/redis.rs"
+use wakuwaku::deps::redis::AsyncConnectionConfig;
+use wakuwaku::deps::redis::aio::MultiplexedConnection;
+
+/// 1 つの受信者または購読だけが使うコネクション。
+pub async fn dedicated_connection(
+    client: &redis::Client,
+) -> redis::RedisResult<MultiplexedConnection> {
+    let config = AsyncConnectionConfig::new().set_response_timeout(None);
+    client.get_multiplexed_async_connection_with_config(&config).await
+}
+```
+
+以降のページの例はこのヘルパーを使います。受信者と購読はいずれも `async fn recv` と、`futures::Stream` に変換する `into_stream` を持ちます。
+
+## サーバーの要件
+
+- ロックとレートリミッターは Lua スクリプトの中で `TIME` を使ってサーバーの時刻を読みます。これにはスクリプトの effects replication が必要で、Redis 5 以降はこれがデフォルトです。時刻はサーバーのものなので、レプリカ間の時計のずれは影響しません。
+- パイプの受信者は小数秒の `BLPOP` タイムアウトでブロックするため、Redis 6 が必要です。
+- 複数のキーにまたがる構造はそれらを同じハッシュスロットに置くので、Redis Cluster に対応しています。
+
+## 次のステップ
+
+<Cards>
+  <Card title="キャッシュ" href="/ja/docs/data/redis/cache" description="型付きの本体による cache-aside と、ハッシュによる再検証。" />
+  <Card title="ロック" href="/ja/docs/data/redis/lock" description="リース、延長、リーダー・ライターロック、cron ジョブのパターン。" />
+  <Card title="レートリミッター" href="/ja/docs/data/redis/rate-limiter" description="サーバーの時刻で連続的に補充されるトークンバケット。" />
+  <Card title="パイプ" href="/ja/docs/data/redis/pipe" description="1 人の送信者から 1 人の受信者への一方向メッセージキュー。" />
+  <Card title="ライブビュー" href="/ja/docs/data/redis/live-view" description="差分として追従できるバージョン付きドキュメント。" />
+  <Card title="ストリームバッファ" href="/ja/docs/data/redis/stream-buffer" description="LLM のチャンクのようなストリーミング出力のための追記専用配列。" />
+</Cards>

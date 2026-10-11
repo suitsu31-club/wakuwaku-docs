@@ -1,0 +1,546 @@
+---
+title: Migrating from 0.3
+description: Move a service from wakuwaku 0.3 to 1.0.0-rc1, with before-and-after code for each replaced module.
+icon: ArrowUpCircle
+---
+
+wakuwaku 0.3 was a set of utilities: a RabbitMQ integration, Redis and sqlx helpers, a resource pool, and a service builder. 1.0.0-rc1 keeps the service builder, but it is now a framework. Data access, events, and validation are separate crates, re-exported behind feature flags, and RabbitMQ is replaced by Apache Iggy.
+
+This page goes through the changes one module at a time. Each section shows code written against 0.3.1 and the equivalent for 1.0.0-rc1. Both sides were compiled against their respective versions.
+
+## Summary
+
+| 0.3                                                         | 1.0.0-rc1                                                    |
+| ----------------------------------------------------------- | ------------------------------------------------------------ |
+| `services::builder::ServiceBuilder`, `services::ServiceCreation` | unchanged, also re-exported as `wakuwaku::ServiceBuilder`, `wakuwaku::ServiceCreation` |
+| `services::grpc_service`, `ServiceBuilder::grpc_service`    | unchanged                                                    |
+| `integration::amqp`, `services::amqp_consumer`, `ServiceBuilder::amqp_consumer` | `wakuwaku::iggy`, `ServiceBuilder::iggy_consumer` |
+| `interval_job::IntervalJobExecutionSignal`                  | `CronJob`, `ServiceBuilder::cron_job`                        |
+| `integration::redis`                                        | `wakuwaku::entity::redis`                                    |
+| `integration::sqlx`                                         | `wakuwaku::entity::sqlx`                                     |
+| `pool`                                                      | removed                                                      |
+| `integration::surreal`                                      | removed                                                      |
+| `wakuwaku::Error`                                           | removed; each crate has its own error type                   |
+| feature `tonic`                                             | feature `grpc`                                               |
+
+## Update `Cargo.toml`
+
+The feature flags changed:
+
+| 0.3 feature            | 1.0.0-rc1                                                              |
+| ---------------------- | ---------------------------------------------------------------------- |
+| `amqprs` (default)     | removed. Use `iggy` for events (a different broker; see below).        |
+| `redis` (default)      | `redis`                                                                |
+| `uuid` (default)       | removed. It converted `uuid::Uuid` into a `RedisKey`. Implement `Name` for your id types instead. |
+| `tracing` (default)    | removed. wakuwaku always logs through `tracing`.                       |
+| `tracing-otel`         | removed. The `monotonic_counter.*` metric events are gone.             |
+| `sqlx`                 | `sqlx-pg`. MySQL is new: `sqlx-mysql`.                                 |
+| `surreal`              | removed                                                                |
+| `tonic` (implicit)     | `grpc`, now enabled by default                                         |
+| none                   | new: `proof`, `iggy`, `entity`, `meilisearch`                          |
+
+In 0.3 you depended on `kanau`, `sqlx`, and `tonic` yourself. In 1.0.0-rc1, import them through `wakuwaku::deps` so their versions match wakuwaku's. The exceptions are code generators and derive macros that name a crate by path; see [Installation](/en/docs/getting-started/installation#when-you-need-a-direct-dependency).
+
+```toml tab="0.3"
+[dependencies]
+wakuwaku = { version = "0.3", features = ["sqlx", "tonic"] }
+kanau = { version = "0.6", features = ["message"] }
+sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
+tonic = "0.14"
+```
+
+```toml tab="1.0"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["iggy", "sqlx-pg", "redis"] }
+tokio = { version = "1.53", features = ["full"] }
+# Only for #[derive(JsonMessageSer, JsonMessageDe)] on message bodies.
+kanau = { version = "0.6", features = ["serde_json"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+## Service builder and gRPC
+
+`ServiceBuilder`, `ServiceCreation`, the `Here` / `There` positions, `ServiceBuilder::grpc_service`, and `GrpcServiceRegisterCenter` work as before. Only the imports change: tonic comes from `wakuwaku::deps::tonic`, and the two core types are also available at the crate root.
+
+```rust tab="0.3"
+use tonic::service::Routes;
+use tonic::transport::Server;
+use wakuwaku::services::ServiceCreation;
+use wakuwaku::services::builder::ServiceBuilder;
+```
+
+```rust tab="1.0"
+use wakuwaku::deps::tonic::service::Routes;
+use wakuwaku::deps::tonic::transport::Server;
+use wakuwaku::{ServiceBuilder, ServiceCreation};
+```
+
+The old paths `wakuwaku::services::builder::ServiceBuilder` and `wakuwaku::services::ServiceCreation` still work.
+
+## RabbitMQ consumers become Iggy event handlers
+
+RabbitMQ support is gone. Events now go through [Apache Iggy](https://iggy.apache.org), with typed events, per-key ordering, and batching. This is not a drop-in replacement. Messages still queued in RabbitMQ are not moved to Iggy, so drain the queues (or replay their contents into Iggy) before you switch.
+
+```rust tab="0.3"
+use kanau::processor::Processor;
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::integration::amqp::{
+    AmqpExchangeType, AmqpMessageProcessor, AmqpMessageSend, AmqpPool, AmqpRouting,
+};
+use wakuwaku::services::ServiceCreation;
+use wakuwaku::services::builder::ServiceBuilder;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+struct OrderPlaced {
+    order_id: u64,
+}
+
+impl AmqpRouting for OrderPlaced {
+    const EXCHANGE: &'static str = "orders";
+    const EXCHANGE_TYPE: AmqpExchangeType = AmqpExchangeType::Topic;
+    const ROUTING_KEY: &'static str = "order.placed";
+}
+
+impl AmqpMessageSend for OrderPlaced {}
+
+#[derive(Clone)]
+struct Mailer;
+
+struct SendReceipt {
+    mailer: Mailer,
+}
+
+impl ServiceCreation for SendReceipt {
+    type Dep = Mailer;
+    fn create_service(mailer: Mailer) -> Self {
+        Self { mailer }
+    }
+}
+
+impl Processor<OrderPlaced> for SendReceipt {
+    type Output = ();
+    type Error = wakuwaku::Error;
+    async fn process(&self, event: OrderPlaced) -> Result<(), wakuwaku::Error> {
+        println!("receipt for order {}", event.order_id);
+        Ok(())
+    }
+}
+
+impl AmqpMessageProcessor<OrderPlaced> for SendReceipt {
+    const QUEUE: &'static str = "send-receipt";
+}
+
+async fn run(pool: &AmqpPool) -> Result<(), wakuwaku::Error> {
+    let (_services, consumers) = ServiceBuilder::new(Mailer)
+        .amqp_consumer::<SendReceipt, _, _>()
+        .setup(pool)
+        .await?;
+
+    OrderPlaced { order_id: 7 }.send(pool).await?;
+
+    consumers.closed().await;
+    Ok(())
+}
+```
+
+```rust tab="1.0"
+use std::hash::DefaultHasher;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::ServiceBuilder;
+use wakuwaku::ServiceCreation;
+use wakuwaku::deps::iggy::prelude::{Client, IggyClient};
+use wakuwaku::iggy::error::HandleError;
+use wakuwaku::iggy::{
+    ConsumerConfig, Event, EventAtomicOrdering, EventBody, EventHandler, EventTypeTag,
+    IggySuperPartitionName, NonAssociative, PartitionKey, Publisher,
+};
+
+/// The key decides the topic ("orders") and the partition.
+#[derive(Hash)]
+struct OrderId(u64);
+
+impl PartitionKey for OrderId {
+    type PartitionMerge = DefaultHasher;
+    const SUPER_PARTITION_NAME: IggySuperPartitionName = IggySuperPartitionName("orders");
+}
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+struct OrderPlaced {
+    order_id: u64,
+}
+
+impl EventBody for OrderPlaced {}
+
+impl Event for OrderPlaced {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = OrderId;
+    type Algebra = NonAssociative;
+    fn key(&self) -> OrderId {
+        OrderId(self.order_id)
+    }
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+
+#[derive(Clone)]
+struct Mailer;
+
+struct SendReceipt {
+    mailer: Mailer,
+}
+
+impl ServiceCreation for SendReceipt {
+    type Dep = Mailer;
+    fn create_service(mailer: Mailer) -> Self {
+        Self { mailer }
+    }
+}
+
+impl EventHandler<OrderPlaced> for SendReceipt {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::MIN;
+    async fn handle(&self, run: &[OrderPlaced]) -> Result<(), HandleError> {
+        for event in run {
+            println!("receipt for order {}", event.order_id);
+        }
+        Ok(())
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Arc::new(IggyClient::from_connection_string(
+        "iggy://iggy:iggy@localhost:8090",
+    )?);
+    client.connect().await?;
+
+    let (_services, consumers) = ServiceBuilder::new(Mailer)
+        .iggy_consumer::<SendReceipt, _, _>()
+        .start(client.clone(), ConsumerConfig::new("shop", "send-receipt", vec![0]))
+        .await?;
+
+    let publisher = Publisher::new(client, "shop")?;
+    publisher.publish(OrderPlaced { order_id: 7 }).await?;
+
+    tokio::signal::ctrl_c().await?;
+    consumers.shutdown().await;
+    Ok(())
+}
+```
+
+How the 0.3 pieces map:
+
+| 0.3                                         | 1.0.0-rc1                                                                 |
+| ------------------------------------------- | ------------------------------------------------------------------------- |
+| `AmqpRouting::EXCHANGE`                     | the Iggy stream passed to `Publisher::new` and `ConsumerConfig::new`      |
+| `AmqpRouting::ROUTING_KEY`                  | `Event::TYPE_TAG` plus the key type's `SUPER_PARTITION_NAME` (the topic)  |
+| `AmqpMessageSend::send`                     | `Publisher::publish`                                                      |
+| `AmqpMessageProcessor<E>` (a `Processor<E>`) | `EventHandler<E>`, which receives a slice of events (`MAX_BATCH` at most) |
+| `AmqpMessageProcessor::QUEUE`               | the consumer name in `ConsumerConfig::new`                                |
+| `RETRY_POLICY`, `<queue>.retry`             | `ConsumerConfig::retry_delays`, the `retry_<topic>` topic                 |
+| `FailureAction`, `<queue>.dlq`              | the `ErrorClass` of the returned `HandleError`; there is no dead-letter topic |
+| `ServiceBuilder::amqp_consumer(..).setup(&pool)` | `ServiceBuilder::iggy_consumer(..).start(client, config)`            |
+| dropping `AmqpConsumersRuntime`             | `ConsumerRuntime::shutdown().await`                                       |
+
+Things to watch for:
+
+- **Create the stream and topics first.** `start` creates only the retry topic `retry_<topic>`. The main topic, named after the key's `SUPER_PARTITION_NAME`, and the configured partitions must already exist.
+- **Partition ids are zero-based.** The example consumes partition `0`.
+- **Retries are per key.** A `Retryable` error moves the key's unfinished events to the retry topic, and its later events wait behind them. If the last retry fails, the failed runs are dropped. An `Unrecoverable` error drops the chunk and logs it. 0.3 parked such messages in a dead-letter queue instead.
+
+[Events](/en/docs/events) covers defining events, publishing, consuming, ordering, and error handling. [Defining events](/en/docs/events/defining-events#serializing-the-body) explains the JSON derives used for the body.
+
+## Interval jobs become cron jobs
+
+In 0.3, `IntervalJobExecutionSignal` described when a signal message was due. You had to call `time_pool` from a loop of your own, publish the signal to RabbitMQ, and handle it in a consumer. In 1.0.0-rc1, a `CronJob` runs the work itself, inside the process, on a fixed interval:
+
+```rust tab="0.3"
+use std::task::Poll;
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use time::{Duration, OffsetDateTime};
+use wakuwaku::integration::amqp::{AmqpExchangeType, AmqpMessageSend, AmqpRouting};
+use wakuwaku::interval_job::IntervalJobExecutionSignal;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+struct ExpireSessionsSignal {
+    unix_time: i64,
+}
+
+impl AmqpRouting for ExpireSessionsSignal {
+    const EXCHANGE: &'static str = "jobs";
+    const EXCHANGE_TYPE: AmqpExchangeType = AmqpExchangeType::Direct;
+    const ROUTING_KEY: &'static str = "expire-sessions";
+}
+
+impl AmqpMessageSend for ExpireSessionsSignal {}
+
+impl IntervalJobExecutionSignal for ExpireSessionsSignal {
+    fn tick(now: OffsetDateTime) -> Self {
+        Self { unix_time: now.unix_timestamp() }
+    }
+
+    fn time_pool(now: OffsetDateTime, last_time: OffsetDateTime) -> Poll<Self> {
+        if now - last_time >= Duration::minutes(1) {
+            Poll::Ready(Self::tick(now))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+```
+
+```rust tab="1.0"
+use std::convert::Infallible;
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+
+#[derive(Clone)]
+struct SessionStore;
+
+struct ExpireSessions {
+    store: SessionStore,
+}
+
+impl ServiceCreation for ExpireSessions {
+    type Dep = SessionStore;
+    fn create_service(store: SessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl Processor<CronTick> for ExpireSessions {
+    type Output = ();
+    type Error = Infallible;
+    async fn process(&self, tick: CronTick) -> Result<(), Infallible> {
+        // The work that used to live in the consumer of the signal.
+        Ok(())
+    }
+}
+
+impl CronJob for ExpireSessions {
+    const INTERVAL: Duration = Duration::from_secs(60);
+}
+
+async fn run() {
+    let (_services, cron) = ServiceBuilder::new(SessionStore)
+        .cron_job::<ExpireSessions, _>()
+        .start();
+    tokio::signal::ctrl_c().await.ok();
+    cron.shutdown().await;
+}
+```
+
+The work that used to live in the signal's consumer moves into `process`. Every replica that starts the job runs it, so make the job idempotent or take a Redis lock inside the run. See [Cron jobs](/en/docs/services/cron-jobs).
+
+## Redis key-value helpers become `entity::redis`
+
+The `KeyValue`, `KeyValueRead`, and `KeyValueWrite` traits are replaced by a Redis data source and typed collections. A cache with a TTL becomes a `Cache` constant, and every operation is a query that runs through a `Db` handle:
+
+```rust tab="0.3"
+use std::time::Duration;
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::integration::redis::{KeyValue, KeyValueRead, KeyValueWrite, RedisConnection};
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+struct Profile {
+    name: String,
+}
+
+struct ProfileEntry {
+    user: u64,
+    profile: Profile,
+}
+
+impl KeyValue for ProfileEntry {
+    type Key = String;
+    type Value = Profile;
+    fn key(&self) -> String {
+        format!("profile:{}", self.user)
+    }
+    fn value(&self) -> Profile {
+        self.profile.clone()
+    }
+    fn into_value(self) -> Profile {
+        self.profile
+    }
+    fn new(key: String, profile: Profile) -> Self {
+        let user = key.trim_start_matches("profile:").parse().unwrap_or_default();
+        Self { user, profile }
+    }
+}
+
+impl KeyValueRead for ProfileEntry {}
+impl KeyValueWrite for ProfileEntry {}
+
+async fn run(conn: &mut RedisConnection) -> Result<(), wakuwaku::Error> {
+    let entry = ProfileEntry { user: 7, profile: Profile { name: "Haruki".into() } };
+    entry.write_with_ttl(conn, Duration::from_secs(300)).await?;
+    let profile: Option<Profile> = ProfileEntry::read(conn, "profile:7".into()).await?;
+    Ok(())
+}
+```
+
+```rust tab="1.0"
+use std::time::Duration;
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::redis::collection::cache::Cache;
+use wakuwaku::entity::{Db, ReadWrite};
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+struct Profile {
+    name: String,
+}
+
+const PROFILES: Cache<u64, Profile> = Cache::new("profile", Duration::from_secs(300));
+
+async fn run(db: &Db<RedisSource, ReadWrite>) -> RedisResult<()> {
+    db.process(PROFILES.put(&7, Profile { name: "Haruki".into() })).await?;
+    let profile: Option<Profile> = db.process(PROFILES.get(&7)).await?;
+    Ok(())
+}
+
+async fn connect() -> Result<Db<RedisSource, ReadWrite>, Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let connection = client.get_multiplexed_async_connection().await?;
+    Ok(Db::new(RedisSource::new(connection)))
+}
+```
+
+- `RedisConnection` becomes `Db<RedisSource, C>`. The capability `C` decides which queries may run. Use `ReadWrite` for code that writes and `ReadOnly` for code that should only read.
+- The key layout changed. Collections store their items under `@@wakuwaku-entity:<kind>:<namespace>:<name>`, so values written by 0.3 are not found. For caches this only means a cold start.
+- Values that are not caches (no TTL, or your own key layout) are written as your own queries on `RedisSource`. See [Redis](/en/docs/data/redis).
+- Errors are `redis::RedisError` instead of `wakuwaku::Error`.
+
+## `DatabaseProcessor` becomes `SqlxSource` and `Db`
+
+0.3 wrapped a `PgPool` in `DatabaseProcessor`, and any SQL could run on `db.db()`. In 1.0.0-rc1 every query is a value that declares what it reads and writes, and it runs through a `Db` whose capability must cover that:
+
+```rust tab="0.3"
+use wakuwaku::integration::sqlx::DatabaseProcessor;
+
+async fn count_users(db: &DatabaseProcessor) -> Result<i64, wakuwaku::Error> {
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+        .fetch_one(db.db())
+        .await?;
+    Ok(count)
+}
+```
+
+```rust tab="1.0"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, PgConnection, PgPool};
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, Entity, Execute, Query, Read, ReadOnly};
+
+struct User;
+impl Entity for User {}
+
+/// A query is a value that says what it touches...
+struct CountUsers;
+
+impl Query for CountUsers {
+    type Effect = Read<User>;
+}
+
+/// ...and how it runs.
+impl Execute<PgSource> for CountUsers {
+    type Output = i64;
+    async fn execute(self, conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+            .fetch_one(conn)
+            .await?;
+        Ok(count)
+    }
+}
+
+async fn count_users(db: &Db<PgSource, ReadOnly>) -> Result<i64, sqlx::Error> {
+    db.process(CountUsers).await
+}
+
+fn read_only(pool: PgPool) -> Db<PgSource, ReadOnly> {
+    Db::new(SqlxSource::new(pool))
+}
+```
+
+- The pool stays private inside `SqlxSource`, so the capability cannot be bypassed. Run migrations on the pool before wrapping it.
+- A `Db<PgSource, ReadOnly>` cannot run a query declared as a write. That is a compile error.
+- MySQL is supported through `sqlx-mysql` and `MySqlSource`.
+- Transactions are written as state machines. See [Transactions](/en/docs/data/transactions).
+
+[Queries](/en/docs/data/queries) and [sqlx](/en/docs/data/sqlx) cover this in detail.
+
+## `wakuwaku::Error` is removed
+
+0.3 had one error enum for everything, including a `From<wakuwaku::Error> for tonic::Status` conversion. In 1.0.0-rc1, each part uses the error type of the layer it wraps: `sqlx::Error` for sqlx sources, `RedisError` for Redis, `HandleError` for event handlers, and `ValidateError` for validation. Define your service's own error type and its mapping to `Status`:
+
+```rust tab="0.3"
+use tonic::Status;
+
+fn find_user(id: u64) -> Result<String, wakuwaku::Error> {
+    Err(wakuwaku::Error::NotFound)
+}
+
+fn get_user(id: u64) -> Result<String, Status> {
+    // `wakuwaku::Error` converted into `tonic::Status` for you.
+    Ok(find_user(id)?)
+}
+```
+
+```rust tab="1.0"
+use wakuwaku::deps::sqlx;
+use wakuwaku::deps::tonic::Status;
+
+/// Your service's own error type.
+#[derive(Debug)]
+enum AppError {
+    NotFound,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<AppError> for Status {
+    fn from(error: AppError) -> Self {
+        match error {
+            AppError::NotFound => Status::not_found("not found"),
+            AppError::Database(_) => Status::internal("database error"),
+        }
+    }
+}
+
+fn find_user(id: u64) -> Result<String, AppError> {
+    Err(AppError::NotFound)
+}
+
+fn get_user(id: u64) -> Result<String, Status> {
+    Ok(find_user(id)?)
+}
+```
+
+## Removed without replacement
+
+- **`pool`**: the generic resource pool. The clients wakuwaku works with bring their own pooling or sharing: sqlx pools, Redis multiplexed connections (clones share one socket), and an `Arc<IggyClient>`.
+- **`integration::surreal`**: SurrealDB support was dropped.
+
+## Next steps
+
+<Cards>
+  <Card title="Quick start" href="/en/docs/getting-started/quick-start" description="A complete 1.0.0-rc1 service with gRPC and a cron job." />
+  <Card title="Events" href="/en/docs/events" description="Typed events on Apache Iggy." />
+  <Card title="Data access" href="/en/docs/data" description="Queries, capabilities, and transactions." />
+</Cards>

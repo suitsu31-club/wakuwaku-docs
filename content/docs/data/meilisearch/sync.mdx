@@ -1,0 +1,442 @@
+---
+title: Sync
+description: Keep a Meilisearch index in sync with its source of truth using projections, the Indexer, write or transaction hooks, and full rebuilds.
+icon: RefreshCw
+---
+
+An index holds a projection of data that lives somewhere else. Keeping the two in sync goes wrong in four well-known ways, and each has a known remedy:
+
+| Problem | Cause | Remedy | In wakuwaku |
+|---|---|---|---|
+| Silent failure | A write only enqueues a task, which fails later | Wait for the task | The [`Indexer`](#the-indexer) waits by default |
+| Stale overwrite | Two updates of one document race; the older one lands last | Reload the latest state by key, one worker per key | The `Indexer` reloads; partitioning your delivery by key is up to you |
+| Lost update | A crash or outage between the commit and the index write | A durable log of changes (outbox, CDC) | Your delivery |
+| Drift | Bugs, missed changes, changed settings | Rebuild the index from scratch | [`rebuild()`](#rebuilding-an-index) |
+
+wakuwaku provides the pieces that are the same in every project: a way to describe the projection, an indexer that applies changes by key, and a zero-downtime rebuild. How changes travel from the source to the indexer depends on your infrastructure, and stays your choice.
+
+<MeiliSyncDiagram lang="en" />
+
+The examples sync the `posts` index from the [overview](/en/docs/data/meilisearch) with a PostgreSQL `post` table, so they need both features:
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["meilisearch", "sqlx-pg"] }
+```
+
+## Describing the projection
+
+A [`Projection`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/trait.Projection.html) says how to load rows of the source by key, and how to turn each row into a document, or into nothing if the row shouldn't be searchable.
+
+Start with the source: the `post` table is its own entity, read by an ordinary [sqlx query](/en/docs/data/sqlx).
+
+```rust title="src/search/sync.rs"
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Entity, Execute, Query, Read};
+
+/// The `post` table: the source of truth.
+pub struct Post;
+impl Entity for Post {}
+
+/// A row of the `post` table.
+pub struct PostRow {
+    pub id: i64,
+    pub workspace_id: i64,
+    pub author_id: i64,
+    pub title: String,
+    pub summary: String,
+    pub tags: Vec<String>,
+    /// `None` while the post is a draft.
+    pub published_at: Option<i64>,
+}
+
+type PostTuple = (i64, i64, i64, String, String, Vec<String>, Option<i64>);
+
+impl From<PostTuple> for PostRow {
+    fn from(
+        (id, workspace_id, author_id, title, summary, tags, published_at): PostTuple,
+    ) -> Self {
+        Self { id, workspace_id, author_id, title, summary, tags, published_at }
+    }
+}
+
+/// Load posts by id.
+pub struct LoadPosts {
+    ids: Vec<i64>,
+}
+
+impl Query for LoadPosts {
+    type Effect = Read<Post>;
+}
+
+impl Execute<PgSource> for LoadPosts {
+    type Output = Vec<PostRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
+        let rows: Vec<PostTuple> = sqlx::query_as(
+            "SELECT id, workspace_id, author_id, title, summary, tags, \
+                    EXTRACT(EPOCH FROM published_at)::bigint \
+             FROM post WHERE id = ANY($1)",
+        )
+        .bind(&self.ids)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows.into_iter().map(PostRow::from).collect())
+    }
+}
+```
+
+Then the projection itself:
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::meilisearch::sync::Projection;
+
+/// How rows of `post` become documents of `posts`.
+pub struct PostProjection;
+
+impl Projection for PostProjection {
+    type Index = PostIndex;
+    type Row = PostRow;
+    type Load = LoadPosts;
+
+    fn load(&self, keys: &[i64]) -> LoadPosts {
+        LoadPosts { ids: keys.to_vec() }
+    }
+
+    fn key(&self, row: &PostRow) -> i64 {
+        row.id
+    }
+
+    fn project(&self, row: PostRow) -> Option<PostDocument> {
+        // Drafts aren't searchable: `None` deletes their document.
+        let published_at = row.published_at?;
+        Some(PostDocument {
+            id: row.id,
+            workspace_id: row.workspace_id,
+            author_id: row.author_id,
+            title: row.title,
+            summary: row.summary,
+            tags: row.tags,
+            published_at,
+        })
+    }
+}
+```
+
+`load` may return rows in any order and leaves out keys without a row. `project` is where visibility rules live: drafts, soft-deleted rows, private content. Returning `None` doesn't just skip the row, it *deletes* its document, so unpublishing a post removes it from the index.
+
+## The indexer
+
+The [`Indexer`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/hook/struct.Indexer.html) is a [`Processor`](/en/docs/data/queries) of anything that converts into a [`Reindex<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/struct.Reindex.html), a list of keys whose documents may have changed. For each batch it:
+
+1. loads the rows of those keys from the source, with the projection's `Load` query;
+2. upserts the documents of rows that project to a document;
+3. deletes the documents of keys whose row is gone or projects to `None`;
+4. waits for both tasks (30 seconds each by default; change it with `.wait_timeout(d)`).
+
+It outputs a [`Reindexed`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/hook/struct.Reindexed.html) report with the number of documents upserted and deleted, or a [`SyncError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/enum.SyncError.html): `Source(e)` if loading failed, `Meilisearch(e)` if a request or task failed or timed out.
+
+The key design choice: **the indexer never trusts the content of a change, only its keys.** It always reloads the current state from the source. A change delivered twice, or late, or out of order, therefore does no harm: the last reindex of a key writes whatever the source holds at that moment.
+
+`Indexer::new(source, meili, projection)` takes three things:
+
+- `source`: anything that processes the projection's `Load` query, typically a read-only database handle;
+- `meili`: anything that processes `Upsert`, `Delete` and `WaitTask` for the index, typically a `Db<MeiliSource, C>` with a [capability that writes the index](/en/docs/data/meilisearch/writes#a-capability-for-the-indexer);
+- `projection`: your `Projection`.
+
+## Delivering changes with a write hook
+
+The simplest delivery is a [write hook](/en/docs/data/hooks): wrap the database handle in `AfterWrite` with the indexer as the hook. Every write query on posts describes its change, and the change converts into a `Reindex`:
+
+```rust title="src/search/sync.rs"
+use std::convert::Infallible;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::meilisearch::sync::{Indexer, Reindex, SyncError};
+use wakuwaku::entity::meilisearch::MeiliSource;
+use wakuwaku::entity::{AfterWrite, Db, ReadOnly, ReadWrite, Write, WriteQuery};
+
+/// Publish a draft.
+pub struct PublishPost {
+    pub id: i64,
+}
+
+impl Query for PublishPost {
+    type Effect = (Read<Post>, Write<Post>);
+}
+
+impl Execute<PgSource> for PublishPost {
+    type Output = u64;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+        let done = sqlx::query("UPDATE post SET published_at = now() WHERE id = $1")
+            .bind(self.id)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected())
+    }
+}
+
+/// What every write query on `post` reports to hooks.
+pub struct PostChanged {
+    pub id: i64,
+}
+
+impl WriteQuery for PublishPost {
+    type Change = PostChanged;
+
+    fn change(&self) -> PostChanged {
+        PostChanged { id: self.id }
+    }
+}
+
+impl From<PostChanged> for Reindex<PostIndex> {
+    fn from(change: PostChanged) -> Self {
+        Reindex::one(change.id)
+    }
+}
+
+/// Hook errors end here; the request already succeeded.
+pub struct LogSyncError;
+
+impl Processor<SyncError<sqlx::Error>> for LogSyncError {
+    type Output = ();
+    type Error = Infallible;
+
+    async fn process(&self, error: SyncError<sqlx::Error>) -> Result<(), Infallible> {
+        eprintln!("reindexing posts failed: {error}");
+        Ok(())
+    }
+}
+```
+
+Wire it once, where the handles are built:
+
+```rust title="src/search/sync.rs"
+pub type PostIndexerFor = Indexer<Db<PgSource, ReadOnly>, Db<MeiliSource, PostIndexer>, PostProjection>;
+
+pub fn wire(
+    primary: PgSource,
+    meili: Db<MeiliSource, PostIndexer>,
+) -> AfterWrite<Db<PgSource, ReadWrite>, PostIndexerFor, LogSyncError> {
+    // Load from the primary: a lagging replica could return the old row.
+    let loader: Db<PgSource, ReadOnly> = Db::new(primary.clone());
+    let indexer = Indexer::new(loader, meili, PostProjection).without_waiting();
+    AfterWrite::new(Db::new(primary), indexer, LogSyncError)
+}
+```
+
+`primary` is `SqlxSource::new(pool)` over the primary's pool. The wrapped handle is a drop-in replacement: handlers that only require `Processor<PublishPost>` keep working unchanged, and every successful `PublishPost` now reindexes its post.
+
+A few things to know about this setup:
+
+- **`without_waiting()`** makes the hook return once the writes are enqueued, so a request doesn't wait for Meilisearch. The price: a task that fails later is not reported.
+- **Hook errors never fail the request.** If Meilisearch is down, the database write still succeeds and the error goes to `LogSyncError`.
+- **Load from the primary.** The indexer trusts what it loads; a replica that lags behind would hand it the row as it was *before* the write.
+- **A crash between the commit and the hook loses the update**, and two concurrent requests on the same post can race (both load, the older write lands last). Both are repaired by the next [rebuild](#rebuilding-an-index).
+
+<Callout type="info" title="Queries inside transactions skip write hooks">
+  `AfterWrite` sees queries run on their own. Queries inside a [transaction](/en/docs/data/transactions) run on the transaction's connection and don't pass through it. Hook the transaction instead.
+</Callout>
+
+## Delivering changes from transactions
+
+For writes that happen in a `TxFlow`, wrap the handle in `AfterTransaction`. Its hook receives the flow's report together with how the transaction ended ([`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)). Let the flow's `Report` be the `Reindex` of the posts it touched, and adapt the indexer:
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::meilisearch::sync::Reindexed;
+use wakuwaku::entity::sqlx::transaction::TxFinalState;
+use wakuwaku::entity::sqlx::transaction::hook::AfterTransaction;
+
+/// Transaction hook: reindex what a transaction touched, once it committed.
+pub struct ReindexCommitted<I>(pub I);
+
+impl<I> Processor<TxFinalState<Reindex<PostIndex>>> for ReindexCommitted<I>
+where
+    I: Processor<Reindex<PostIndex>, Output = Reindexed> + Sync,
+    I::Error: Send,
+{
+    type Output = ();
+    type Error = I::Error;
+
+    async fn process(&self, state: TxFinalState<Reindex<PostIndex>>) -> Result<(), I::Error> {
+        match state {
+            // Reloading is idempotent, so an unknown commit is safe to reindex.
+            TxFinalState::Committed(keys) | TxFinalState::CommitUnknown(keys) => {
+                self.0.process(keys).await?;
+                Ok(())
+            }
+            TxFinalState::RolledBack(_) => Ok(()),
+        }
+    }
+}
+
+pub fn wire_transactions(
+    primary: PgSource,
+    meili: Db<MeiliSource, PostIndexer>,
+) -> AfterTransaction<Db<PgSource, ReadWrite>, ReindexCommitted<PostIndexerFor>, LogSyncError> {
+    let loader: Db<PgSource, ReadOnly> = Db::new(primary.clone());
+    let indexer = Indexer::new(loader, meili, PostProjection).without_waiting();
+    AfterTransaction::new(Db::new(primary), ReindexCommitted(indexer), LogSyncError)
+}
+```
+
+`CommitUnknown` is where reindexing by key pays off: when the `COMMIT` result was lost, you can't know whether the post changed, but reloading it is correct either way. Queries run on their own pass through `AfterTransaction` untouched, so you can stack both hooks: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>`.
+
+## Delivering changes through a durable log
+
+Hooks run in the process that made the write, so a crash right after the commit loses the update. When that matters, use a durable log:
+
+1. In the same database transaction as the change, insert an *outbox* row naming the changed key.
+2. Relay outbox rows to a queue, such as an [Iggy stream](/en/docs/events), or use change data capture.
+3. Consume the queue with the indexer: convert each message into a `Reindex` and process it.
+4. **Partition the queue by key**, so that one key is reindexed by one worker at a time. This is what rules out stale overwrites.
+5. **Acknowledge a message only once the indexer succeeded.** Keep the indexer's default waiting here, so success really means "Meilisearch applied it".
+
+Because the indexer reloads by key, redelivered messages are harmless.
+
+## Rebuilding an index
+
+Whatever the delivery, rebuild periodically: it repairs whatever the delivery missed. [`rebuild()`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/rebuild/fn.rebuild.html) reads the whole source page by page and needs the projection to implement [`Scan`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/trait.Scan.html):
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::meilisearch::sync::Scan;
+
+/// One page of `post`, in id order.
+pub struct PostPage {
+    after: Option<i64>,
+    limit: i64,
+}
+
+impl Query for PostPage {
+    type Effect = Read<Post>;
+}
+
+impl Execute<PgSource> for PostPage {
+    type Output = Vec<PostRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
+        let rows: Vec<PostTuple> = sqlx::query_as(
+            "SELECT id, workspace_id, author_id, title, summary, tags, \
+                    EXTRACT(EPOCH FROM published_at)::bigint \
+             FROM post WHERE $1::bigint IS NULL OR id > $1 ORDER BY id LIMIT $2",
+        )
+            .bind(self.after)
+            .bind(self.limit)
+            .fetch_all(conn)
+            .await?;
+        Ok(rows.into_iter().map(PostRow::from).collect())
+    }
+}
+
+impl Scan for PostProjection {
+    type Page = PostPage;
+
+    fn page(&self, after: Option<&i64>, limit: usize) -> PostPage {
+        PostPage {
+            after: after.copied(),
+            limit: i64::try_from(limit).unwrap_or(i64::MAX),
+        }
+    }
+}
+```
+
+A page returns the rows whose key comes *after* `after` (every row if `None`), in ascending key order, at most `limit` of them. The order must be strict and stable: `rebuild()` continues after the key of the last row of each page, and stops at the first page with fewer than `limit` rows. Keyset pagination like this stays fast on large tables, unlike `OFFSET`. If a page ends at the same key as the previous one, the rebuild stops with `SyncError::StuckScan` instead of looping forever.
+
+Running it is one call:
+
+```rust title="src/search/rebuild.rs"
+use wakuwaku::entity::meilisearch::sync::{RebuildOptions, Rebuilt, rebuild};
+
+/// Rebuild `posts` from `post`.
+pub async fn rebuild_posts(
+    source: &Db<PgSource, ReadOnly>,
+    meili: &Db<MeiliSource, PostIndexer>,
+) -> Result<Rebuilt, SyncError<sqlx::Error>> {
+    let rebuilt = rebuild(&PostProjection, source, meili, &RebuildOptions::default()).await?;
+    eprintln!("rebuilt posts with {} documents", rebuilt.documents);
+    Ok(rebuilt)
+}
+```
+
+Schedule it with a [cron job](/en/docs/services/cron-jobs); nightly is a reasonable start.
+
+### How a rebuild works
+
+1. Delete any leftover copy named `posts__wakuwaku_rebuild` (from a failed earlier run), then create it.
+2. Apply the index's settings to the copy.
+3. Read the source page by page and upsert the documents into the copy, keeping one write in flight while the next page is read.
+4. Create the live index if it doesn't exist, then **swap** the live index and the copy in one step.
+5. Delete the copy, which now holds the old documents.
+
+Searches see either the old documents or the new ones, never a half-filled index. If anything fails, the live index is left as it was. This also makes a rebuild the right tool after changing settings or the projection: the new settings are applied to the copy, not to the index serving traffic.
+
+Only one rebuild of an index may run at a time, because each starts by deleting the copy. The API key of `meili` needs the `indexes.create`, `indexes.delete`, `indexes.swap`, `settings.update`, `documents.add` and `tasks.get` actions on both the index and its copy, and the capability must write the index (`C: CanWrite<PostIndex>`).
+
+<TypeTable
+  type={{
+    batch_size: { type: 'NonZeroUsize', description: 'Rows per page read from the source, and documents per write.', default: '1000' },
+    task_timeout: { type: 'Duration', description: 'How long to wait for each task.', default: '10 minutes' },
+    poll_interval: { type: 'Duration', description: 'How often to check whether a task has run.', default: '200 ms' },
+  }}
+/>
+
+### Writes during a rebuild
+
+The copy holds the source as each page was read. A change made to a row *after* its page was read, and reindexed into the live index meanwhile, is lost at the swap. Without further action, the next rebuild repairs it. To catch up right away, reindex the keys changed since [`Rebuilt::started_at`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/sync/rebuild/struct.Rebuilt.html). This needs a change timestamp on the rows, and soft deletes to find deleted rows:
+
+```rust title="src/search/rebuild.rs"
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Ids of posts changed since `since`, deleted ones included (soft deletes).
+pub struct ChangedSince {
+    since: SystemTime,
+}
+
+impl Query for ChangedSince {
+    type Effect = Read<Post>;
+}
+
+impl Execute<PgSource> for ChangedSince {
+    type Output = Vec<i64>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error> {
+        let since = self.since.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        sqlx::query_scalar("SELECT id FROM post WHERE updated_at >= to_timestamp($1)")
+            .bind(since)
+            .fetch_all(conn)
+            .await
+    }
+}
+
+pub async fn rebuild_and_catch_up(
+    source: &Db<PgSource, ReadOnly>,
+    meili: &Db<MeiliSource, PostIndexer>,
+) -> Result<Reindexed, SyncError<sqlx::Error>> {
+    let rebuilt = rebuild(&PostProjection, source, meili, &RebuildOptions::default()).await?;
+    let changed = source
+        .process(ChangedSince { since: rebuilt.started_at })
+        .await
+        .map_err(SyncError::Source)?;
+    let indexer = Indexer::new(source.clone(), meili.clone(), PostProjection);
+    indexer.process(Reindex::<PostIndex>::new(changed)).await
+}
+```
+
+## Choosing a strategy
+
+| Strategy | Index lags by | After a crash or outage | Good for |
+|---|---|---|---|
+| Write or transaction hook + periodic rebuild | Moments | Missed changes until the next rebuild | Starting out; most internal search |
+| Durable log + indexer + periodic rebuild | Queue latency | Nothing lost; changes are redelivered | Search users rely on, high write rates |
+| Rebuild only | Up to the rebuild interval | Nothing lost at the next rebuild | Small or rarely changing data, catalogs |
+
+Starting with a hook and a nightly rebuild is reasonable: the index is then at most a day off after a failure. Move to a durable log when that is no longer acceptable. Either way, the projection, the indexer and the rebuild stay the same; only the delivery changes.
+
+## Next steps
+
+<Cards>
+  <Card title="Hooks" href="/en/docs/data/hooks" description="How AfterWrite and BeforeWrite wrap a handle." />
+  <Card title="Transactions" href="/en/docs/data/transactions" description="Transaction flows and AfterTransaction." />
+  <Card title="Cron jobs" href="/en/docs/services/cron-jobs" description="Schedule the nightly rebuild." />
+</Cards>

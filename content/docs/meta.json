@@ -1,0 +1,19 @@
+{
+  "title": "wakuwaku",
+  "pages": [
+    "---Getting Started---",
+    "index",
+    "...getting-started",
+    "---Core Concepts---",
+    "...core",
+    "---Building Services---",
+    "...services",
+    "events",
+    "data",
+    "validation",
+    "---Guides---",
+    "...guides",
+    "roadmap",
+    "[ExternalLink][API Reference](https://docs.rs/wakuwaku/latest/wakuwaku/)"
+  ]
+}

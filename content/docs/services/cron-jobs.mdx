@@ -1,0 +1,395 @@
+---
+title: Cron jobs
+description: Run local jobs at a fixed interval, built from the ServiceBuilder, on a schedule that never overlaps and keeps going through errors and panics.
+icon: Clock
+---
+
+Most "cron" work in a microservice is a scan: expire stale sessions, retry stuck work, reconcile a search index. A [`CronJob`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/trait.CronJob.html) is exactly that: a [`Processor`](https://docs.rs/kanau/0.6/kanau/processor/trait.Processor.html) of [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html)s with a fixed `INTERVAL`. The interval is a constant of the job type, not a calendar expression: there is no "every day at 03:00" syntax.
+
+If you come from Spring, the closest thing is `@Scheduled(fixedRate = ...)` on a bean method. The differences are covered below: a run that takes too long skips the runs it covered instead of queueing them, and every replica of the service runs every job.
+
+## Defining a job
+
+A job is a struct holding its dependencies. It implements three traits:
+
+- [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html), to be built from a value registered in the [service builder](/en/docs/core/service-builder);
+- `Processor<CronTick>` with `Output = ()` and an `Error` that implements `Display`, which is one run;
+- `CronJob`, which adds the `INTERVAL`.
+
+The job must also be `Send + Sync + 'static`, because it runs on its own Tokio task.
+
+```rust title="src/jobs.rs"
+use std::time::Duration;
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::{CronJob, CronTick, ServiceCreation};
+
+pub struct ExpireSessions {
+    store: SessionStore,
+}
+
+impl ServiceCreation for ExpireSessions {
+    type Dep = SessionStore;
+
+    fn create_service(store: SessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl Processor<CronTick> for ExpireSessions {
+    type Output = ();
+    type Error = StoreError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), StoreError> {
+        let deleted = self.store.delete_expired(1_000).await?;
+        tracing::info!(deleted, "expired sessions removed");
+        Ok(())
+    }
+}
+
+impl CronJob for ExpireSessions {
+    const INTERVAL: Duration = Duration::from_secs(60);
+}
+```
+
+`SessionStore` and `StoreError` stand in for your own data access. The store is cheap to clone (it is cloned out of the service builder when the job is built), and the error only needs `Display`, because that is how a failed run is logged:
+
+```rust title="src/store.rs"
+/// Stand-in for a database pool: cheap to clone, every clone shares the data.
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    expired: Arc<AtomicU64>,
+}
+
+impl SessionStore {
+    pub async fn delete_expired(&self, limit: u64) -> Result<u64, StoreError> {
+        self.expired.fetch_add(1, Ordering::Relaxed);
+        Ok(limit.min(1))
+    }
+}
+
+#[derive(Debug)]
+pub struct StoreError(String);
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session store: {}", self.0)
+    }
+}
+```
+
+If you use the data layer, a `Db` handle is a natural `Dep`, and its query errors already implement `Display`; see [Data access](/en/docs/data).
+
+## The tick
+
+Each run receives a `CronTick`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `run` | `u64` | Number of earlier runs of this job since its runtime started: `0` for the first run. |
+| `fired_at` | `SystemTime` | Wall-clock time when the run started. |
+
+`run` counts runs that actually happened. Grid points skipped because of an overrun (see [The schedule](#the-schedule)) are not counted, so `run` is not "time since start divided by the interval". It is good for things like "do a full pass every Nth run":
+
+```rust
+impl Processor<CronTick> for ReindexSearch {
+    type Output = ();
+    type Error = StoreError;
+
+    async fn process(&self, tick: CronTick) -> Result<(), StoreError> {
+        // Every 24th run (and the first one) rebuilds everything;
+        // the others only pick up changes.
+        let reindexed = if tick.run % 24 == 0 {
+            self.index.reindex_all().await?
+        } else {
+            self.index.reindex_changed().await?
+        };
+        tracing::info!(run = tick.run, fired_at = ?tick.fired_at, reindexed, "search index refreshed");
+        Ok(())
+    }
+}
+
+impl CronJob for ReindexSearch {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+}
+```
+
+## Registering and starting
+
+`ServiceBuilder::cron_job::<Job, Position>()` looks up the job's `Dep`, clones it, builds the job with `create_service` and starts a job list. Chain one call per job, then `start`:
+
+```rust title="src/main.rs"
+let (services, cron) = ServiceBuilder::new(SessionStore::default())
+    .push(SearchIndex::default())
+    .cron_job::<ExpireSessions, _>()
+    .cron_job::<ReindexSearch, _>()
+    .start();
+
+// `services` is handed back: register gRPC servers, consumers, ... from it.
+let _store: &SessionStore = services.provide::<SessionStore, _>();
+
+let _ = tokio::signal::ctrl_c().await;
+// Lets the runs in progress finish, then stops every job.
+cron.shutdown().await;
+```
+
+- `Position` is `_` unless the `Dep` type is registered more than once (then use `Here` / `There`, see [The service builder](/en/docs/core/service-builder)). A `Dep` that was never registered is a compile error.
+- `start` spawns **one Tokio task per job** and returns the service builder together with a [`CronRuntime`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html). It must be called inside a Tokio runtime; outside one it panics.
+- Jobs are stored in a type-level list, like gRPC servers and the service builder itself: no boxing, no dynamic dispatch.
+
+## The schedule
+
+<CronScheduleDiagram lang="en" />
+
+Each job runs on its own grid, `start + k × INTERVAL`, where `start` is the moment `start` was called.
+
+- **The first run is at `start`**, not one interval later.
+- **Runs of one job never overlap.** A run that takes longer than `INTERVAL` skips the grid points it covered; the next run is at the first grid point that is not before the run ended. If a run ends exactly on a grid point, the next run starts right away.
+- So two consecutive runs always start a whole, non-zero number of intervals apart, and the schedule never drifts.
+
+For example, with a 10-second interval and a first run that takes 25 seconds, runs start at 0 s, 30 s, 40 s, 50 s, … The points at 10 s and 20 s are skipped, not queued.
+
+Different jobs are independent: a slow `ReindexSearch` never delays `ExpireSessions`.
+
+### Errors and panics
+
+A run that returns `Err` is logged with [`tracing`](https://docs.rs/tracing) at error level (`cron job failed`, with the error's `Display` output). A run that **panics** is caught and logged as well (`cron job panicked`, with the panic message). In both cases the job keeps its schedule: the next run happens at the next grid point as usual.
+
+Every run executes inside a `cron_job` tracing span with the fields `job` (the job's type name) and `run`, so everything your job logs can be traced back to the run. Install a `tracing` subscriber in `main` to see these logs.
+
+<Callout type="warn" title={'panic = "abort"'}>
+Catching a panic relies on unwinding. If your release profile sets `panic = "abort"`, a panicking job takes the whole process down instead.
+</Callout>
+
+## A zero interval does not build
+
+An `INTERVAL` of zero has no schedule, so registering such a job is rejected at compile time. Here `Busy` implements `ServiceCreation` and `Processor<CronTick>` as usual:
+
+```rust
+impl CronJob for Busy {
+    const INTERVAL: Duration = Duration::ZERO; // no schedule
+}
+
+#[tokio::main]
+async fn main() {
+    let (_services, cron) = ServiceBuilder::new(Config)
+        .cron_job::<Busy, _>() // `cargo build` fails: INTERVAL is zero
+        .start();
+    cron.shutdown().await;
+}
+```
+
+`cargo build` stops with (abridged):
+
+```text
+error[E0080]: evaluation panicked: CronJob::INTERVAL must not be zero
+   --> wakuwaku/src/services/cron_job.rs:250:17
+    |
+250 |         const { assert_interval::<Job>() };
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `wakuwaku::services::cron_job::CronRegisterCenter::<Busy>::new::{constant#0}` failed inside this call
+...
+note: the above error was encountered while instantiating `fn CronRegisterCenter::<Busy>::new`
+```
+
+The error points into wakuwaku's source rather than at your `cron_job` call; the job type in `CronRegisterCenter::<Busy>` tells you which job to fix.
+
+<Callout type="info" title="cargo check does not see it">
+The check is a `const` assertion that is evaluated when the registration is instantiated during code generation. `cargo build` and `cargo run` report it. **`cargo check`, `cargo clippy` and your editor do not**, and neither does `cargo test` unless a test actually reaches the registration (the test harness never calls your `main`, so the registrations in it are not instantiated). If CI only runs check, clippy and tests, add a `cargo build` step.
+</Callout>
+
+## Running on several replicas
+
+Jobs run **locally**: every process that starts a job runs it. With three replicas of a service, each run happens three times, and because each replica's grid starts when that replica started, the three runs are not aligned in time.
+
+Design each job for that. In order of preference:
+
+1. **Make it idempotent.** "Delete sessions that expired" is safe to run three times; the second and third runs find nothing to do.
+2. **Partition the work.** Have each replica scan only its share of the keys (for example by a hash of the id modulo the replica count).
+3. **Take a lock inside the run**, such as the Redis [`Lock`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/lock/struct.Lock.html) from the `redis` feature (see [Redis](/en/docs/data/redis) and [Locks](/en/docs/data/redis/lock)).
+
+With a lock, every replica tries to take it and at most one succeeds; the others skip that run:
+
+```rust title="src/jobs/digest.rs"
+use std::time::Duration;
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisError;
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::redis::collection::lock::Lock;
+use wakuwaku::entity::{Db, ReadWrite};
+use wakuwaku::{CronJob, CronTick, ServiceCreation};
+
+/// One lock per job name. The lease must outlast a run.
+const CRON_LOCKS: Lock<str> = Lock::new("cron", Duration::from_secs(5 * 60));
+
+pub struct SendDailyDigest {
+    db: Db<RedisSource, ReadWrite>,
+}
+
+impl ServiceCreation for SendDailyDigest {
+    type Dep = Db<RedisSource, ReadWrite>;
+
+    fn create_service(db: Db<RedisSource, ReadWrite>) -> Self {
+        Self { db }
+    }
+}
+
+impl Processor<CronTick> for SendDailyDigest {
+    type Output = ();
+    type Error = RedisError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), RedisError> {
+        // Every replica tries; at most one gets the token.
+        let Some(token) = self.db.process(CRON_LOCKS.try_lock("send-daily-digest")).await? else {
+            return Ok(()); // Another replica is running it right now.
+        };
+
+        // ... build and send the digest; call `token.extend()` for long work ...
+
+        self.db.process(token.release()).await?;
+        Ok(())
+    }
+}
+
+impl CronJob for SendDailyDigest {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+}
+```
+
+Acquiring never waits: `try_lock` outputs `Some(token)` if the lock was free and `None` otherwise. The lease (the lock's TTL) is what frees the lock if the holder crashes, so work that may outlive it must call `token.extend()`.
+
+<Callout type="warn" title="A lock prevents overlap, not repetition">
+Releasing the lock at the end of the run only guarantees that two replicas never run the job **at the same time**. Because the replicas' grids are offset, another replica may take the free lock a few seconds later and run the job again in the same interval. If the job must run about once per interval across all replicas, do not release the lock: set the lease a little shorter than `INTERVAL` and let it run out, so the lock itself records "someone ran this recently". The work must then finish well within the lease.
+</Callout>
+
+## Jobs that need several dependencies
+
+As with gRPC servers, a job built by `cron_job` gets **one** registered value. Either register a struct that bundles what the job needs and use it as `Dep`, or build the job by hand: end the chain with `into_parts`, which returns the service builder and the unstarted [`CronRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRegisterCenter.html), then `push` the job and `start`:
+
+```rust
+/// Needs two registered values, so it is built by hand.
+pub struct ReconcileIndex {
+    store: SessionStore,
+    index: SearchIndex,
+}
+```
+
+```rust title="src/main.rs"
+let (services, jobs) = ServiceBuilder::new(SessionStore::default())
+    .push(SearchIndex::default())
+    .cron_job::<ExpireSessions, _>()
+    .into_parts();
+
+let reconcile = ReconcileIndex {
+    store: services.provide::<SessionStore, _>().clone(),
+    index: services.provide::<SearchIndex, _>().clone(),
+};
+let cron = jobs.push(reconcile).start();
+```
+
+A hand-built job still implements `Processor<CronTick>` and `CronJob`; it only skips `ServiceCreation`. `CronRegisterCenter` also works without a service builder at all:
+
+```rust
+use wakuwaku::services::cron_job::CronRegisterCenter;
+
+let store = SessionStore::default();
+let cron = CronRegisterCenter::new(ExpireSessions::create_service(store.clone()))
+    .push(ReconcileIndex { store, index: SearchIndex::default() })
+    .start();
+cron.shutdown().await;
+```
+
+`new` and `push` both apply the [zero-interval check](#a-zero-interval-does-not-build).
+
+## Shutting down
+
+`CronRuntime` gives you two ways to stop the jobs:
+
+| | What happens |
+| --- | --- |
+| `cron.shutdown().await` | No new runs are scheduled. Jobs waiting for their next grid point stop at once; a run in progress is allowed to **finish**. Returns when every job has stopped. |
+| dropping `cron` | Every job is **aborted**, including runs in progress, at their next `.await`. |
+
+Prefer `shutdown`, so a job is never cut off in the middle of a batch. Since `shutdown` waits for the run in progress, a run that hangs would block it forever; bound it with a timeout if that matters:
+
+```rust
+if tokio::time::timeout(Duration::from_secs(30), cron.shutdown()).await.is_err() {
+    // Timing out drops the `CronRuntime`, which aborts the stuck runs.
+    tracing::warn!("cron jobs did not stop within 30s; aborted");
+}
+```
+
+In a service that also serves gRPC, start the jobs, build the servers from the service builder that `start` hands back, and stop the jobs after the server has drained:
+
+```rust title="src/main.rs"
+let (services, cron) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .cron_job::<ExpireSessions, _>()
+    .start();
+
+let (_services, register) = services
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .into_router_fn();
+
+let router = Server::builder().add_routes(Routes::default());
+register(router)
+    .serve_with_shutdown("[::1]:50051".parse()?, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+
+// The server has drained; now let the jobs finish their current run.
+cron.shutdown().await;
+```
+
+See [gRPC services](/en/docs/services/grpc) for the server side and [Lifecycle](/en/docs/core/lifecycle) for the order across a whole service.
+
+## Testing a job
+
+A job is a plain value, so a unit test builds it and calls `process` with a `CronTick` made by hand. No runtime, no waiting for the interval:
+
+```rust title="src/jobs.rs"
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn expire_sessions_deletes_from_the_store() {
+        let store = SessionStore::default();
+        let job = ExpireSessions::create_service(store.clone());
+
+        let tick = CronTick { run: 0, fired_at: SystemTime::now() };
+        job.process(tick).await.unwrap();
+
+        assert_eq!(store.expired.load(Ordering::Relaxed), 1);
+    }
+}
+```
+
+To test the scheduling itself, start the real runtime under Tokio's paused clock, where `sleep` advances virtual time instantly. This needs Tokio's `test-util` feature in `[dev-dependencies]` (`tokio = { version = "1", features = ["test-util"] }`):
+
+```rust
+#[tokio::test(start_paused = true)]
+async fn the_first_run_happens_at_start() {
+    let store = SessionStore::default();
+    let (_services, cron) = ServiceBuilder::new(store.clone())
+        .cron_job::<ExpireSessions, _>()
+        .start();
+
+    tokio::time::sleep(ExpireSessions::INTERVAL / 2).await;
+    cron.shutdown().await;
+
+    assert_eq!(store.expired.load(Ordering::Relaxed), 1);
+}
+```
+
+Most jobs only need the first kind of test: the schedule is wakuwaku's job and is tested there. See [Testing](/en/docs/core/testing) for the general approach.
+
+<Cards>
+  <Card title="gRPC services" href="/en/docs/services/grpc" description="Serve tonic servers built from the same service builder." />
+  <Card title="Redis" href="/en/docs/data/redis" description="Locks, caches and rate limiters shared between replicas." />
+  <Card title="The service builder" href="/en/docs/core/service-builder" description="How dependencies are registered and looked up by type." />
+  <Card title="Lifecycle" href="/en/docs/core/lifecycle" description="Start-up and shutdown order for a whole service." />
+</Cards>

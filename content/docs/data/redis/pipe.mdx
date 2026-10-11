@@ -1,0 +1,87 @@
+---
+title: Pipes
+description: Send ordered messages from one sender to one receiver anywhere in the cluster, like one direction of a websocket.
+icon: ArrowRightLeft
+---
+
+A [`Pipe`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/pipe/struct.Pipe.html) is a queue of messages from one sender to one receiver: the receiver gets each message once, in the order they were sent, until the sender closes the pipe. It is the shape of one direction of a websocket, but the two ends may live in different replicas. A typical use: the replica holding a browser's websocket receives, while whichever replica handles a backend event sends. Use a second pipe for the other direction.
+
+Messages wait in Redis while no receiver is listening, so the receiver may connect before or after the sender starts.
+
+## Sending and receiving
+
+```rust title="src/push.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::entity::redis::dynamic::pipe::Pipe;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum Frame {
+    Text(String),
+    /// Sent while there is nothing to say, so the pipe outlives its TTL.
+    Heartbeat,
+}
+
+/// Frames from the backend to one browser session.
+pub const TO_CLIENT: Pipe<str, Frame> = Pipe::new("to-client", Duration::from_secs(60));
+
+/// Backend: anywhere in the cluster.
+pub async fn notify(redis: &Redis, session: &str, text: String) -> RedisResult<()> {
+    redis.process(TO_CLIENT.send(session, Frame::Text(text))).await
+}
+
+pub async fn hang_up(redis: &Redis, session: &str) -> RedisResult<()> {
+    redis.process(TO_CLIENT.close(session)).await
+}
+
+/// Gateway: the instance holding the browser's websocket.
+pub async fn forward(redis: &Redis, client: &redis::Client, session: &str) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let mut receiver = redis.process(TO_CLIENT.receive(session, conn)).await?;
+    while let Some(frame) = receiver.recv().await? {
+        match frame {
+            Frame::Text(text) => write_to_websocket(&text).await,
+            Frame::Heartbeat => {}
+        }
+    }
+    // The backend closed the pipe after its last frame.
+    Ok(())
+}
+```
+
+- `send(name, body)` appends a message.
+- `close(name)` ends the pipe: the receiver gets every message sent before the close, then `recv` outputs `None`.
+- `receive(name, conn)` outputs a `PipeReceiver`. Its `recv` waits for the next message; `into_stream` turns it into a `Stream` that ends when the pipe is closed.
+
+`receive` takes a connection of its own because `recv` blocks on it; see [dedicated connections](/en/docs/data/redis#following-changes-dedicated-connections) for how to open one and why it must not be shared.
+
+## In Redis
+
+Each name is two lists in one cluster hash slot: `…:Pipe:{<namespace>:<name>}:m` holds the messages, and `…:c` receives a marker when the sender closes. The receiver waits with `BLPOP` on both, messages first, so it always sees the close after every message sent before it. Each send and the close push and restart the TTL in one `MULTI` block.
+
+## Lifetime and the TTL
+
+A pipe has no explicit "open". It is abandoned when nothing is written to it for one TTL:
+
+- Every `send` and the `close` restart the TTL of what they write, so a pipe whose sender stopped without closing it disappears one TTL later.
+- A receiver that gets nothing for a whole TTL fails with a "structure gone" `RedisError` instead of waiting forever.
+
+A sender that may stay quiet for longer than the TTL must send heartbeats, which is why `Frame` above has a `Heartbeat` variant. A failed `recv` may be retried, so a receiver that wants to tolerate a gap can call it again.
+
+## Guarantees and pitfalls
+
+- **Order.** Messages arrive in the order they were sent.
+- **At most once.** Taking a message removes it from Redis. A receiver that fails after taking a message, before handling it, loses it. When every message must be processed, use an [event stream](/en/docs/events) instead.
+- **One receiver at a time.** Two receivers on the same name would split the messages between them, and only one of them would see the close.
+- **Sends after a close** are accepted but never read; they expire with the pipe.
+- **Capability.** `send`, `close` and `receive` are all writes (`receive` removes messages), so the effect of each is `Write<Pipe<N, B>>`.
+
+## Next steps
+
+<Cards>
+  <Card title="Stream buffers" href="/en/docs/data/redis/stream-buffer" description="Many subscribers, replayable from any index." />
+  <Card title="Live views" href="/en/docs/data/redis/live-view" description="A durable document followed as diffs." />
+</Cards>

@@ -1,0 +1,5 @@
+{
+  "title": "Core Concepts",
+  "icon": "Boxes",
+  "pages": ["proof-driven", "service-builder", "lifecycle", "testing"]
+}

@@ -1,0 +1,115 @@
+---
+title: Stream buffers
+description: Append bodies to an ordered array with an end, and let any number of subscribers follow it from any index, such as the chunks of an LLM response.
+icon: ListEnd
+---
+
+A [`StreamBuffer`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/stream_buffer/struct.StreamBuffer.html) is an append-only array of bodies that ends when its producer finishes it. Any number of subscribers can read it from any index and follow new bodies as they are appended, so a client that reconnects resumes exactly where it stopped.
+
+The typical case is streamed output: a worker calls an LLM and appends each chunk, while the HTTP handler holding the user's connection, possibly on another replica, streams the chunks to the browser. If the browser reconnects, or a second tab opens the same answer, it subscribes from the index it already has.
+
+## Producing and subscribing
+
+```rust title="src/completion.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::entity::redis::dynamic::stream_buffer::StreamBuffer;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub struct Chunk {
+    pub text: String,
+}
+
+/// LLM completions per request ID, kept 2 minutes after their last chunk.
+pub const COMPLETIONS: StreamBuffer<u64, Chunk> =
+    StreamBuffer::new("completion", Duration::from_secs(120));
+
+/// Producer: a worker streaming from the model.
+pub async fn produce(redis: &Redis, request: u64, tokens: Vec<String>) -> RedisResult<()> {
+    for text in tokens {
+        if redis.process(COMPLETIONS.append(&request, Chunk { text })).await?.is_none() {
+            break; // already finished, e.g. cancelled by the user
+        }
+    }
+    redis.process(COMPLETIONS.finish(&request)).await?;
+    Ok(())
+}
+
+/// Subscriber: an HTTP handler streaming to a client that has already
+/// received `seen` chunks (0 on the first connection).
+pub async fn stream_to_client(
+    redis: &Redis,
+    client: &redis::Client,
+    request: u64,
+    seen: u64,
+) -> RedisResult<()> {
+    let conn = dedicated_connection(client).await?;
+    let mut subscription = redis.process(COMPLETIONS.subscribe(&request, seen, conn)).await?;
+    while let Some(chunk) = subscription.recv().await? {
+        send_to_client(&chunk.text).await;
+    }
+    Ok(())
+}
+```
+
+- `append(name, body)` adds a body, creating the buffer if needed. It outputs the body's index (from 0), or `None` if the buffer is already finished.
+- `finish(name)` ends the buffer, creating it empty if needed. Subscribers end after the last body, and later appends output `None`. It outputs `false` if the buffer was already finished.
+- `subscribe(name, from, conn)` outputs a subscription that first reads the bodies from index `from` on, then waits for new ones, and ends (`recv` outputs `None`) after the last body of a finished buffer. It may start before the buffer exists. `conn` is a [dedicated connection](/en/docs/data/redis#following-changes-dedicated-connections).
+- `remove(name)` deletes the buffer.
+
+Since `finish` is also how a *consumer* can stop the producer (the next `append` outputs `None`), a "stop generating" button needs nothing more than a call to `finish` from the handler that received the click.
+
+## Reading without waiting
+
+`read(name, from)` outputs the bodies from index `from` on and whether the buffer is finished, without blocking. Use it for polling clients, or to render what exists so far in a single response:
+
+```rust
+pub async fn poll(redis: &Redis, request: u64, seen: u64) -> RedisResult<(String, bool)> {
+    let contents = redis.process(COMPLETIONS.read(&request, seen)).await?;
+    let text: String = contents.bodies.into_iter().map(|chunk| chunk.text).collect();
+    Ok((text, contents.finished))
+}
+```
+
+An absent buffer reads as empty and unfinished, so `read` can't tell "not started yet" from "expired"; a subscription can (see below).
+
+## In Redis
+
+Each name is one Redis stream, `@@wakuwaku-entity:StreamBuffer:<namespace>:<name>`. The body at index `i` is the entry with ID `0-(i + 1)`, and a finished buffer ends with one more entry marking the end. `append` and `finish` are Lua scripts that check for the end marker and write the next entry atomically, so appends from several producers never get the same index and nothing is appended after the end.
+
+Subscribers read with `XREAD BLOCK` after the index they have, in batches of up to 128 entries, so they catch up on everything before waiting and never skip a body.
+
+## Lifetime and the TTL
+
+`StreamBuffer::new(namespace, ttl)` sets how long a buffer lives after its last change:
+
+- Every `append` and the `finish` restart the TTL, so a buffer lives one TTL after its last change, finished or not. Choose a TTL long enough for late subscribers to replay a finished buffer.
+- A subscriber that gets nothing for a whole TTL checks whether the buffer still exists. If it doesn't (it expired, or was removed, before being finished), `recv` fails with a "structure gone" `RedisError` and outputs `None` afterwards. So a subscriber never waits forever on a producer that crashed without finishing.
+- If the buffer still exists (the producer is just slow), the subscriber keeps waiting. Other failures of `recv` may be retried.
+
+## Pitfalls
+
+- **Appends are not idempotent.** If an `append` fails with a timeout after Redis ran it, retrying adds the body twice. For chunked text this is usually acceptable; otherwise include a sequence number in the body and let readers drop duplicates.
+- **Track indices on the client.** Resuming needs the number of bodies the client already received. Count them as they arrive; the index output by `append` is the same number seen from the producer's side.
+- **Finish, always.** A producer that fails should still call `finish` (and perhaps append an error body first), so subscribers end promptly instead of after a TTL.
+- **Capability.** `read` and `subscribe` are reads; `append`, `finish` and `remove` are writes.
+
+## Compared with the other dynamic structures
+
+| | [Pipe](/en/docs/data/redis/pipe) | [Live view](/en/docs/data/redis/live-view) | Stream buffer |
+| --- | --- | --- | --- |
+| Receivers | exactly one | any number | any number |
+| Reading consumes | yes | no | no |
+| Replay from a position | no | from a version | from an index |
+| Ends | when closed | never | when finished |
+| Expires | one TTL after the last write | never | one TTL after the last change |
+
+## Next steps
+
+<Cards>
+  <Card title="Redis overview" href="/en/docs/data/redis" description="Setup, keys, capabilities and dedicated connections." />
+  <Card title="Events" href="/en/docs/events" description="Durable, typed event streams on Apache Iggy." />
+</Cards>

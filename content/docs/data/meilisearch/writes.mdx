@@ -1,0 +1,132 @@
+---
+title: Writes
+description: Upsert and delete documents, apply index settings, and wait for Meilisearch's asynchronous tasks.
+icon: PenLine
+---
+
+Writes to Meilisearch don't behave like writes to a database. A request only *enqueues a task*; Meilisearch applies it later, and errors such as a document without a primary key only show up when the task runs. wakuwaku's write queries make this explicit: each one outputs the [`TaskInfo`](https://docs.rs/meilisearch-sdk/0.33.0/meilisearch_sdk/task_info/struct.TaskInfo.html) of its task, and a separate query waits for it.
+
+| Query | Effect | Does |
+|---|---|---|
+| [`Upsert<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.Upsert.html) | `Write<I>` | Adds documents, replacing those with the same primary key. |
+| [`Delete<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.Delete.html) | `Write<I>` | Deletes documents by primary key; keys without a document are ignored. |
+| [`ApplySettings<I>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.ApplySettings.html) | `Write<I>` | Writes the index's settings, creating the index if needed. |
+| [`WaitTask`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/meilisearch/write/struct.WaitTask.html) | `()` | Waits until a task has run; fails if the task failed. |
+
+All of them live in `wakuwaku::entity::meilisearch::write`.
+
+<Callout type="info" title="You rarely write an index by hand">
+  An index is a projection of another data source. In most services the only code that writes it is the [indexer](/en/docs/data/meilisearch/sync), which reloads documents from the source of truth. The queries on this page are its building blocks, and what you use for one-off jobs and deployment steps.
+</Callout>
+
+## A capability for the indexer
+
+`ReadWrite` would let the indexer write every entity of the system. Give it a capability that writes its own index and nothing else, the same way you would [narrow a database handle](/en/docs/data/queries):
+
+```rust title="src/search/indexer.rs"
+use wakuwaku::deps::meilisearch_sdk::client::Client;
+use wakuwaku::deps::meilisearch_sdk::errors::Error;
+use wakuwaku::entity::meilisearch::MeiliSource;
+use wakuwaku::entity::{CanRead, CanWrite, Db, Entity};
+
+/// The indexer service: reads every entity, writes the posts index only.
+pub enum PostIndexer {}
+impl<E: Entity> CanRead<E> for PostIndexer {}
+impl CanWrite<PostIndex> for PostIndexer {}
+
+/// Built from a key with `documents.*`, `settings.*` and `tasks.get`
+/// on the `posts` index.
+pub fn indexer_handle(url: &str, key: &str) -> Result<Db<MeiliSource, PostIndexer>, Error> {
+    Ok(Db::new(MeiliSource::new(Client::new(url, Some(key))?)))
+}
+```
+
+Both mistakes this guards against fail to compile. A search handle can't write:
+
+```rust
+async fn write_with_search_key(reader: &Db<MeiliSource, ReadOnly>) {
+    // error[E0277]: the trait bound `ReadOnly: CanWrite<PostIndex>` is not satisfied
+    let _ = reader.process(Upsert::<PostIndex>::new(vec![])).await;
+}
+```
+
+And the posts indexer can't touch another index:
+
+```rust
+async fn write_other_index(meili: &Db<MeiliSource, PostIndexer>) {
+    // error[E0277]: the trait bound `PostIndexer: CanWrite<UserIndex>` is not satisfied
+    let _ = meili.process(Delete::<UserIndex>::new(vec![1])).await;
+}
+```
+
+Pair the capability with a Meilisearch API key restricted to the same indexes, so Meilisearch refuses what the types would refuse.
+
+## Writing and waiting
+
+```rust title="src/search/indexer.rs"
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::meilisearch::write::{Delete, Upsert, WaitTask};
+
+/// Write documents and wait until Meilisearch has applied them.
+pub async fn index_posts(
+    meili: &Db<MeiliSource, PostIndexer>,
+    posts: Vec<PostDocument>,
+) -> Result<(), Error> {
+    let task = meili.process(Upsert::<PostIndex>::new(posts)).await?;
+    // Ok(TaskInfo) only means "enqueued". A bad document fails here.
+    meili.process(WaitTask::new(task, Duration::from_secs(30))).await
+}
+
+/// Remove documents; keys without a document are ignored.
+pub async fn unindex_posts(
+    meili: &Db<MeiliSource, PostIndexer>,
+    ids: Vec<i64>,
+) -> Result<u32, Error> {
+    let task = meili.process(Delete::<PostIndex>::new(ids)).await?;
+    Ok(task.task_uid)
+}
+```
+
+`Upsert` sends the documents with `PRIMARY_KEY` as the primary key, and `Delete` takes keys of the index's `Key` type, so a document of the wrong index or a key of the wrong type doesn't compile.
+
+### How tasks behave
+
+- **Order**: tasks of one index run in the order they were enqueued. An upsert followed by a delete of the same key ends with the document deleted.
+- **Success**: `WaitTask` outputs `()` once the task succeeded.
+- **Failure**: a failed task makes `WaitTask` fail with `Error::Meilisearch`, carrying the task's error.
+- **Timeout**: if the task is still pending after the timeout, `WaitTask` fails with `Error::Timeout`. The task keeps running; only your wait stopped.
+
+`WaitTask` touches no entity (its effect is `()`), so any handle may run it, including a read-only one.
+
+<Callout type="warn" title="Not waiting means not knowing">
+  If you skip `WaitTask`, a write that fails later goes unnoticed. That is a reasonable trade-off in a request path (see [`without_waiting`](/en/docs/data/meilisearch/sync#delivering-changes-with-a-write-hook)), but only if something else, such as a periodic [rebuild](/en/docs/data/meilisearch/sync#rebuilding-an-index), repairs what was missed.
+</Callout>
+
+## Applying settings
+
+[`SearchIndex::settings()`](/en/docs/data/meilisearch#the-index-itself) only describes the settings. `ApplySettings<I>` writes them, together with the filterable and sortable attributes taken from the index's field enums, and creates the index if it doesn't exist:
+
+```rust title="src/search/deploy.rs"
+use wakuwaku::entity::meilisearch::write::ApplySettings;
+
+/// Run once per deployment, before serving searches.
+pub async fn deploy_settings(meili: &Db<MeiliSource, PostIndexer>) -> Result<(), Error> {
+    let task = meili.process(ApplySettings::<PostIndex>::new()).await?;
+    // Changing filterable or searchable attributes reindexes every document.
+    meili.process(WaitTask::new(task, Duration::from_secs(600))).await
+}
+```
+
+Changing filterable, sortable or searchable attributes makes Meilisearch reindex every document, which can take a while on a large index. Run it when deploying, never per request. For a change you want to roll out without searches seeing a half-reindexed index, [rebuild](/en/docs/data/meilisearch/sync#rebuilding-an-index) the index instead: a rebuild applies the settings to a fresh copy and swaps it in.
+
+## Hooks on index writes
+
+Write queries on an index have the effect `Write<I>`, so they could be wrapped in [write hooks](/en/docs/data/hooks) like any other write. There is rarely a reason to. The index is a projection: hook the writes to its *source* instead, and update the index from there. That is what the next page is about.
+
+## Next steps
+
+<Cards>
+  <Card title="Sync" href="/en/docs/data/meilisearch/sync" description="Keep the index in sync with the table it projects." />
+  <Card title="Search" href="/en/docs/data/meilisearch/search" description="Query what you wrote." />
+</Cards>

@@ -1,0 +1,310 @@
+---
+title: Algebra
+description: Declare the algebraic laws an event type obeys so the consumer can collapse and fold its runs before your handler sees them.
+icon: Sigma
+---
+
+Every event type picks one **algebra marker** as its `Event::Algebra`. The marker states which laws applying the event obeys, and the consumer uses those laws to shrink each run *before* it reaches your handler: duplicate role grants collapse, a hundred stock adjustments fold into one. Fewer events means fewer handler calls, fewer database writes and less retry traffic, without changing the result.
+
+This is the second half of wakuwaku's batching story. [Ordering](/en/docs/events/ordering) decides which events may be grouped into a run; the algebra decides what may be done to a run.
+
+## Where reduction happens [#where]
+
+The consumer reduces each **run**: the events of one type, for one key, inside one ordering segment of one polled batch. For each run it:
+
+1. decodes the records into your body type;
+2. reduces them with the type's marker;
+3. passes the result to your `EventHandler::handle` in chunks of at most `MAX_BATCH` events.
+
+Runs never span keys, so every law below only has to hold **for events of the same key**. Unfinished work sent to the [retry topic](/en/docs/events/error-handling#retryable) is written already reduced.
+
+Writing `s · e` for "apply event `e` to state `s`", the markers are:
+
+| Marker                  | Law it promises                       | Bound on the body | Reduction of a run                    |
+|-------------------------|---------------------------------------|-------------------|---------------------------------------|
+| `NonAssociative`        | none                                  | none              | none                                  |
+| `Commutative`           | `s · a · b = s · b · a`               | none              | none; may be applied in any order     |
+| `Idempotent`            | `s · a · a = s · a`                   | `Eq`              | adjacent equal events collapse        |
+| `IdempotentCommutative` | both of the above                     | `Ord`             | all equal events collapse             |
+| `Associative`           | `s · a · b = s · combine(a, b)`       | `EventSemigroup`  | the run folds into one event          |
+
+<AlgebraDiagram lang="en" />
+
+All markers live in [`wakuwaku::iggy::partition::algebra`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/algebra/index.html) and are re-exported from `wakuwaku::iggy`. The trait behind them is sealed: these five are the only choices.
+
+## `NonAssociative` [#non-associative]
+
+**Promises nothing.** Every event is applied, in log order. Choose it when order matters and every occurrence counts.
+
+Example: chat messages in a room. The timeline *is* the log order, and two identical "hi" messages are two messages.
+
+```rust title="src/events/chat.rs"
+impl Event for MessagePosted {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(1);
+    type Key = RoomId;
+    // The timeline is the log order, and two identical "hi"s are two messages.
+    type Algebra = NonAssociative;
+
+    fn key(&self) -> RoomId {
+        RoomId(self.room)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+The handler still receives up to `MAX_BATCH` events per call, so a `NonAssociative` type can be batched; it just can't be shrunk.
+
+## `Commutative` [#commutative]
+
+**Promises `s · a · b = s · b · a`**: the events of a run may be applied in any order. Nothing is removed. No bound is required.
+
+The consumer does not drop anything for this marker; the run is passed to your handler as is. What the marker gives you is permission: your handler may apply the run in any order, for example with one multi-row `INSERT` or by firing its writes concurrently.
+
+Example: line items added to an order. Each one inserts a row; the insertion order is irrelevant, but two identical lines really are two purchases.
+
+```rust title="src/events/orders.rs"
+impl Event for LineItemAdded {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(10);
+    type Key = OrderId;
+    // Inserting rows: the order of insertion doesn't matter, but every line counts.
+    type Algebra = Commutative;
+
+    fn key(&self) -> OrderId {
+        OrderId(self.order)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+## `Idempotent` [#idempotent]
+
+**Promises `s · a · a = s · a`**: applying an event twice in a row is the same as applying it once. The body must implement `Eq`. The consumer collapses **adjacent** equal events (`Vec::dedup`).
+
+Only neighbors collapse, because the law says nothing about order: in `a, b, a` the second `a` may override `b`, so it has to stay. A run `[1, 1, 2, 1, 1]` becomes `[1, 2, 1]`.
+
+Example: granting and revoking a role. Granting `admin` twice in a row is granting it once, but a grant and a revoke do not commute.
+
+```rust title="src/events/users.rs"
+#[derive(PartialEq, Eq, Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct RoleChanged {
+    pub user: u64,
+    pub role: String,
+    pub granted: bool,
+}
+
+impl EventBody for RoleChanged {}
+
+impl Event for RoleChanged {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(20);
+    type Key = UserId;
+    // Granting `admin` twice in a row is granting it once.
+    // Grant and revoke don't commute, so only adjacent duplicates may go.
+    type Algebra = Idempotent;
+
+    fn key(&self) -> UserId {
+        UserId(self.user)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+## `IdempotentCommutative` [#idempotent-commutative]
+
+**Promises both laws**: duplicates are harmless *and* the order is irrelevant. The body must implement `Ord`. The consumer sorts the run and then removes duplicates, so equal events collapse wherever they appear. A run `[1, 1, 2, 1, 1]` becomes `[1, 2]`.
+
+Because commutativity allows reordering, the run reaches your handler **sorted by `Ord`**, not in log order.
+
+Example: adding tags to an article, which is inserting into a set.
+
+```rust title="src/events/articles.rs"
+#[derive(
+    PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe,
+)]
+pub struct TagAdded {
+    pub article: u64,
+    pub tag: String,
+}
+
+impl EventBody for TagAdded {}
+
+impl Event for TagAdded {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(30);
+    type Key = ArticleId;
+    // Adding to a set: any order, and duplicates anywhere in the run collapse.
+    type Algebra = IdempotentCommutative;
+
+    fn key(&self) -> ArticleId {
+        ArticleId(self.article)
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+## `Associative` [#associative]
+
+**Promises `s · a · b = s · combine(a, b)`**: two consecutive events can be replaced by one combined event with the same effect, and `combine` is associative. The body must implement [`EventSemigroup`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/partition/algebra/trait.EventSemigroup.html). The consumer folds the whole run, in log order, into a single event: `combine(combine(a, b), c)`.
+
+Example: stock adjustments. Any number of deltas for one SKU sum to one delta.
+
+```rust title="src/events/inventory.rs"
+#[derive(Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct StockAdjusted {
+    pub sku: String,
+    pub delta: i64,
+}
+
+impl EventBody for StockAdjusted {}
+
+impl EventSemigroup for StockAdjusted {
+    fn combine(self, later: Self) -> Self {
+        // Both events have the same key, so `sku` is the same.
+        Self {
+            sku: self.sku,
+            delta: self.delta + later.delta,
+        }
+    }
+}
+
+impl Event for StockAdjusted {
+    const TYPE_TAG: EventTypeTag = EventTypeTag::new(40);
+    type Key = Sku;
+    type Algebra = Associative;
+
+    fn key(&self) -> Sku {
+        Sku(self.sku.clone())
+    }
+
+    fn atomic_ordering(&self) -> EventAtomicOrdering {
+        EventAtomicOrdering::Relaxed
+    }
+}
+```
+
+The handler then performs one `UPDATE` per SKU per run, however many adjustments the batch held:
+
+```rust title="src/handlers/stock.rs"
+pub struct ApplyStock {
+    pub pool: PgPool,
+}
+
+impl EventHandler<StockAdjusted> for ApplyStock {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+    async fn handle(&self, run: &[StockAdjusted]) -> Result<(), HandleError> {
+        // One key per call, and an associative run is already folded:
+        // `run` holds a single event with the summed delta.
+        for adjustment in run {
+            wakuwaku::deps::sqlx::query("UPDATE stock SET quantity = quantity + $1 WHERE sku = $2")
+                .bind(adjustment.delta)
+                .bind(&adjustment.sku)
+                .execute(&self.pool)
+                .await
+                .map_err(HandleError::transient)?;
+        }
+        Ok(())
+    }
+}
+```
+
+(How to classify database errors properly is covered in [Error handling](/en/docs/events/error-handling#classifying).)
+
+### Last write wins is associative [#last-write-wins]
+
+"Set the field to this value" events look idempotent, but they are better modeled as `Associative`: applying `a` then `b` leaves `b`, so `combine` simply keeps the later event, and the whole run folds into its last event.
+
+```rust title="src/events/orders.rs"
+impl EventSemigroup for ShippingAddressChanged {
+    fn combine(self, later: Self) -> Self {
+        // Last write wins: applying `a` then `b` leaves `b`.
+        later
+    }
+}
+```
+
+`Idempotent` would only remove consecutive *equal* addresses; `Associative` removes every address but the last.
+
+Once a run folds into one event, idempotency and commutativity cannot shrink it further. That is why there is no idempotent or commutative variant of `Associative`.
+
+## Checked at compile time [#compile-time]
+
+The bounds are checked by the compiler, on the body type (`<E as IntoEventBody>::Target`, which is the event itself when it implements `EventBody`). Declaring `Idempotent` for a body without `Eq` fails:
+
+```rust
+#[derive(Serialize, Deserialize, kanau::JsonMessageSer, kanau::JsonMessageDe)]
+pub struct RoleChanged {
+    pub user: u64,
+    pub role: String,
+    pub granted: bool,
+}
+
+impl Event for RoleChanged {
+    // ...
+    type Algebra = Idempotent; // RoleChanged does not implement Eq
+    // ...
+}
+```
+
+```text
+error[E0277]: the trait bound `RoleChanged: Eq` is not satisfied
+   |
+   |     type Algebra = Idempotent; // RoleChanged does not implement Eq
+   |                    ^^^^^^^^^^ the trait `Eq` is not implemented for `RoleChanged`
+   |
+   = note: required for `wakuwaku::wakuwaku_iggy::Idempotent` to implement `Algebra<RoleChanged>`
+```
+
+The compiler can check that `Eq` exists; it cannot check that your laws hold. That part is on you (see [Pitfalls](#pitfalls)).
+
+## Choosing a marker [#choosing]
+
+Ask these questions in order and stop at the first "yes":
+
+<Accordions>
+  <Accordion title="1. Can two consecutive events be replaced by one event with the same effect?">
+    Use `Associative` and implement `EventSemigroup`. Sums, counters, maxima, merges of sets, and last-write-wins updates all fold. This is the strongest reduction: one event per run.
+  </Accordion>
+  <Accordion title="2. Is applying the same event twice the same as once, and is the order irrelevant?">
+    Use `IdempotentCommutative` and derive `Ord`. Typical for set inserts and "mark as X" flags that are never unset by the same type.
+  </Accordion>
+  <Accordion title="3. Is applying the same event twice in a row the same as once?">
+    Use `Idempotent` and derive `Eq`. Typical for set/unset pairs carried by one type, such as grant and revoke.
+  </Accordion>
+  <Accordion title="4. Is the order irrelevant, but every event counts?">
+    Use `Commutative`. Typical for row inserts and independent notifications. Nothing is removed, but your handler may apply the run in any order.
+  </Accordion>
+  <Accordion title="5. None of the above">
+    Use `NonAssociative`. It is always correct, just never reduced.
+  </Accordion>
+</Accordions>
+
+## Pitfalls [#pitfalls]
+
+<Callout type="error" title={"Claiming a law the handler doesn't satisfy loses data silently"}>
+  The consumer trusts the marker. Declare `Idempotent` on an "increment by one" event and two increments in a row become one. Declare `IdempotentCommutative` on a `SwitchSet { on: bool }` event and the run "on, off, on" becomes "off, on" (sorted, then deduplicated): the switch ends up off instead of on. Write a `combine` that keeps only the later event for a partial update ("change the fields that are `Some`") and the fields set by earlier events are lost. None of this fails at runtime; the result is just wrong.
+</Callout>
+
+- **Equality must mean "same effect".** `Idempotent` and `IdempotentCommutative` compare whole bodies with `Eq`/`Ord`. If the body carries an event id or a timestamp, no two events are ever equal and nothing collapses (correct, but useless). A hand-written `Eq` that ignores a field that changes the effect is worse: events that differ get merged.
+- **Every occurrence counts?** Collapsing and folding mean fewer handler calls. If each event must trigger its own side effect (one e-mail per event, one webhook per event), use `NonAssociative` or `Commutative`.
+- **`combine` must be associative and keep the key.** The fold is `combine(combine(a, b), c)`; any grouping must give the same result. `combine` only ever sees events of the same key, so it may keep the key fields of either side, but it must not change them.
+- **Reduction is an optimization, not a guarantee.** It only happens inside one run of one polled batch. Events of the same key in different batches, or on different sides of a fence, reach your handler in separate calls. Your handler must give the correct result for any run, reduced or not.
+- **Changing the marker of an existing type.** Every message header carries its type's algebra, and the consumer drops (and logs) records whose header doesn't match the marker the registered type declares. Messages already in the log under the old marker are therefore dropped after the change. Either drain the topic first or publish the new semantics under a new `TYPE_TAG`.
+
+## Next steps [#next-steps]
+
+<Cards>
+  <Card title="Ordering" href="/en/docs/events/ordering" description="How runs are formed from a polled batch." />
+  <Card title="Error handling" href="/en/docs/events/error-handling" description="Classify failures and understand the retry topic." />
+  <Card title="Consuming events" href="/en/docs/events/consuming" description="Register handlers and choose MAX_BATCH." />
+</Cards>

@@ -1,0 +1,86 @@
+---
+title: Apache Iggy によるイベント
+description: wakuwaku が Apache Iggy 上で型付きイベントを発行・購読する仕組みを、キー単位の順序保証、キーの並行処理、代数的なバッチ処理とあわせて説明します。
+icon: Radio
+---
+
+`wakuwaku::iggy`（[`wakuwaku-iggy`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/) クレート）は wakuwaku のイベント層です。イベント型を Rust の型として一度定義すれば、残りはフレームワークが引き受けます。どの Iggy トピックとパーティションに送るか、ボディをどうエンコードするか、どのイベントを順番どおりに処理すべきか、どれをまとめたり畳み込んだりできるか、ハンドラが失敗したらどうするか、といった点です。
+
+Spring に慣れている方は、Spring for Apache Kafka が担っている役割、つまり型付きのパブリッシャーとリスナーメソッドを思い浮かべてください。違いは判断の置き場所です。wakuwaku では順序とバッチ処理のルールを**イベント型**に宣言し、コンパイラがそれを検査します。コンシューマはその宣言を使い、イベントが求める順序を崩さない範囲でパーティションを並行に処理します。
+
+## なぜパーティション単位ではなくキー単位で順序を守るのか [#why-order-per-key-not-per-partition]
+
+Iggy のパーティションは全順序のログです。最も単純なコンシューマはレコードを厳密に 1 件ずつ処理しますが、これには 2 つのコストがあります。
+
+- **1 つのキーが他のキーを止める。** 1 つのパーティションには多くのキー（ユーザー、注文など）のイベントが混在します。注文 17 のイベント処理が遅かったり失敗し続けたりすると、同じパーティションにある他の注文はすべてその後ろで待たされます。
+- **何もまとめられない。** あるユーザーへの「ポイント付与」イベントが 10 件続けば、合計を 1 回渡せば済む場合でもハンドラ呼び出しは 10 回になります。
+
+業務ロジックがパーティション全体の順序を必要とすることはほとんどありません。必要なのは**1 つのキーに属するイベント**の順序です。注文は支払いより先に作成されていなければなりませんが、注文 17 と注文 18 は互いに無関係です。そこで wakuwaku はキー単位で順序を守ります。
+
+- 異なるキーのイベントは、同じパーティションにあっても互いに順序づけられません。キー同士は並行に処理されます。
+- 1 つのキーの中では、同じ型のイベントは常にログ順を保ちます。
+- 1 つのキーの中の異なる型のイベント同士については、各イベントの `EventAtomicOrdering`（`Relaxed`、`Acquire`、`Release`、`AcqRel`）が、何が何を追い越してよいかを決めます。詳しくは [順序](/ja/docs/events/ordering) を参照してください。
+- ポーリングした 1 バッチの中で、2 つの順序フェンスの間にある同じ型・同じキーのイベントすべてが *ラン* (run) になります。イベント型の代数（`NonAssociative`、`Commutative`、`Idempotent`、`IdempotentCommutative`、`Associative`）は、ハンドラに渡す前にランをどう縮約してよいかを表します。詳しくは [代数](/ja/docs/events/algebra) を参照してください。
+
+順序がキーの範囲に閉じているので、失敗したキーだけを脇へ退かすこともできます。そのキーの未完了の処理はリトライトピックへ移り、パーティションの残りはそのまま流れ続けます。詳しくは [エラー処理](/ja/docs/events/error-handling) を参照してください。
+
+## モデル [#the-model]
+
+イベントの送り先と識別方法は、次の 3 つの型で決まります。
+
+| 宣言するもの | 対応するもの | 決める場所 |
+|---|---|---|
+| `PartitionKey` を実装したキー型 | その型の *スーパーパーティション*。この型をキーとするすべてのイベントを運ぶ Iggy の**トピック**（`SUPER_PARTITION_NAME`） | キー型 |
+| キーの値を、キー型の `PartitionMerge` ハッシャーでハッシュしたもの | そのトピック内の Iggy の**パーティション**。等しいキーは常に同じパーティションに入ります | `key_hash` |
+| `Event` を実装したイベント型 | そのトピック内のレコード。`TYPE_TAG` が付くので、複数のイベント型が 1 つのトピックを共有できます | イベント型 |
+
+**ストリーム**は型には含まれず、設定から決まります。`Publisher::new` と `ConsumerConfig` に渡すストリーム名です。キー型ごとに 1 つのトピックなので、注文に関するすべてのイベント（作成、支払い、発送など）は `OrderId` をキーとする 1 つのトピックに集まります。そのため 1 つのコンシューマがそれらすべてをログ順に受け取り、イベント間の順序を守れます。
+
+<EventFlowDiagram lang="ja" />
+
+## コンシューマが行うこと [#what-the-consumer-does]
+
+`IggyConsumerRegisterCenter::start` は、設定したパーティションごとに 1 つのタスクを起動します。各タスクは次の段階を繰り返します。
+
+1. **まずリトライ。** リトライトピック `retry_<topic>` の自分のパーティションを読み、リトライの待ち時間が過ぎたキーを再実行します。
+2. **ポーリング。** メイントピックの自分のパーティションから最大 `poll_count` 件のレコードを取得します。
+3. **計画。** バッチをキーのハッシュでグループ化し、各キーのイベントを順序フェンスでセグメントに分け、各セグメントのイベントを型ごとにランにまとめます。
+4. **実行。** キー同士は並行に処理します。1 つのキーの中ではセグメントを順に処理し、セグメントの中では先頭 (head) のラン、本体 (body) のラン群を並行に、最後に末尾 (tail) のランを処理します。
+5. **縮約してハンドラへ。** 各ランをデコードし、イベント型の代数で縮約し、最大 `MAX_BATCH` 件ずつのチャンクに分けてハンドラを呼び出します。
+6. **失敗の隔離。** リトライ可能な失敗が起きると、そのキーの未完了の処理をリトライトピックへ移し、キーを隔離します。以後のそのキーのイベントはリトライトピックでその後ろに並びます。
+7. **コミット。** `DeliveryMode` に応じて、処理の前または後にコンシューマのオフセットを保存します。
+
+API とすべての設定項目は [イベントの購読](/ja/docs/events/consuming) で順に説明します。
+
+## フィーチャーを有効にする [#enabling-the-feature]
+
+イベント機能は `iggy` フィーチャーの後ろにあり、デフォルトでは無効です。
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["iggy"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+このフィーチャーで次のものが使えるようになります。
+
+- `wakuwaku::iggy`: 再エクスポートされた `wakuwaku-iggy` クレート（イベント、パブリッシャー、ハンドラ、コンシューマのランタイム）。
+- `wakuwaku::deps::iggy`: wakuwaku がビルドに使っている Apache Iggy のクライアント SDK（`iggy` 0.11）。`IggyClient` やストリーム・トピックの作成にはこれを使ってください。`iggy` を自分で依存に加えるより、バージョンが常に一致します。
+- `ServiceBuilder::iggy_consumer`: サービスの共有依存からイベントハンドラを組み立てる機能。
+
+イベントのボディは `kanau::message` のトレイトでシリアライズします。serde の JSON で derive するには依存を 2 つ追加する必要があります。[ボディのシリアライズ](/ja/docs/events/defining-events#serializing-the-body) を参照してください。
+
+<Callout type="info" title="Iggy サーバーが必要です">
+  例では `iggy://iggy:iggy@localhost:8090` で Apache Iggy サーバーに接続します。これはローカルの Iggy サーバーのデフォルトの認証情報と TCP ポートです。発行や購読の前に、ストリームとメイントピックが存在している必要があります。[サーバーに必要なもの](/ja/docs/events/publishing#what-must-exist-on-the-server) を参照してください。
+</Callout>
+
+## このセクションの内容 [#in-this-section]
+
+<Cards>
+  <Card title="イベントの定義" href="/ja/docs/events/defining-events" description="パーティションキー、イベント型、型タグ、ボディのシリアライズ。" />
+  <Card title="イベントの発行" href="/ja/docs/events/publishing" description="Publisher による送信、書き込まれるヘッダー、サーバー側の準備。" />
+  <Card title="イベントの購読" href="/ja/docs/events/consuming" description="イベントハンドラ、登録方法、ConsumerConfig、配信保証。" />
+  <Card title="順序" href="/ja/docs/events/ordering" description="1 つのキーの中での Relaxed、Acquire、Release、AcqRel。" />
+  <Card title="代数" href="/ja/docs/events/algebra" description="ハンドラに届く前にイベントのランをまとめたり畳み込んだりする仕組み。" />
+  <Card title="エラー処理" href="/ja/docs/events/error-handling" description="一時的・リトライ可能・回復不能な失敗と、リトライトピック。" />
+</Cards>

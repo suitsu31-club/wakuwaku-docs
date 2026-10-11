@@ -1,0 +1,223 @@
+---
+title: Validation (Proof)
+description: Make "forgot to validate" a compile error by passing proofs of validation instead of raw values.
+icon: ShieldCheck
+---
+
+`wakuwaku::proof` (the [`wakuwaku-proof`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/) crate) is proof-carrying validation. You describe a rule as a **predicate**, run it once with `prove`, and get back a `Proven<T, P>`: the value together with the evidence that the rule held. Code that needs a validated value asks for `Proven<T, P>` in its signature, so an unvalidated value cannot reach it.
+
+## The bug this prevents
+
+Most validation bugs are not wrong rules. They are rules that never ran:
+
+```rust
+// Every caller has to remember to validate `name` first.
+fn register(name: String) { /* ... */ }
+```
+
+A validated `String` and an unvalidated `String` have the same type, so nothing stops a new endpoint, a background job, or a refactor from calling `register` with raw input. If you come from Spring, this is the classic missing `@Valid` on a controller parameter: the constraints are declared, but nothing forces them to be checked.
+
+With `wakuwaku::proof` the requirement moves into the type:
+
+```rust
+fn register(name: Proven<String, ValidUsername>) { /* ... */ }
+```
+
+The only way to get a `Proven<String, ValidUsername>` is to run the `ValidUsername` check (or to derive it from another proof). Forgetting to validate becomes a type error.
+
+<ProofDiagram lang="en" />
+
+## Setup
+
+The `proof` feature is on by default, so `wakuwaku` alone is enough. Predicates are plain async code; you only need `tokio` directly for `#[tokio::main]` and `#[tokio::test]`. Inside a wakuwaku service, gRPC handlers already run on a runtime.
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = "1.0.0-rc1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+## The pieces
+
+| Item | Role |
+| --- | --- |
+| [`ValidateContext`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.ValidateContext.html) | What a check reads while deciding (configuration, connection handles, caches), plus the error type for "could not decide". |
+| [`Predicate<T>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.Predicate.html) | A proposition about a `T`, decided at runtime. The predicate type is also its own evidence. |
+| [`prove`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/fn.prove.html) | Runs a predicate against a subject and wraps both in a `Proven` on success. |
+| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | The subject plus evidence that `P` held. Only obtainable from `prove` or from another proof. |
+| [`ValidateError<E>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.ValidateError.html) | `Deny(DeniedReason)` when the rule is false, `IoError(E)` when it could not be decided. |
+| [`DeniedReason`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.DeniedReason.html) | A `&'static str` explaining a denial, compared by identity. |
+
+### A context
+
+Every predicate names its context type. A context implements `ValidateContext`, which fixes the error type for checks that fail to decide. Pure checks cannot fail that way, so they use `Infallible`:
+
+```rust title="src/validation.rs"
+use std::convert::Infallible;
+use wakuwaku::proof::{
+    And, CheckOrder, DeniedReason, Predicate, Proven, ValidateContext, ValidateError, prove,
+};
+
+/// Everything the checks read. Here: configuration only.
+#[derive(Clone)]
+pub struct Limits {
+    pub max_len: usize,
+}
+
+impl ValidateContext for Limits {
+    // Pure checks cannot fail to decide.
+    type IoError = Infallible;
+}
+```
+
+### Predicates
+
+A predicate is a type that implements `Predicate<T>`. `check` takes no `self`: everything the decision needs comes from the subject and the context. When the rule holds, `check` returns a value of the predicate type itself. That value is the **evidence**. A rule with nothing to report is a unit struct; a rule that learns something while deciding stores it in its fields.
+
+```rust title="src/validation.rs"
+pub static EMPTY: DeniedReason = DeniedReason("username is empty");
+pub static TOO_LONG: DeniedReason = DeniedReason("username is too long");
+
+/// "The name is not empty." Nothing to report, so a unit struct.
+pub struct NonEmpty;
+
+impl Predicate<String> for NonEmpty {
+    type Ctx = Limits;
+
+    async fn check(
+        name: &String,
+        _: &Limits,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<Infallible>> {
+        if name.is_empty() {
+            Err(ValidateError::Deny(EMPTY))
+        } else {
+            Ok(NonEmpty)
+        }
+    }
+}
+
+/// "The name fits in `max_len` bytes." Records how much room was left.
+pub struct ShortEnough {
+    pub spare: usize,
+}
+
+impl Predicate<String> for ShortEnough {
+    type Ctx = Limits;
+
+    async fn check(
+        name: &String,
+        limits: &Limits,
+        _: CheckOrder,
+    ) -> Result<Self, ValidateError<Infallible>> {
+        match limits.max_len.checked_sub(name.len()) {
+            Some(spare) => Ok(ShortEnough { spare }),
+            None => Err(ValidateError::Deny(TOO_LONG)),
+        }
+    }
+}
+```
+
+The future returned by `check` must be `Send`, so a check can run inside any tonic handler. The `CheckOrder` argument only matters to predicates that combine others; leaf predicates may ignore it (see [Composing predicates](/en/docs/validation/composition#check-order)).
+
+### Proving
+
+`prove` takes the subject by value, runs the check, and returns either the proof or the error. `And<NonEmpty, ShortEnough>` is itself a predicate that holds when both hold; [Composing predicates](/en/docs/validation/composition) covers it in detail.
+
+```rust title="src/validation.rs"
+/// Both must hold.
+pub type ValidUsername = And<NonEmpty, ShortEnough>;
+
+/// Only callable with a name that went through `prove`.
+pub fn register(name: Proven<String, ValidUsername>) -> String {
+    let And(_, short_enough) = name.evidence();
+    format!("{} ({} bytes to spare)", name.subject(), short_enough.spare)
+}
+
+pub async fn handle(input: String) -> Result<String, &'static str> {
+    let limits = Limits { max_len: 16 };
+
+    match prove::<_, ValidUsername>(input, &limits, CheckOrder::Sequential).await {
+        Ok(name) => Ok(register(name)),
+        Err(ValidateError::Deny(reason)) => Err(reason.0),
+        // `Infallible` has no values: this arm can never run.
+        Err(ValidateError::IoError(never)) => match never {},
+    }
+}
+```
+
+`handle("haruki".into())` returns `Ok("haruki (10 bytes to spare)")`; an empty string returns `Err("username is empty")`. When the check fails, the subject is dropped along with the error.
+
+## Three outcomes
+
+A check ends in exactly one of three ways:
+
+| Result | Meaning | Typical handling |
+| --- | --- | --- |
+| `Ok(evidence)` | The proposition holds. `prove` returns `Proven<T, P>`. | Continue with the proof. |
+| `Err(ValidateError::Deny(reason))` | The proposition was decided and is false. | Reject the input (`INVALID_ARGUMENT`, `ALREADY_EXISTS`, …). |
+| `Err(ValidateError::IoError(e))` | The proposition could not be decided, e.g. the database was unreachable. | Treat as a server-side failure (`UNAVAILABLE`), not as bad input. |
+
+<Callout type="warn" title="An I/O error is not a denial">
+`IoError` says nothing about whether the subject is valid. Reporting it to the client as "invalid input" blames the user for an outage. Keep the two arms separate; [Using proofs in services](/en/docs/validation/in-services#mapping-validateerror-to-a-grpc-status) shows a mapping to `tonic::Status`.
+</Callout>
+
+### Denied reasons
+
+`DeniedReason` wraps a `&'static str`, and its equality is **pointer identity**, not string content. Two reasons with the same text may compare unequal if they live at different addresses, and string literals or references to a `const` are not guaranteed to share one. Declare each reason once as a `static` and compare against that `static`:
+
+```rust
+pub static TAKEN: DeniedReason = DeniedReason("username is already taken");
+
+// Later, when mapping errors:
+if reason == TAKEN { /* ... */ }
+```
+
+The text is in `reason.0` when you need to show it.
+
+## Evidence
+
+The predicate type is its own evidence. `Proven::evidence()` hands it out **by reference**:
+
+- `NonEmpty` carries nothing; holding the proof is the information.
+- `ShortEnough { spare }` records how much room was left, so `register` reads `short_enough.spare` without measuring again.
+- An I/O predicate can carry the database row it looked up (see [I/O predicates](/en/docs/validation/composition#io-predicates)), so later code does not repeat the query.
+
+Inside `Proven`, `And` and `Or`, each piece of evidence is wrapped in [`Evidence<P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Evidence.html). It dereferences to `&P`, it cannot be moved out, and it is **not `Clone`**, even when `P` is. Only the crate's Boolean-algebra laws duplicate evidence, and only those whose result contains the same proof twice; those require `P: Clone` (see [Deriving proofs](/en/docs/validation/derivation#when-evidence-must-be-clone)).
+
+The subject is also exposed only as `&T` through `Proven::subject()`, so it cannot be changed after the check (interior mutability aside). There is no method that gives the subject back by value; clone it if you need an owned copy.
+
+<Callout type="info" title="A proof is a snapshot">
+Both subject and evidence describe the moment of the check. If the predicate depends on external state, such as "this username is free", that state may have changed since. Keep the database's own constraints (for example a unique index) as the final guard.
+</Callout>
+
+## Never accept a bare predicate
+
+It is tempting to require the evidence type directly:
+
+```rust
+// Do not do this: proves nothing.
+fn register(name: String, _proof: NonEmpty) { /* ... */ }
+```
+
+Anyone can write `NonEmpty`, and calling `Predicate::check` directly returns evidence that is not tied to any subject. Take `Proven<T, P>` in signatures, never a bare `P`.
+
+`Proven` is safe to require because its fields are private. Outside the crate a `Proven` comes only from `prove`, or from another proof through `Proven::from_a`, `from_b`, `from_both`, `into_a`, `into_b` and `derive`. Both shortcuts fail to compile:
+
+```rust
+let input = String::from("haruki");
+register(input); // error[E0308]: mismatched types
+                 // expected `Proven<String, And<NonEmpty, ShortEnough>>`, found `String`
+
+let fake = Proven { subject: String::new(), evidence: todo!() };
+// error[E0451]: fields `subject` and `evidence` of struct `Proven` are private
+```
+
+## Next steps
+
+<Cards>
+  <Card title="Composing predicates" href="/en/docs/validation/composition" description="And, Or, check order, and predicates that do I/O." />
+  <Card title="Deriving proofs" href="/en/docs/validation/derivation" description="Turn a proof into a weaker or equivalent one without rechecking." />
+  <Card title="Using proofs in services" href="/en/docs/validation/in-services" description="Validate gRPC requests and pass proofs into domain logic and queries." />
+  <Card title="Proof-driven design" href="/en/docs/core/proof-driven" description="How wakuwaku splits correctness between the compiler and tests." />
+</Cards>

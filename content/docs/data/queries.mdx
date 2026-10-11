@@ -1,0 +1,380 @@
+---
+title: Queries and Handles
+description: Define entities and queries, run them through capability-typed Db handles, route reads to a replica, and inject the handles into your components.
+---
+
+This page builds the data access of a small user service on PostgreSQL. It defines queries, builds a primary handle and a replica handle, sends each query to the right one, and registers the handles in the [`ServiceBuilder`](/en/docs/core/service-builder). The concepts behind it (entities, capabilities, effects) are explained in the [overview](/en/docs/data).
+
+## Setup
+
+```toml title="Cargo.toml"
+[dependencies]
+wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+`sqlx-pg` enables `wakuwaku::entity` with the PostgreSQL data source, and re-exports sqlx as `wakuwaku::deps::sqlx`.
+
+## Define the entities
+
+```rust title="src/entities.rs"
+use wakuwaku::entity::Entity;
+
+/// The `users` table.
+pub struct User;
+impl Entity for User {}
+
+/// The `posts` table.
+pub struct Post;
+impl Entity for Post {}
+```
+
+## Define a query
+
+A query implements two traits:
+
+- [`Query`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Query.html) says **what it touches**: its `Effect`. This part doesn't depend on where the query runs, so capability checks and [hooks](/en/docs/data/hooks) work the same for every data source.
+- [`Execute<S>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html) says **how it runs** on the data source `S`: its `Output`, and the code that runs on a connection. A query written in portable SQL may implement it for several sources.
+
+```rust title="src/queries.rs"
+use crate::entities::{Post, User};
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Execute, Query, Read, Write};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRow {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Load one user by id.
+pub struct FindUser {
+    pub id: i64,
+}
+
+impl Query for FindUser {
+    type Effect = Read<User>;
+}
+
+impl Execute<PgSource> for FindUser {
+    type Output = Option<UserRow>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
+        let row: Option<(i64, String)> = sqlx::query_as("SELECT id, name FROM users WHERE id = $1")
+            .bind(self.id)
+            .fetch_optional(conn)
+            .await?;
+        Ok(row.map(|(id, name)| UserRow { id, name }))
+    }
+}
+```
+
+`execute` receives a plain `&mut PgConnection` and returns the data source's error type, `sqlx::Error` for sqlx sources. When the query runs on its own, the connection comes from the pool in autocommit mode. Inside a [transaction](/en/docs/data/transactions), it is the transaction's connection. The same query works in both places.
+
+A query that touches several entities lists them all. A tuple is the union of its effects:
+
+```rust title="src/queries.rs"
+/// Titles of the posts of an active author.
+pub struct PostsByAuthor {
+    pub author: i64,
+}
+
+impl Query for PostsByAuthor {
+    // Reads two tables: a tuple is the union of its effects.
+    type Effect = (Read<User>, Read<Post>);
+}
+
+impl Execute<PgSource> for PostsByAuthor {
+    type Output = Vec<String>;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT p.title FROM posts p JOIN users u ON u.id = p.author_id \
+             WHERE u.id = $1 AND u.active ORDER BY p.created_at DESC",
+        )
+        .bind(self.author)
+        .fetch_all(conn)
+        .await
+    }
+}
+```
+
+A write declares `Write<E>`. A capability that can write `E` can also read it, so `Write<User>` is enough for an `UPDATE` that also filters on `users`:
+
+```rust title="src/queries.rs"
+/// Change a user's display name.
+pub struct RenameUser {
+    pub id: i64,
+    pub name: String,
+}
+
+impl Query for RenameUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<PgSource> for RenameUser {
+    /// Rows affected.
+    type Output = u64;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+        let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
+            .bind(self.id)
+            .bind(self.name)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected())
+    }
+}
+```
+
+<Callout type="info" title="Declare honestly">
+The compiler checks the effect you declare, not the SQL you write. A query declared as `Read<User>` that runs an `UPDATE` still compiles. Treat the `Effect` line like a function signature and review it together with the statement.
+</Callout>
+
+## Data sources
+
+A [`DataSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.DataSource.html) is anything that can run queries: a connection pool, a multiplexed client. It fixes the connection type that queries receive and the error they return:
+
+```rust
+pub trait DataSource: Send + Sync + Sized {
+    type Connection: Send;
+    type Error: Send;
+
+    fn run<Q: Execute<Self>>(
+        &self,
+        query: Q,
+    ) -> impl Future<Output = Result<Q::Output, Self::Error>> + Send;
+}
+```
+
+You rarely implement it yourself. wakuwaku provides one per backend:
+
+| Source | Feature | Connection | Error |
+|---|---|---|---|
+| `entity::sqlx::backend::PgSource` | `sqlx-pg` | `PgConnection` | `sqlx::Error` |
+| `entity::sqlx::backend::MySqlSource` | `sqlx-mysql` | `MySqlConnection` | `sqlx::Error` |
+| `entity::redis::RedisSource` | `redis` | see [Redis](/en/docs/data/redis) | |
+| `entity::meilisearch::MeiliSource` | `meilisearch` | see [Meilisearch](/en/docs/data/meilisearch) | |
+
+`PgSource` is an alias for `SqlxSource<Postgres>`. Each query run on its own acquires a connection from the pool.
+
+## Build the handles
+
+A `Db<S, C>` owns a data source `S` and has a capability `C`. The capability is only a type parameter, so you choose it when you build the handle. A service with a primary and a read replica builds two handles:
+
+```rust title="src/wiring.rs"
+use crate::queries::{DeactivateUsers, DormantUsers, FindUser, PostsByAuthor, RenameUser, UserRow};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
+use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+
+/// The two handles of the service: writes go to the primary,
+/// reads that tolerate replication lag go to the replica.
+#[derive(Clone)]
+pub struct Databases {
+    pub primary: Db<PgSource, ReadWrite>,
+    pub replica: Db<PgSource, ReadOnly>,
+}
+
+impl Databases {
+    pub async fn connect(primary_url: &str, replica_url: &str) -> Result<Self, sqlx::Error> {
+        let primary = PgPoolOptions::new().max_connections(10).connect(primary_url).await?;
+        let replica = PgPoolOptions::new().max_connections(20).connect(replica_url).await?;
+        Ok(Self {
+            primary: Db::new(SqlxSource::new(primary)),
+            replica: Db::new(SqlxSource::new(replica)),
+        })
+    }
+}
+```
+
+<Callout type="warn" title="The type is the promise">
+`Db::new` can't tell which server a pool is connected to. Building a `Db<PgSource, ReadWrite>` from the replica pool compiles, and it would then send writes to the replica. Only build a writing capability from a source connected to a writable database, and keep this wiring in one place.
+</Callout>
+
+Once a pool is wrapped, you can't get it back out of the handle. That is what makes the capability sound. Run migrations and other setup on the pool before calling `SqlxSource::new`. Cloning a `Db` clones its source, and for sqlx that means cloning the pool handle, which is cheap.
+
+## Run a query
+
+`Db` implements kanau's [`Processor`](https://docs.rs/kanau/latest/kanau/processor/trait.Processor.html). Bring the trait into scope and call `process`:
+
+```rust title="src/wiring.rs"
+pub async fn run_one(dbs: &Databases) -> Result<(), sqlx::Error> {
+    let user: Option<UserRow> = dbs.replica.process(FindUser { id: 7 }).await?;
+    let renamed: u64 = dbs.primary.process(RenameUser { id: 7, name: "Haruki".into() }).await?;
+    println!("{user:?}, {renamed} row(s) updated");
+    Ok(())
+}
+```
+
+`process` returns the query's `Output`, or the data source's `Error`.
+
+## Keep handlers generic over the handle
+
+Handlers shouldn't name `Db<PgSource, ReadOnly>`. They should list the queries they need as `Processor` bounds:
+
+```rust title="src/wiring.rs"
+pub struct Profile {
+    pub user: UserRow,
+    pub posts: Vec<String>,
+}
+
+/// Works with any handle that can run both queries.
+pub async fn load_profile<D>(db: &D, id: i64) -> Result<Option<Profile>, sqlx::Error>
+where
+    D: Processor<FindUser, Output = Option<UserRow>, Error = sqlx::Error>
+        + Processor<PostsByAuthor, Output = Vec<String>, Error = sqlx::Error>,
+{
+    let Some(user) = db.process(FindUser { id }).await? else {
+        return Ok(None);
+    };
+    let posts = db.process(PostsByAuthor { author: id }).await?;
+    Ok(Some(Profile { user, posts }))
+}
+
+pub async fn rename_user<D>(db: &D, id: i64, name: String) -> Result<bool, sqlx::Error>
+where
+    D: Processor<RenameUser, Output = u64, Error = sqlx::Error>,
+{
+    Ok(db.process(RenameUser { id, name }).await? == 1)
+}
+```
+
+The capability is then checked once, where the handle is passed in. This also means:
+
+- A handler accepts any processor of its queries: a `Db`, a `Db` wrapped in [write hooks](/en/docs/data/hooks), or a fake in a [unit test](/en/docs/core/testing).
+- With several `Processor` bounds, pin `Output` and `Error` in each bound as above, so that `db.process(...)` has an unambiguous result type.
+
+## Route reads to the replica and writes to the primary
+
+At the call site, pick the handle:
+
+```rust title="src/wiring.rs"
+pub async fn handle_requests(dbs: &Databases) -> Result<(), sqlx::Error> {
+    // A profile page: a slightly stale read is fine.
+    let _profile = load_profile(&dbs.replica, 7).await?;
+
+    // Writes go to the primary.
+    rename_user(&dbs.primary, 7, "Haruki".into()).await?;
+
+    // Read your own write: the primary can read too.
+    let _fresh = load_profile(&dbs.primary, 7).await?;
+    Ok(())
+}
+```
+
+`ReadWrite` covers every read, so the primary handle runs read queries too. Use it when a read must see a write that was just made, because a replica can lag behind the primary.
+
+## When a write reaches a read-only handle
+
+Pass the replica to a handler that writes:
+
+```rust
+pub async fn oops(dbs: &Databases) -> Result<bool, sqlx::Error> {
+    rename_user(&dbs.replica, 7, "Haruki".into()).await
+}
+```
+
+The program doesn't compile:
+
+```text
+error[E0277]: the trait bound `ReadOnly: CanWrite<User>` is not satisfied
+  --> src/fails.rs:18:17
+   |
+18 |     rename_user(&dbs.replica, 7, "Haruki".into()).await
+   |     ----------- ^^^^^^^^^^^^ the trait `CanWrite<User>` is not implemented for `ReadOnly`
+   |     |
+   |     required by a bound introduced by this call
+   |
+   = note: required for `ReadOnly` to implement `Covers<wakuwaku::wakuwaku_entity::Write<User>>`
+   = note: required for `Db<SqlxSource<Postgres>, ReadOnly>` to implement `Processor<RenameUser>`
+note: required by a bound in `rename_user`
+```
+
+Read the notes from the bottom up. `rename_user` needs `Processor<RenameUser>`. `Db` provides it only if its capability covers `Write<User>`, and `ReadOnly` has no `CanWrite<User>`. Calling `dbs.replica.process(RenameUser { .. })` directly fails with the same error.
+
+If a component should write only some entities, give it a [custom capability](/en/docs/data#capabilities) instead of `ReadWrite`.
+
+## Inject the handles into components
+
+Handles are ordinary values, so they go into the [`ServiceBuilder`](/en/docs/core/service-builder) like any other shared dependency. A component implements [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) with one `Dep` type. A component that needs both handles therefore uses the `Databases` struct as its dependency (it derives `Clone`, which `Dep` requires).
+
+This [cron job](/en/docs/services/cron-jobs) finds dormant users on the replica and deactivates them on the primary:
+
+```rust title="src/wiring.rs"
+/// Deactivate users that haven't signed in for a year.
+pub struct DeactivateDormantUsers {
+    dbs: Databases,
+}
+
+impl ServiceCreation for DeactivateDormantUsers {
+    type Dep = Databases;
+
+    fn create_service(dbs: Databases) -> Self {
+        Self { dbs }
+    }
+}
+
+impl Processor<CronTick> for DeactivateDormantUsers {
+    type Output = ();
+    type Error = sqlx::Error;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), sqlx::Error> {
+        let ids = self.dbs.replica.process(DormantUsers { days: 365 }).await?;
+        if !ids.is_empty() {
+            self.dbs.primary.process(DeactivateUsers { ids }).await?;
+        }
+        Ok(())
+    }
+}
+
+impl CronJob for DeactivateDormantUsers {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+}
+```
+
+`DormantUsers` (`Read<User>`) and `DeactivateUsers` (`Write<User>`) are defined like the queries above. Register the handles and the job:
+
+```rust title="src/wiring.rs"
+pub async fn start() -> Result<(), sqlx::Error> {
+    let dbs = Databases::connect(
+        "postgres://app@db-primary/app",
+        "postgres://app@db-replica/app",
+    )
+    .await?;
+
+    let (services, cron) = ServiceBuilder::new(dbs)
+        .cron_job::<DeactivateDormantUsers, _>()
+        .start();
+
+    // Everything else gets the handles from the builder too.
+    let dbs: &Databases = services.provide::<Databases, _>();
+    handle_requests(dbs).await?;
+
+    cron.shutdown().await;
+    Ok(())
+}
+```
+
+`ServiceBuilder::cron_job` clones the `Databases` out of the builder and calls `create_service`. gRPC services are built the same way with `grpc_service` (see [gRPC services](/en/docs/services/grpc)). `Db<PgSource, ReadOnly>` and `Db<PgSource, ReadWrite>` are different types, so you could also register them separately and look each one up by its type.
+
+<Accordions>
+  <Accordion title="Why are queries values instead of repository methods?">
+    A value can be inspected before it runs. Its type carries the `Effect` the compiler checks, a hook can describe it as a change, and a transaction can hold it as its next step. A handler that takes `D: Processor<FindUser>` depends on exactly the operations it uses, so you can replace the handle with a small fake in tests without mocking a whole repository.
+  </Accordion>
+  <Accordion title="Why is the capability a type parameter and not a runtime flag?">
+    A runtime flag can only fail at runtime, after the write has been routed. A type parameter makes a misrouted write a compile error at the exact call that passes the wrong handle, and it costs nothing at runtime: `Db<S, C>` stores only `S`.
+  </Accordion>
+</Accordions>
+
+## Next steps
+
+<Cards>
+  <Card title="Write hooks" href="/en/docs/data/hooks" description="Run audit, cache, and search updates around every write." />
+  <Card title="sqlx" href="/en/docs/data/sqlx" description="Details of the PostgreSQL and MySQL sources." />
+  <Card title="Transactions" href="/en/docs/data/transactions" description="Run several queries atomically." />
+</Cards>

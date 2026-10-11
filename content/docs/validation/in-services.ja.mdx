@@ -1,0 +1,287 @@
+---
+title: サービスでの証明の利用
+description: gRPC リクエストを境界で検証し、証明をドメインロジックとクエリに渡し、エラーを tonic::Status に変換し、述語をテストします。
+icon: ServerCog
+---
+
+証明が真価を発揮するのはサービスの境界です。パターンは常に同じです。
+
+1. ハンドラーは生の入力を受け取り、[`ServiceBuilder`](/ja/docs/core/service-builder) に登録したコンテキストを使って `prove` を一度だけ実行します。
+2. 失敗は `tonic::Status` に変換して返します。
+3. 成功したら `Proven` の値を内側へ渡します。ドメイン関数とクエリは `Proven<T, P>` を受け取るので、チェックを通らずにそこへ到達する経路はありません。
+
+このページでは、[述語の合成](/ja/docs/validation/composition#io-predicates) の `Directory` コンテキストと `NewUsername` 述語の上に `Register` RPC を作ります。
+
+```rust
+pub type NewUsername = And<UsernameAvailable, And<NonEmpty, ShortEnough>>;
+```
+
+## 証明を要求するクエリ [#queries-that-require-a-proof]
+
+要件はできるだけ下の層まで押し下げます。ユーザーを挿入するクエリは、検証済みの名前からしか作れないようにします。
+
+```rust title="src/accounts.rs"
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::{self, PgConnection};
+use wakuwaku::entity::sqlx::backend::PgSource;
+use wakuwaku::entity::{Execute, Query, Write};
+use wakuwaku::proof::Proven;
+
+/// ユーザーを挿入する。`NewUsername` を通った名前からしか作れない
+pub struct InsertUser {
+    name: Proven<String, NewUsername>,
+}
+
+impl InsertUser {
+    pub fn new(name: Proven<String, NewUsername>) -> Self {
+        Self { name }
+    }
+}
+
+impl Query for InsertUser {
+    type Effect = Write<User>;
+}
+
+impl Execute<PgSource> for InsertUser {
+    type Output = i64;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
+        let (id,) = sqlx::query_as::<_, (i64,)>("INSERT INTO users (name) VALUES ($1) RETURNING id")
+            .bind(self.name.subject().as_str())
+            .fetch_one(conn)
+            .await?;
+        Ok(id)
+    }
+}
+```
+
+フィールドは private なので、モジュールの外で `InsertUser` を作る方法は証明を要求する `InsertUser::new` だけです。この保証を得るために、クエリは専用のモジュールに置いてください。
+
+ドメインロジックは、ハンドルについてはジェネリックに保つという [データアクセスの慣習](/ja/docs/data/queries) に従い、型としては証明を要求します。
+
+```rust title="src/accounts.rs"
+/// ドメインロジック: ハンドルにはジェネリック、名前には証明を要求する
+pub async fn create_account<D>(db: &D, name: Proven<String, NewUsername>) -> Result<i64, sqlx::Error>
+where
+    D: Processor<InsertUser, Output = i64, Error = sqlx::Error>,
+{
+    db.process(InsertUser::new(name)).await
+}
+```
+
+## ValidateError を gRPC ステータスに変換する [#mapping-validateerror-to-a-grpc-status]
+
+`ValidateError` も `tonic::Status` も外部の型なので、オーファンルールにより `impl From<ValidateError<LookupError>> for Status` は書けません。関数を用意して `map_err` で使います。理由はそれぞれの `static` と比較し (等価性は同一性で判定されます。[拒否の理由](/ja/docs/validation#denied-reasons) を参照)、I/O エラーは拒否と分けて扱います。
+
+```rust title="src/accounts.rs"
+use wakuwaku::deps::tonic::Status;
+use wakuwaku::proof::ValidateError;
+
+pub fn validation_status(error: ValidateError<LookupError>) -> Status {
+    match error {
+        ValidateError::Deny(reason) if reason == TAKEN => Status::already_exists(reason.0),
+        ValidateError::Deny(reason) if reason == EMPTY || reason == TOO_LONG => {
+            Status::invalid_argument(reason.0)
+        }
+        ValidateError::Deny(reason) => Status::failed_precondition(reason.0),
+        // 判定できなかった: 入力については何も分からない
+        ValidateError::IoError(LookupError::Db(error)) => {
+            // データベースの詳細はレスポンスに含めない
+            eprintln!("username lookup failed: {error}");
+            Status::unavailable("could not validate the request, try again")
+        }
+    }
+}
+```
+
+| エラー | ステータス | 理由 |
+| --- | --- | --- |
+| 形式が不正な値に対する `Deny` | `INVALID_ARGUMENT` | クライアントは決して正しくなりえない値を送った。 |
+| 既存の状態との衝突に対する `Deny` | `ALREADY_EXISTS` / `FAILED_PRECONDITION` | 形式は正しいが、現在の状態では受け付けられない。 |
+| `IoError` | `UNAVAILABLE` (または `INTERNAL`) | 入力については何も分からない。クライアントは再試行してよい。 |
+
+理由の文字列はクライアント向けのものとして書いてください。内部の詳細を含めてはいけません。
+
+## gRPC ハンドラー [#the-grpc-handler]
+
+サービス定義は普通の protobuf です。
+
+```proto title="proto/accounts.proto"
+syntax = "proto3";
+
+package accounts;
+
+service Accounts {
+  rpc Register(RegisterRequest) returns (RegisterReply);
+}
+
+message RegisterRequest {
+  string username = 1;
+}
+
+message RegisterReply {
+  int64 id = 1;
+}
+```
+
+コードは [gRPC サービス](/ja/docs/services/grpc#generating-code-from-a-proto-file) の説明に従って生成します。生成されたコードには `tonic`、`tonic-prost`、`prost` への直接の依存と、ビルド依存の `tonic-prost-build` が必要です。サービスは検証用のコンテキストと書き込み用のハンドルを持ち、`ServiceCreation` を通して登録済みの 1 つの依存から作られます。
+
+```rust title="src/accounts.rs"
+pub mod pb {
+    tonic::include_proto!("accounts");
+}
+
+use pb::accounts_server::{Accounts, AccountsServer};
+use pb::{RegisterReply, RegisterRequest};
+use wakuwaku::ServiceCreation;
+use wakuwaku::deps::tonic::{Request, Response, Status};
+use wakuwaku::entity::{Db, ReadWrite};
+use wakuwaku::proof::{CheckOrder, prove};
+
+/// `ServiceBuilder` に一度だけ登録し、サービスにクローンされる
+#[derive(Clone)]
+pub struct AccountsDeps {
+    pub directory: Directory,
+    pub writer: Db<PgSource, ReadWrite>,
+}
+
+pub struct AccountsService {
+    directory: Directory,
+    writer: Db<PgSource, ReadWrite>,
+}
+
+impl ServiceCreation for AccountsService {
+    type Dep = AccountsDeps;
+
+    fn create_service(dep: AccountsDeps) -> Self {
+        Self { directory: dep.directory, writer: dep.writer }
+    }
+}
+
+#[tonic::async_trait]
+impl Accounts for AccountsService {
+    async fn register(
+        &self,
+        request: Request<RegisterRequest>,
+    ) -> Result<Response<RegisterReply>, Status> {
+        let RegisterRequest { username } = request.into_inner();
+
+        // 1. 境界で検証する
+        let username = prove::<_, NewUsername>(username, &self.directory, CheckOrder::Parallel)
+            .await
+            .map_err(validation_status)?;
+
+        // 2. 証明をドメインに渡す
+        let id = create_account(&self.writer, username).await.map_err(|error| match error {
+            // チェック時には空いていたが、その後別のリクエストが取った
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                Status::already_exists(TAKEN.0)
+            }
+            _ => Status::internal("could not create the account"),
+        })?;
+
+        Ok(Response::new(RegisterReply { id }))
+    }
+}
+```
+
+対象は単一のフィールドである必要はありません。ルールが複数のフィールドにまたがる場合は、リクエストメッセージ全体に対して述語を実装できます (`impl Predicate<RegisterRequest> for …`)。
+
+<Callout type="warn" title="証明はスナップショット: データベースの制約を残してください">
+`UsernameAvailable` はチェックした時点では真でした。同じ名前に対する 2 つの並行リクエストは、どちらかが挿入する前に両方ともこのチェックを通過できます。証明ではそれを防げませんが、`users.name` の一意インデックスなら防げます。上のハンドラーは、その結果として起こる一意制約違反を、拒否の場合と同じ `ALREADY_EXISTS` に変換しています。
+</Callout>
+
+### チェック順序の選択 [#choosing-the-check-order]
+
+`CheckOrder::Parallel` にすると、データベース検索と安価なルールが並行に実行されます。レイテンシが重要な場合のよいデフォルトです。`Sequential` では、`NewUsername` は検索を先に実行し (左オペランドだからです)、名前が使われていれば安価なルールを省きます。データベースに触れずに不正な名前を拒否したい場合は、`prove::<_, NewUsername>` の代わりに [I/O の前に安価なチェックを](/ja/docs/validation/composition#cheap-checks-before-io) の段階的な `check_new_username` を使ってください。同じ `Proven<String, NewUsername>` が返ります。
+
+## コンテキストの組み込み [#wiring-the-context]
+
+コンテキストは他の依存と変わりません。サービスビルダーに登録すると、サービスの生成時にクローンされ、さらに `And` がチェックのたびにクローンするので、クローンが安価である必要があります。`PgSource` 上の `Db` はプールのハンドルを包んでいるだけなので、クローンは安価です。
+
+```rust title="src/accounts.rs"
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::sqlx::postgres::PgPoolOptions;
+use wakuwaku::deps::tonic::service::Routes;
+use wakuwaku::deps::tonic::transport::Server;
+use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
+
+pub async fn serve(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPoolOptions::new().connect(database_url).await?;
+
+    let deps = AccountsDeps {
+        directory: Directory {
+            // 検証は読み取りだけなので、読み取り専用のハンドルを渡す
+            users: Db::<_, ReadOnly>::new(PgSource::new(pool.clone())),
+            limits: Limits { max_len: 32 },
+        },
+        writer: Db::<_, ReadWrite>::new(PgSource::new(pool)),
+    };
+
+    let (_services, register) = ServiceBuilder::new(deps)
+        .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+        .into_router_fn();
+
+    let router = Server::builder().add_routes(Routes::default());
+    register(router).serve("[::1]:50051".parse()?).await?;
+    Ok(())
+}
+```
+
+述語に `ReadOnly` のハンドルを渡すと、検証コードは書き込みクエリを実行できません。実行しようとするとコンパイルエラーになります ([クエリ](/ja/docs/data/queries) を参照)。ここでは 2 つのハンドルが 1 つのプールを共有しています。ケイパビリティが制御するのは、各ハンドルがどのクエリを受け付けるかだけです。
+
+## 述語のテスト [#testing-predicates]
+
+述語は対象とコンテキストを受け取る普通の非同期関数なので、純粋な述語は `prove` を直接呼んで単体テストできます。「失敗した」だけでなく、具体的な理由をアサートしてください。
+
+```rust title="src/validation.rs"
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+    use wakuwaku::proof::{CheckOrder, ValidateError, prove};
+
+    fn limits() -> Limits {
+        Limits { max_len: 8 }
+    }
+
+    #[tokio::test]
+    async fn rejects_long_names() {
+        let result = prove::<_, ShortEnough>("a".repeat(9), &limits(), CheckOrder::Sequential).await;
+        assert!(matches!(result, Err(ValidateError::Deny(reason)) if reason == TOO_LONG));
+    }
+
+    #[tokio::test]
+    async fn reports_spare_room() {
+        let Ok(name) = prove::<_, ShortEnough>("haruki".to_owned(), &limits(), CheckOrder::Sequential).await
+        else {
+            panic!("`haruki` fits in 8 bytes");
+        };
+        assert_eq!(name.evidence().spare, 2);
+    }
+
+    #[tokio::test]
+    async fn composite_reports_which_rule_failed() {
+        for order in [CheckOrder::Sequential, CheckOrder::Parallel] {
+            let result = prove::<_, ValidUsername>(String::new(), &limits(), order).await;
+            assert!(matches!(result, Err(ValidateError::Deny(reason)) if reason == EMPTY));
+        }
+    }
+}
+```
+
+`#[tokio::test]` には、`macros` と `rt` フィーチャーを有効にした `tokio` への直接の依存が必要です (`rt-multi-thread` は `rt` を含みます)。
+
+いくつかの指針:
+
+- 結果に依存している合成述語は、**両方のチェック順序でテスト** してください。どのオペランドが実行されるか、複数が失敗したときにどのエラーが報告されるかが異なります ([チェック順序](/ja/docs/validation/composition#check-order) を参照)。
+- 成功だけでなく **証拠もテスト** してください。後続のコードが証拠を読むので、チェックが通っても `spare` や行が間違っていればバグです。
+- **`Proven` を受け取る関数は本物の証明でテスト** します。テスト専用のコンストラクターは意図的に用意されていません。テスト内で `prove` から証明を得てください。純粋な述語なら手間はかかりません。
+- **I/O を行う述語** は具体的なコンテキスト (`Directory` は `Db<PgSource, ReadOnly>` を持ちます) を通して読むので、統合テストで本物のデータベースに対してテストします。`UsernameAvailable` のように判定そのものは単純にしておき、込み入ったロジックは純粋な述語に置いてください。全体的な方針は [テスト](/ja/docs/core/testing) を参照してください。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="gRPC サービス" href="/ja/docs/services/grpc" description="コード生成と、サービスビルダーからのサーバー登録。" />
+  <Card title="クエリ" href="/ja/docs/data/queries" description="ケイパビリティで型付けされたクエリと Db ハンドル。" />
+  <Card title="テスト" href="/ja/docs/core/testing" description="コンポーネントの単体テストと、組み立ての統合テスト。" />
+</Cards>

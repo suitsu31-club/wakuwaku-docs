@@ -1,0 +1,614 @@
+---
+title: トランザクション
+description: sqlx のトランザクションを wakuwaku が駆動する純粋なステートマシンとして書き、終了時の状態にフックし、すべての分岐をデータベースなしで単体テストします。
+icon: ArrowLeftRight
+---
+
+`Db` ハンドルを通じて実行したクエリは、単独でオートコミットモードで実行されます。複数の文をまとめて成功または失敗させたいときは、**トランザクションフロー**、つまり `TxFlow` を実装する型を書きます。フローが持つのはトランザクションのビジネスロジックだけです。フローはコネクションに一切触れず、次に実行するクエリを指示し、その結果をどう扱うかを決めるだけです。`BEGIN`、クエリ、`COMMIT` または `ROLLBACK` の実行は wakuwaku が担当します。
+
+このページは、sqlx 向けのクエリの書き方を知っていることを前提とします。[sqlx（PostgreSQL と MySQL）](/ja/docs/data/sqlx) を参照してください。
+
+## モデル
+
+<TransactionFlowDiagram lang="ja" />
+
+フローは **フローの値そのものが状態** であるステートマシンです。各遷移は状態を消費し、`Step` を返します。
+
+| `Step` のバリアント | 意味 |
+|---------------------|------|
+| `Step::Run { next, query }` | トランザクション上で `query` を実行し、`next.resume(result)` を呼ぶ |
+| `Step::Commit { output, report }` | コミットする。`output` は呼び出し元へ、`report` はトランザクションフックへ渡る |
+| `Step::Rollback { output, report }` | ロールバックする。`output` と `report` の分け方は同じ |
+
+`TxFlow` トレイトには 3 つの遷移があり、すべて同期関数です。
+
+- `start(self) -> Step<Self>`: `BEGIN` 直後の最初のステップ。
+- `resume(self, output: Result<FlowOutput<Self>, sqlx::Error>) -> Step<Self>`: 直前のクエリの結果を受けて次のステップを決めます。エラーを受け取るのは、そのエラーの後もトランザクションが **まだ使える** 場合だけです（[トランザクション内のエラー](#errors-inside-a-transaction) を参照）。フローは続行、コミット、ロールバックのいずれも選べます。
+- `aborted(self, error: sqlx::Error) -> (Self::Abort, Self::Report)`: 直前のクエリが、サーバー上でトランザクションを終わらせる形で失敗しました。トランザクションは必ずロールバックされ、フローは結果を記述するだけです。
+
+遷移は普通の同期関数なので、フローは I/O を行えず、`await` できず、コネクションを保持できません。フローが知る必要のある情報は、すべてクエリの結果として届きます。
+
+関連型は、フローが何を扱うかを表します。
+
+<TypeTable
+  type={{
+    Database: { type: 'SqlxBackend', description: 'データベース。Postgres または MySql。' },
+    Query: { type: 'Execute<SqlxSource<Self::Database>>', description: 'フローが発行するクエリ。複数の種類のクエリを使うフローは、それらの enum を使い、出力も enum（または共通の型）にします。そのエフェクトがトランザクション全体のエフェクトです。' },
+    Commit: { type: 'Send', description: 'コミット後に呼び出し元へ返される値。' },
+    Abort: { type: 'Send', description: 'ロールバック後に呼び出し元へ返される値。' },
+    Report: { type: 'Send', description: '結果にかかわらずトランザクションフックへ渡される値。' },
+    ISOLATION: { type: 'Option<IsolationLevel>', description: 'トランザクションの分離レベル。', default: 'None（サーバーのデフォルト）' },
+  }}
+/>
+
+## 完全なフロー: 送金
+
+この例は、ある口座から別の口座へ `amount` を移します。引き落とし、入金、コミットの順です。引き落としがどの行にも一致しない場合（口座が存在しない、または残高不足）はロールバックします。
+
+まずクエリです。フローが発行しうる文はすべて 1 つのクエリ型のバリアントで、その `Query::Effect` がすべてをカバーします。
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```rust title="src/transfer.rs"
+use wakuwaku::deps::sqlx::{self, PgConnection, Postgres};
+use wakuwaku::entity::sqlx::backend::SqlxSource;
+use wakuwaku::entity::sqlx::transaction::{IsolationLevel, Step, TxFlow};
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+
+pub struct Account;
+impl Entity for Account {}
+
+/// Every query the transfer may issue. Its effect is the effect of the whole transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferQuery {
+    Debit { from: i64, amount: i64 },
+    Credit { to: i64, amount: i64 },
+}
+
+impl Query for TransferQuery {
+    type Effect = (Read<Account>, Write<Account>);
+}
+
+impl Execute<SqlxSource<Postgres>> for TransferQuery {
+    /// Rows affected.
+    type Output = u64;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
+        let done = match self {
+            TransferQuery::Debit { from, amount } => {
+                sqlx::query(
+                    "UPDATE account SET balance = balance - $2 WHERE id = $1 AND balance >= $2",
+                )
+                .bind(from)
+                .bind(amount)
+                .execute(conn)
+                .await?
+            }
+            TransferQuery::Credit { to, amount } => {
+                sqlx::query("UPDATE account SET balance = balance + $2 WHERE id = $1")
+                    .bind(to)
+                    .bind(amount)
+                    .execute(conn)
+                    .await?
+            }
+        };
+        Ok(done.rows_affected())
+    }
+}
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```rust title="src/transfer.rs"
+use wakuwaku::deps::sqlx::{self, MySql, MySqlConnection};
+use wakuwaku::entity::sqlx::backend::SqlxSource;
+use wakuwaku::entity::sqlx::transaction::{IsolationLevel, Step, TxFlow};
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+
+pub struct Account;
+impl Entity for Account {}
+
+/// Every query the transfer may issue. Its effect is the effect of the whole transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferQuery {
+    Debit { from: i64, amount: i64 },
+    Credit { to: i64, amount: i64 },
+}
+
+impl Query for TransferQuery {
+    type Effect = (Read<Account>, Write<Account>);
+}
+
+impl Execute<SqlxSource<MySql>> for TransferQuery {
+    /// Rows affected.
+    type Output = u64;
+
+    async fn execute(self, conn: &mut MySqlConnection) -> Result<u64, sqlx::Error> {
+        let done = match self {
+            TransferQuery::Debit { from, amount } => {
+                sqlx::query(
+                    "UPDATE account SET balance = balance - ? WHERE id = ? AND balance >= ?",
+                )
+                .bind(amount)
+                .bind(from)
+                .bind(amount)
+                .execute(conn)
+                .await?
+            }
+            TransferQuery::Credit { to, amount } => {
+                sqlx::query("UPDATE account SET balance = balance + ? WHERE id = ?")
+                    .bind(amount)
+                    .bind(to)
+                    .execute(conn)
+                    .await?
+            }
+        };
+        Ok(done.rows_affected())
+    }
+}
+```
+
+</Tab>
+</Tabs>
+
+次にフローです。状態はリクエストと、待っている段階（stage）の組です。`start` は引き落としを指示し、`resume` は結果ごとに次を決めます。
+
+```rust title="src/transfer.rs"
+/// Published once the money has moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transferred {
+    pub from: i64,
+    pub to: i64,
+    pub amount: i64,
+}
+
+/// Why the transfer was rolled back.
+#[derive(Debug)]
+pub enum TransferFailed {
+    InsufficientFunds,
+    UnknownAccount,
+    /// Serialization failure or deadlock: safe to run the transfer again.
+    Conflict,
+    Database(sqlx::Error),
+}
+
+/// The state of a transfer: the request, and the query it waits for.
+#[derive(Debug, Clone)]
+pub struct Transfer {
+    from: i64,
+    to: i64,
+    amount: i64,
+    stage: Stage,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    Debiting,
+    Crediting,
+}
+
+impl Transfer {
+    pub fn new(from: i64, to: i64, amount: i64) -> Self {
+        Self { from, to, amount, stage: Stage::Debiting }
+    }
+}
+
+impl TxFlow for Transfer {
+    type Database = Postgres;
+    type Query = TransferQuery;
+    type Commit = ();
+    type Abort = TransferFailed;
+    type Report = Option<Transferred>;
+
+    const ISOLATION: Option<IsolationLevel> = Some(IsolationLevel::Serializable);
+
+    fn start(self) -> Step<Self> {
+        let query = TransferQuery::Debit { from: self.from, amount: self.amount };
+        Step::Run { next: self, query }
+    }
+
+    fn resume(self, rows: Result<u64, sqlx::Error>) -> Step<Self> {
+        let Transfer { from, to, amount, stage } = self;
+        match (stage, rows) {
+            (Stage::Debiting, Ok(1)) => Step::Run {
+                next: Transfer { stage: Stage::Crediting, ..self },
+                query: TransferQuery::Credit { to, amount },
+            },
+            (Stage::Debiting, Ok(_)) => {
+                Step::Rollback { output: TransferFailed::InsufficientFunds, report: None }
+            }
+            (Stage::Crediting, Ok(1)) => Step::Commit {
+                output: (),
+                report: Some(Transferred { from, to, amount }),
+            },
+            (Stage::Crediting, Ok(_)) => {
+                Step::Rollback { output: TransferFailed::UnknownAccount, report: None }
+            }
+            (_, Err(error)) => {
+                Step::Rollback { output: TransferFailed::Database(error), report: None }
+            }
+        }
+    }
+
+    fn aborted(self, error: sqlx::Error) -> (TransferFailed, Option<Transferred>) {
+        if is_conflict(&error) {
+            (TransferFailed::Conflict, None)
+        } else {
+            (TransferFailed::Database(error), None)
+        }
+    }
+}
+```
+
+MySQL では、`type Database = MySql;` 以外はフローがまったく同じです。`aborted` が使う `is_conflict` ヘルパーは、「別のトランザクションと衝突したので、もう一度実行すればよい」ことを意味するエラーを見分けます。
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```rust title="src/transfer.rs"
+/// SQLSTATE 40001 (serialization failure) or 40P01 (deadlock detected).
+pub fn is_conflict(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "40001" || code == "40P01")
+}
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```rust title="src/transfer.rs"
+/// SQLSTATE 40001: deadlock (error 1213).
+pub fn is_conflict(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "40001")
+}
+```
+
+</Tab>
+</Tabs>
+
+### 実行する
+
+フローを `Transaction` で包み、フローのエフェクトをカバーするケイパビリティを持つ `Db` で処理します。
+
+```rust title="src/pay.rs"
+use crate::transfer::Transfer;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::PgPool;
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::sqlx::transaction::{Transaction, TxError, TxOutput};
+use wakuwaku::entity::{Db, ReadWrite};
+
+pub async fn pay(pool: PgPool) -> Result<(), TxError> {
+    let db: Db<PgSource, ReadWrite> = Db::new(SqlxSource::new(pool));
+    match db.process(Transaction(Transfer::new(1, 2, 10))).await? {
+        TxOutput::Committed(()) => println!("transferred"),
+        TxOutput::RolledBack(why) => println!("rolled back: {why:?}"),
+    }
+    Ok(())
+}
+```
+
+`process` は `Result<TxOutput<Commit, Abort>, TxError>` を返します。
+
+- `Ok(TxOutput::Committed(output))`: フローがコミットし、サーバーがそれを確認しました。
+- `Ok(TxOutput::RolledBack(output))`: フローがロールバックを指示したか、文がトランザクションを中断し、`aborted` がそれを記述しました。
+- `Err(TxError::Begin(_))`: コネクションを取得できなかったか、`BEGIN` が失敗しました。フローは実行されていません。
+- `Err(TxError::CommitRejected(_))`: サーバーが `COMMIT` を拒否しました。トランザクションはロールバックされています。
+- `Err(TxError::CommitUnknown(_))`: `COMMIT` は送信されましたが、その応答が失われました（コネクションが切れた場合など）。トランザクションはコミットされた **かもしれないし、されていないかもしれません**。
+
+## ドライバーがフローを実行する手順
+
+ドライバーが行うのは次の手順だけです。
+
+1. プールからコネクションを取得します。
+2. フローのモードで `BEGIN` を送ります。分離レベルは `ISOLATION` から取り、フローのエフェクトが読み取りだけなら `READ ONLY`、そうでなければ `READ WRITE` です。どちらかの手順が失敗すると結果は `Err(TxError::Begin)` になり、フローは開始されません。
+3. `start` を呼びます。
+4. `Step::Run` なら、トランザクションのコネクション上でクエリを実行します。結果がサーバー上でトランザクションを終わらせたエラーなら、`aborted` を呼んでロールバックへ進みます。そうでなければ結果を `resume` に渡し、繰り返します。
+5. `Step::Commit` なら `COMMIT` を送ります。成功すれば `Committed` です。データベースエラーはサーバーがコミットを拒否したことを意味し（`CommitRejected`）、それ以外のエラーでは結果が不明になります（`CommitUnknown`）。
+6. `Step::Rollback` なら `ROLLBACK` を送り、`RolledBack` を返します。`ROLLBACK` 自体の結果は無視されます。コミットされていないトランザクションは、`ROLLBACK` が成功してもコネクションが切れても、もうコミットされることはないからです。
+
+手順 4 と 5 の判断は、非同期のドライバーではなく `flow` モジュールの普通の関数が行います。これがプロトコルをテスト可能にしています。[データベースなしでフローをテストする](#testing-flows-without-a-database) を参照してください。
+
+<Callout type="info" title="フロー内のクエリは同じクエリ">
+`Execute::execute` はトランザクションのコネクションを受け取るので、`Db` を通じて単独で実行しているクエリを、そのままフローのステップとして使えます。
+</Callout>
+
+## ケイパビリティと読み取り専用トランザクション
+
+トランザクションのエフェクトは、そのクエリ型のエフェクト `FlowEffect<F>` です。`Db<S, C>` が `Transaction<F>` を処理できるのは、単独のクエリと同じく `C` がそのエフェクトをカバーする場合だけです。送金は `Account` に書き込むので、レプリカのハンドルに対してはコンパイルできません。
+
+```rust
+async fn on_replica(replica: &Db<PgSource, ReadOnly>) {
+    // error[E0277]: the trait bound
+    // `Db<SqlxSource<Postgres>, ReadOnly>: Processor<Transaction<Transfer>>` is not satisfied
+    let _ = replica.process(Transaction(Transfer::new(1, 2, 10))).await;
+}
+```
+
+エフェクトの種類はトランザクションの開始方法も決めます。エフェクトが読み取りだけのフロー（たとえば複数の `SELECT` にまたがる一貫したレポートのための `Read<Account>`）は `READ ONLY` で開始し、`Db<_, ReadOnly>` ハンドル上で問題なく実行できます。
+
+## 分離レベル
+
+レベルを選ぶには `const ISOLATION` に `Some(IsolationLevel::…)` を設定します。省略するとサーバーのデフォルトになります。送信される文はデータベースによって異なります。
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+1 つの文で開始します。たとえば `BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE`、分離レベルがなければ `BEGIN READ ONLY` などです。PostgreSQL は `ReadUncommitted` を `READ COMMITTED` として実行します。
+
+</Tab>
+<Tab value="MySQL">
+
+`START TRANSACTION` では分離レベルを指定できないので、wakuwaku はまず `SET TRANSACTION ISOLATION LEVEL …`（次のトランザクションにだけ適用されます）を送り、その後 `START TRANSACTION READ WRITE` または `START TRANSACTION READ ONLY` を送ります。
+
+</Tab>
+</Tabs>
+
+## トランザクション内のエラー [#errors-inside-a-transaction]
+
+エラーが `resume` と `aborted` のどちらに渡るかは、トランザクションがそのエラーの後も生き残るかどうかで決まり、それはデータベースによって異なります。sqlx がクライアント側で、文の送信後または送信の代わりに発生させたエラーはサーバーの状態を変えないので、常に `resume` に渡ります。`RowNotFound`、`TypeNotFound`、`ColumnIndexOutOfBounds`、`ColumnNotFound`、`ColumnDecode`、`Encode`、`Decode`、`InvalidArgument` です。
+
+<Tabs items={['PostgreSQL', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+**それ以外のエラーはすべて中断扱いです。** PostgreSQL では、文がエラーになると、ロールバックするまで以降のすべての文が拒否され、`COMMIT` は黙ってロールバックします。そのため制約違反、シリアライゼーション失敗、コネクション切断はいずれも `aborted` に渡ります。
+
+</Tab>
+<Tab value="MySQL">
+
+失敗した文は通常 **その文だけ** をロールバックし、トランザクションは続くので、データベースエラー（重複キーなど）は `resume` に渡ります。例外は **デッドロック**（エラー 1213）です。InnoDB はトランザクション全体をロールバックし、以降の文はどのトランザクションにも属さないオートコミットモードで実行されてしまいます。これは `aborted` に渡ります。データベースエラー以外のエラー（I/O、プロトコルなど）も中断扱いです。
+
+**ロック待機タイムアウト**（エラー 1205）は、サーバーのデフォルト通り文だけをロールバックするものとして扱われます。サーバーが `innodb_rollback_on_timeout = ON` で動いている場合はトランザクション全体がロールバックされるので、`resume` でエラー 1205 を受け取ったフローは続行せず、ロールバックしなければなりません。
+
+</Tab>
+</Tabs>
+
+<Callout type="warn" title="中断されたトランザクションをフローは無視できない">
+この振り分けはフロー任せではなく、ドライバーが強制します。文がトランザクションを終わらせた後は `resume` が二度と呼ばれないので、失敗する文や、MySQL ではトランザクションの外で実行されてしまう文を、フローがうっかり発行し続けることはありません。
+</Callout>
+
+## リトライ
+
+wakuwaku はトランザクションを自動でリトライしません。シリアライゼーション失敗やデッドロックはフローの `aborted` に届き（`SERIALIZABLE` のトランザクションが最後に失敗した場合は `TxError::CommitRejected` として返り）、次にどうするかはあなたが決めます。
+
+フローは普通の値なので、リトライとは同じ開始値をもう一度実行することです。`F` が `Clone` なら `Transaction<F>` も `Clone` なので、小さなループで十分です。
+
+```rust title="src/retry.rs"
+use crate::transfer::{Transfer, TransferFailed, is_conflict};
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::sqlx::transaction::{Transaction, TxError, TxOutput};
+
+const MAX_ATTEMPTS: usize = 3;
+
+/// Run `transfer`, running it again from the start after a conflict.
+pub async fn transfer_with_retry<D>(
+    db: &D,
+    transfer: Transfer,
+) -> Result<TxOutput<(), TransferFailed>, TxError>
+where
+    D: Processor<Transaction<Transfer>, Output = TxOutput<(), TransferFailed>, Error = TxError>,
+{
+    for _ in 1..MAX_ATTEMPTS {
+        match db.process(Transaction(transfer.clone())).await {
+            // Aborted by a serialization failure or a deadlock.
+            Ok(TxOutput::RolledBack(TransferFailed::Conflict)) => continue,
+            // SERIALIZABLE can also reject the COMMIT itself.
+            Err(TxError::CommitRejected(error)) if is_conflict(&error) => continue,
+            // Never retry `CommitUnknown`: the transfer may have happened.
+            outcome => return outcome,
+        }
+    }
+    db.process(Transaction(transfer)).await
+}
+```
+
+リトライするのは、トランザクションがコミットされていないと分かっている場合だけにしてください。`CommitUnknown` は闇雲にリトライしてはいけない例外です。送金はすでに行われているかもしれません。操作を冪等にする（たとえば一意な送金 ID を使う）か、照合してから再試行してください。
+
+## トランザクションの終了にフックする
+
+トランザクションの **終了後** に何かを行う必要はよくあります。イベントの発行、キャッシュの無効化、他サービスへの通知などです。これをフローの中で行ってはいけませんし（フローは I/O を行えません）、[書き込みフック](/ja/docs/data/hooks) で行ってもいけません。トランザクション内のクエリはトランザクションのコネクション上で実行され、`BeforeWrite` や `AfterWrite` を通らないからです。代わりに `AfterTransaction` を使います。
+
+`AfterTransaction<D, H, EH>` は sqlx の `Db` ハンドルを包みます。フローが実行されたすべてのトランザクションの後で、フローの `Report` を、トランザクションがどうなったかのタグ付きでフック `H` に渡します。
+
+| `TxFinalState` | いつ |
+|----------------|------|
+| `Committed(report)` | トランザクションがコミットされた |
+| `RolledBack(report)` | フローがロールバックを指示した、文が中断させた、またはサーバーが `COMMIT` を拒否した |
+| `CommitUnknown(report)` | `COMMIT` を送信したが結果が失われた |
+
+フックは任意の `Processor<TxFinalState<F::Report>>` です。コミット、ロールバック、不明なコミットのどれに反応するかはフックが決めます。フックが失敗すると、そのエラーはエラーハンドラー `EH` に渡ります。これはフックのエラーを処理する `Processor` で、自身のエラー型は `Infallible` です。つまり失敗を自分で処理しなければなりません（ログに残す、リトライする、アウトボックスに退避するなど）。呼び出し元の結果がフックによって変わることはありません。
+
+```rust title="src/accounts.rs"
+use crate::transfer::{Transfer, Transferred};
+use std::convert::Infallible;
+use std::sync::mpsc::Sender;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::sqlx::PgPool;
+use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::entity::sqlx::transaction::hook::AfterTransaction;
+use wakuwaku::entity::sqlx::transaction::{Transaction, TxError, TxFinalState};
+use wakuwaku::entity::{Db, ReadWrite};
+
+/// Hands each committed transfer to the event publisher.
+pub struct PublishTransfers {
+    events: Sender<Transferred>,
+}
+
+impl Processor<TxFinalState<Option<Transferred>>> for PublishTransfers {
+    type Output = ();
+    type Error = String;
+
+    async fn process(&self, state: TxFinalState<Option<Transferred>>) -> Result<(), String> {
+        match state {
+            TxFinalState::Committed(Some(event)) => {
+                self.events.send(event).map_err(|error| error.to_string())
+            }
+            TxFinalState::CommitUnknown(Some(event)) => {
+                Err(format!("{event:?} may or may not have been committed"))
+            }
+            // Rolled back: nothing happened, nothing to publish.
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Hook errors end here; they never change what the caller gets.
+pub struct LogHookError;
+
+impl Processor<String> for LogHookError {
+    type Output = ();
+    type Error = Infallible;
+
+    async fn process(&self, error: String) -> Result<(), Infallible> {
+        eprintln!("transfer hook failed: {error}");
+        Ok(())
+    }
+}
+
+pub type Accounts = AfterTransaction<Db<PgSource, ReadWrite>, PublishTransfers, LogHookError>;
+
+pub fn accounts(pool: PgPool, events: Sender<Transferred>) -> Accounts {
+    AfterTransaction::new(
+        Db::new(SqlxSource::new(pool)),
+        PublishTransfers { events },
+        LogHookError,
+    )
+}
+```
+
+`Accounts` は素の `Db` と同じ出力とエラーで `Transaction<Transfer>` を処理するので、前述の `transfer_with_retry` ヘルパーもそのまま使えます。細かな点:
+
+- フローが開始されなかった場合（`TxError::Begin`）、フックは実行されません。渡すレポートがないからです。
+- 実際のサービスでは、フックは Iggy に発行します。[イベントの発行](/ja/docs/events/publishing) を参照してください。何を発行するかを決めるのが `Report` の役割です。フローがイベントをレポートに入れ、それを見るのはフックだけです。
+- `AfterTransaction` は単独で実行されたクエリを包んでいる `Db` に転送するので、書き込みフックで包めます: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>`。書き込みフックはトランザクションを転送しないので、トランザクションフックには `AfterWrite::inner()` でたどり着きます。
+- `AfterTransaction` は `Db` を直接包む必要があります。
+
+## データベースなしでフローをテストする [#testing-flows-without-a-database]
+
+フローは値で、遷移は普通の関数なので、素直な単体テストは `start` と `resume` を手で呼ぶものです。wakuwaku はさらに一歩進んでいます。ドライバーが使うマシンが `wakuwaku::entity::sqlx::transaction::flow` で公開されているので、テストは自分で選んだ結果を使って **プロトコル全体**（どのエラーが中断扱いか、失われた `COMMIT` が何を意味するか）を駆動できます。
+
+| 型 | 役割 |
+|----|------|
+| `Begin<F>` | `BEGIN` の前。`mode()` はドライバーが使う `TxMode`、`begun()` はフローを開始し、`failed(error)` は失敗した `BEGIN` |
+| `TxMachine<F>` | 次に送るもの: `Run(Running<F>, F::Query)`、`Commit(Committing<F>)`、`Rollback(RollingBack<F>)` |
+| `Running<F>` | `ran(result)` がクエリの結果を戻す。データベースごとの中断ルールが適用される |
+| `Committing<F>` | `committed(result)` が `COMMIT` の結果を戻す |
+| `RollingBack<F>` | `rolled_back()` がロールバックを完了する |
+| `Done<F>` | 終了。`output`（呼び出し元が受け取るもの）と `report`（フックが受け取るもの。フローが実行されなかった場合は `None`） |
+
+```rust title="src/transfer.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wakuwaku::entity::sqlx::transaction::flow::{Begin, TxMachine};
+    use wakuwaku::entity::sqlx::transaction::{TxError, TxFinalState, TxOutput};
+
+    fn connection_reset() -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::other("connection reset"))
+    }
+
+    #[test]
+    fn debits_credits_and_commits() {
+        let begin = Begin::new(Transfer::new(1, 2, 10));
+        assert!(!begin.mode().read_only); // the effect writes
+
+        let TxMachine::Run(running, TransferQuery::Debit { from: 1, amount: 10 }) = begin.begun()
+        else {
+            panic!("a transfer starts with the debit");
+        };
+        let TxMachine::Run(running, TransferQuery::Credit { to: 2, amount: 10 }) = running.ran(Ok(1))
+        else {
+            panic!("a successful debit is followed by the credit");
+        };
+        let TxMachine::Commit(committing) = running.ran(Ok(1)) else {
+            panic!("a successful credit commits");
+        };
+
+        let done = committing.committed(Ok(()));
+        assert!(matches!(done.output, Ok(TxOutput::Committed(()))));
+        assert_eq!(
+            done.report,
+            Some(TxFinalState::Committed(Some(Transferred { from: 1, to: 2, amount: 10 })))
+        );
+    }
+
+    #[test]
+    fn insufficient_funds_rolls_back() {
+        let TxMachine::Run(running, _) = Begin::new(Transfer::new(1, 2, 10)).begun() else {
+            panic!("a transfer starts with the debit");
+        };
+        let TxMachine::Rollback(rolling_back) = running.ran(Ok(0)) else {
+            panic!("no row debited means no funds");
+        };
+
+        let done = rolling_back.rolled_back();
+        assert!(matches!(done.output, Ok(TxOutput::RolledBack(TransferFailed::InsufficientFunds))));
+        assert_eq!(done.report, Some(TxFinalState::RolledBack(None)));
+    }
+
+    #[test]
+    fn lost_connection_aborts_without_resuming() {
+        let TxMachine::Run(running, _) = Begin::new(Transfer::new(1, 2, 10)).begun() else {
+            panic!("a transfer starts with the debit");
+        };
+        // An I/O error ends the transaction: `aborted` runs instead of `resume`.
+        let TxMachine::Rollback(rolling_back) = running.ran(Err(connection_reset())) else {
+            panic!("an aborted transaction rolls back");
+        };
+        let done = rolling_back.rolled_back();
+        assert!(matches!(done.output, Ok(TxOutput::RolledBack(TransferFailed::Database(_)))));
+    }
+
+    #[test]
+    fn lost_commit_is_reported_as_unknown() {
+        let TxMachine::Run(running, _) = Begin::new(Transfer::new(1, 2, 10)).begun() else {
+            panic!("a transfer starts with the debit");
+        };
+        let TxMachine::Run(running, _) = running.ran(Ok(1)) else {
+            panic!("a successful debit is followed by the credit");
+        };
+        let TxMachine::Commit(committing) = running.ran(Ok(1)) else {
+            panic!("a successful credit commits");
+        };
+
+        let done = committing.committed(Err(connection_reset()));
+        assert!(matches!(done.output, Err(TxError::CommitUnknown(_))));
+        assert!(matches!(done.report, Some(TxFinalState::CommitUnknown(Some(_)))));
+    }
+}
+```
+
+これらのテストにはデータベースも Docker も非同期ランタイムも不要で、マイクロ秒単位で終わります。テストで作りやすいエラー値:
+
+- `sqlx::Error::Io(std::io::Error::other("…"))` はどちらのデータベースでもトランザクションを終わらせるので、マシンは `aborted` を呼びます。
+- `sqlx::Error::RowNotFound`（または他のクライアント側エラー）はトランザクションを使える状態に保つので、マシンはそれを渡して `resume` を呼びます。
+
+フックも `Processor` なので、自分で作った `TxFinalState` の値で `process` を呼べばテストできます。
+
+<Accordions>
+<Accordion title="トランザクションが async クロージャではなくステートマシンなのはなぜか">
+トランザクションを受け取る async クロージャは何でもできてしまいます。別のサービスを呼ぶ、スリープする、無関係な `await` をまたいでコネクションを保持する、データベースがすでにトランザクションを中断した後でエラーを握りつぶして処理を続ける、などです。そのどれも型には現れず、テストには本物のデータベースが必要です。`TxFlow` にできるのは、クエリを指示し、その結果に反応することだけです。間違えやすいルール（中断された PostgreSQL のトランザクション、オートコミットに落ちる MySQL のデッドロック、結果が不明な `COMMIT`）は wakuwaku のマシンにあって一度だけテストされ、あなたのフロー固有の分岐は普通の値でテストできます。これは [プルーフ駆動プログラミング](/ja/docs/core/proof-driven) のうち、ミクロな正しさの側面です。
+</Accordion>
+<Accordion title="読み取ったデータに基づいて次のクエリを選べるか">
+はい。すべてのクエリの結果は `resume` に届き、次の `Step::Run` はそれをもとに組み立てられます。後のステップで必要なものは、送金の例が段階と金額を持ち回すように、次の状態（`next`）に保持してください。
+</Accordion>
+</Accordions>
+
+## API リファレンス
+
+- [`transaction` モジュール](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/index.html): [`TxFlow`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/trait.TxFlow.html)、[`Step`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/enum.Step.html)、[`Transaction`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/struct.Transaction.html)、[`TxOutput`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/enum.TxOutput.html)、[`TxError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/enum.TxError.html)
+- [`flow` モジュール](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/index.html): `Begin`、`TxMachine`、`Running`、`Committing`、`RollingBack`、`Done`
+- [`AfterTransaction`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/hook/struct.AfterTransaction.html)
+
+<Cards>
+  <Card title="sqlx（PostgreSQL と MySQL）" href="/ja/docs/data/sqlx" description="プール、Db ハンドル、クエリの書き方。" />
+  <Card title="フック" href="/ja/docs/data/hooks" description="単独で実行する書き込みクエリの前後のフック。" />
+  <Card title="イベントの発行" href="/ja/docs/events/publishing" description="コミットされたトランザクションのレポートを発行します。" />
+</Cards>

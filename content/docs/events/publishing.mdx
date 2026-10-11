@@ -1,0 +1,181 @@
+---
+title: Publishing events
+description: Send typed events to Iggy with Publisher, understand the headers it writes, and prepare the stream and topics it needs.
+icon: Send
+---
+
+Publishing is one type and one method: [`Publisher`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/publisher/struct.Publisher.html) and `publish`. Everything else (topic, partition, headers, encoding) comes from the event type you defined in [Defining events](/en/docs/events/defining-events).
+
+## Create a publisher and publish
+
+A publisher wraps a connected `IggyClient` and the name of one stream. It can publish events of any type, keyed by any key type, into that stream:
+
+```rust title="src/main.rs"
+use std::sync::Arc;
+use wakuwaku::deps::iggy::prelude::{Client, IggyClient};
+use wakuwaku::iggy::Publisher;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Arc::new(IggyClient::from_connection_string(
+        "iggy://iggy:iggy@localhost:8090",
+    )?);
+    client.connect().await?;
+
+    // Publish two events of order 42. Both go to topic `orders`, same partition.
+    let publisher = Publisher::new(client.clone(), "shop")?;
+    publisher
+        .publish(OrderPlaced {
+            order_id: 42,
+            customer: "alice".into(),
+            total_cents: 12_000,
+        })
+        .await?;
+    publisher
+        .publish(PaymentReceived {
+            order_id: 42,
+            amount_cents: 12_000,
+        })
+        .await?;
+
+    Ok(())
+}
+```
+
+`Publisher::new` does not talk to the server; it only checks that the stream name is a valid Iggy identifier. `publish(event)` then:
+
+1. computes the key hash with `key_hash(&event.key())`, using the key type's `PartitionMerge` hasher;
+2. converts the event into its body (`IntoEventBody::into_event_body`) and serializes it with `MessageSer::to_bytes`;
+3. builds one Iggy message with the body as payload and the [wakuwaku headers](#headers-on-the-wire);
+4. sends it to the stream, to the topic named by the key type's `SUPER_PARTITION_NAME`, partitioned by the key hash as Iggy message key.
+
+Every event of one key therefore lands in the same partition, in publish order. Each `publish` call sends exactly one message; there is no client-side batching.
+
+## Sharing a publisher
+
+`Publisher` is `Send + Sync` but not `Clone`. Create it once at startup, wrap it in an `Arc`, and register it in the [`ServiceBuilder`](/en/docs/core/service-builder) so components can take it as their dependency:
+
+```rust title="src/checkout.rs"
+use std::sync::Arc;
+use wakuwaku::ServiceCreation;
+use wakuwaku::iggy::Publisher;
+use wakuwaku::iggy::error::Error;
+
+/// A component that publishes events. `Arc<Publisher>` is its dependency.
+pub struct Checkout {
+    publisher: Arc<Publisher>,
+}
+
+impl ServiceCreation for Checkout {
+    type Dep = Arc<Publisher>;
+    fn create_service(publisher: Arc<Publisher>) -> Self {
+        Self { publisher }
+    }
+}
+
+impl Checkout {
+    pub async fn place_order(&self, order_id: u64, customer: String) -> Result<(), Error> {
+        // ... store the order, then announce it.
+        self.publisher
+            .publish(OrderPlaced {
+                order_id,
+                customer,
+                total_cents: 12_000,
+            })
+            .await
+    }
+}
+```
+
+```rust title="src/main.rs"
+let publisher = Arc::new(Publisher::new(client.clone(), "shop")?);
+let services = ServiceBuilder::new(client).push(publisher);
+```
+
+## Headers on the wire
+
+Every message carries three user headers, all raw bytes. The consumer reads them back to route, order and reduce the record without decoding its body. You only need this table when another program (a different language, a bridge, a replay tool) writes events that a wakuwaku consumer should read; the constants are in [`wakuwaku::iggy::events::headers`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/headers/index.html).
+
+| Header | Content |
+|---|---|
+| `wakuwaku-tag` | the event's `TYPE_TAG`, `u32` little endian |
+| `wakuwaku-key` | the key hash, `u64` little endian |
+| `wakuwaku-props` | 3 bytes: version `1`, the message's ordering, the type's associativity |
+| `wakuwaku-retry` | only on records of a retry topic: version `1`, then the failure time in milliseconds since the Unix epoch, `u64` little endian |
+
+The wire values inside `wakuwaku-props` are:
+
+| Ordering | Byte | | Algebra marker | Byte |
+|---|---|---|---|---|
+| `Relaxed` | `1` | | `NonAssociative` | `0` |
+| `Acquire` | `2` | | `Associative` | `1` |
+| `Release` | `4` | | `Idempotent` | `2` |
+| `AcqRel` | `6` | | `Commutative` | `3` |
+| | | | `IdempotentCommutative` | `4` |
+
+A foreign producer must also partition the same way: use the 8 little-endian bytes of the key hash as the Iggy message key, so the Iggy client picks the partition exactly as `Publisher` does.
+
+<Callout type="info" title="The consumer double-checks the algebra">
+  A record whose associativity byte differs from the algebra of the handler's event type is dropped and logged, never reduced with the wrong rule.
+</Callout>
+
+## What must exist on the server
+
+wakuwaku creates as little as possible on the Iggy server:
+
+| Resource | Created by wakuwaku? |
+|---|---|
+| The stream (e.g. `shop`) | No. Create it yourself. |
+| The main topic (`SUPER_PARTITION_NAME`, e.g. `orders`) and its partitions | No. Create it yourself, with the partition count you want. |
+| The retry topic `retry_<topic>` | Yes, by the consumer's `start`, with the same partition count as the main topic, if it does not exist yet. |
+
+`publish` to a missing topic fails with an Iggy error, and a consumer refuses to start without its main topic (`Error::TopicNotFound`). Create both as part of deployment, for example with a small idempotent step at startup using the Iggy client re-exported as `wakuwaku::deps::iggy`:
+
+```rust title="src/setup.rs"
+use wakuwaku::deps::iggy::prelude::{
+    Identifier, IggyClient, IggyError, StreamClient, TopicClient, TopicCreateOptions,
+};
+use wakuwaku::iggy::PartitionKey;
+
+/// Create the stream and the main topic if they don't exist yet.
+pub async fn ensure_topology(client: &IggyClient) -> Result<(), IggyError> {
+    let stream = Identifier::named("shop")?;
+    if client.get_stream(&stream).await?.is_none() {
+        client.create_stream("shop").await?;
+    }
+
+    let topic = OrderId::SUPER_PARTITION_NAME.0; // "orders"
+    if client.get_topic(&stream, &Identifier::named(topic)?).await?.is_none() {
+        let options = TopicCreateOptions {
+            partitions_count: Some(4),
+            ..Default::default()
+        };
+        client.create_topic(&stream, topic, &options).await?;
+    }
+    Ok(())
+}
+```
+
+Reading the topic name from `SUPER_PARTITION_NAME` keeps the setup and the event types from drifting apart. If `partitions_count` is left unset, the Iggy SDK's default is a single partition.
+
+<Callout type="warn" title="Choose the partition count up front">
+  The partition of a key is derived from its hash and the topic's partition count. Adding partitions later moves keys to other partitions, so events of one key published before and after the change can be processed out of order. The consumer also refuses to start if the retry topic's partition count no longer matches the main topic's (`Error::PartitionCountMismatch`). Size the topic for the concurrency you will need.
+</Callout>
+
+## Errors
+
+`Publisher::new` and `publish` return [`wakuwaku::iggy::error::Error`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.Error.html). The variants you can get from publishing are:
+
+| Variant | Cause |
+|---|---|
+| `Error::Iggy` | the stream or topic name is not a valid identifier, the message cannot be built, or the send fails (server unreachable, topic missing, permission denied, …) |
+| `Error::Serialize` | the body's `MessageSer::to_bytes` failed |
+
+The send is **not retried**. When `publish` returns an error, the event was not written as far as wakuwaku knows, and it is up to you whether to retry, fail the request, or surface the error. `publish` writes one message to Iggy and nothing else; if the event must be published exactly when a database transaction commits, that coordination is your code's responsibility.
+
+## Next steps
+
+<Cards>
+  <Card title="Consuming" href="/en/docs/events/consuming" description="Handle the events you just published." />
+  <Card title="Ordering" href="/en/docs/events/ordering" description="What the ordering byte in the headers means for the consumer." />
+</Cards>

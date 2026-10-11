@@ -1,0 +1,363 @@
+---
+title: イベントの購読
+description: イベントハンドラを書き、ServiceBuilder または IggyConsumerRegisterCenter で登録し、パーティション、配信モード、シャットダウンを設定します。
+icon: Inbox
+---
+
+コンシューマは、1 つの Iggy トピックを読むイベントハンドラの一覧です。イベント型ごとにハンドラを 1 つ書いて登録し、`start` を呼びます。wakuwaku はパーティションごとに 1 つのタスクを起動し、[概要](/ja/docs/events#what-the-consumer-does) で説明したパイプラインを実行します。
+
+## イベントハンドラ [#event-handlers]
+
+ハンドラは、イベント型 `E` に対して [`EventHandler<E>`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/trait.EventHandler.html) を実装します。
+
+```rust title="wakuwaku::iggy (宣言)"
+pub trait EventHandler<E: Event>: Send + Sync + 'static {
+    const MAX_BATCH: NonZeroUsize;
+
+    fn handle(&self, run: &[E::Target]) -> impl Future<Output = Result<(), HandleError>> + Send;
+}
+```
+
+- **`run`** には**1 つのキー**のイベントが、適用すべき順に、`E` の代数で縮約済みの状態で入っています。要素の型はデコード済みのボディである `E::Target` です。イベント自身がボディである通常の場合、これは単に `E` です。
+- **`MAX_BATCH`** は `run` の長さの上限です。これより長いランは、最大 `MAX_BATCH` 件ずつの連続したチャンクに分けて順に渡されます。1 回の呼び出しで 1 件ずつ受け取るには `NonZeroUsize::MIN`（1）を使います。
+- **戻り値** は、[`HandleError`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/struct.HandleError.html) の [`ErrorClass`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.ErrorClass.html) を通じて、失敗時に何が起きるかを決めます。[後述](#when-a-handler-fails) を参照してください。
+
+`handle` は `async fn` として書けます。異なるキーのハンドラは Tokio 上で並行に動くため、その future は `Send` でなければなりません。`std::sync::MutexGuard` を `.await` をまたいで保持しないでください。
+
+[イベントの定義](/ja/docs/events/defining-events) のイベントに対する 2 つのハンドラは次のとおりです。どちらも、データベースのコネクションプールの代わりである `OrderStore` から組み立てます。
+
+```rust title="src/handlers.rs"
+/// 新しい注文を書き込む。
+pub struct RecordOrder {
+    store: OrderStore,
+}
+
+impl ServiceCreation for RecordOrder {
+    type Dep = OrderStore;
+    fn create_service(store: OrderStore) -> Self {
+        Self { store }
+    }
+}
+
+impl EventHandler<OrderPlaced> for RecordOrder {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+    async fn handle(&self, run: &[OrderPlaced]) -> Result<(), HandleError> {
+        for order in run {
+            self.store.insert(order.order_id, order.total_cents).await;
+        }
+        Ok(())
+    }
+}
+
+/// 支払いを適用する。ランは 1 つの支払いに畳み込まれた状態で届く。
+pub struct ApplyPayment {
+    store: OrderStore,
+}
+
+impl ServiceCreation for ApplyPayment {
+    type Dep = OrderStore;
+    fn create_service(store: OrderStore) -> Self {
+        Self { store }
+    }
+}
+
+impl EventHandler<PaymentReceived> for ApplyPayment {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::MIN;
+
+    async fn handle(&self, run: &[PaymentReceived]) -> Result<(), HandleError> {
+        for payment in run {
+            self.store
+                .pay(payment.order_id, payment.amount_cents)
+                .await
+                .map_err(HandleError::retryable)?;
+        }
+        Ok(())
+    }
+}
+```
+
+`PaymentReceived` は `Associative` なので、同じランに入った 1 つの注文の支払いは、合算された 1 つのイベントとして `ApplyPayment` に届きます。`OrderPlaced` は `Acquire` なので、注文の後に発行された支払いが注文より先に適用されることはありません。
+
+ハンドラは普通の値なので、単体テストでは Iggy なしで `handle` を直接呼び出せます。
+
+```rust title="src/handlers.rs"
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wakuwaku::iggy::error::ErrorClass;
+
+    #[tokio::test]
+    async fn payment_for_unknown_order_is_retryable() {
+        let handler = ApplyPayment::create_service(OrderStore::default());
+        let payment = PaymentReceived { order_id: 7, amount_cents: 500 };
+        let error = handler.handle(&[payment]).await.unwrap_err();
+        assert_eq!(error.class(), ErrorClass::Retryable);
+    }
+}
+```
+
+## サービスビルダーで登録する [#registering-through-the-service-builder]
+
+ハンドラはたいてい、データベースのプール、HTTP クライアント、`Publisher` などの共有依存を必要とします。上の例のようにハンドラに [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装し、[`ServiceBuilder::iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/iggy_consumer/index.html) に、[サービスビルダー](/ja/docs/core/service-builder) に登録済みの依存から組み立てさせます。
+
+```rust title="src/main.rs"
+use std::sync::Arc;
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::iggy::prelude::{Client, IggyClient};
+use wakuwaku::iggy::ConsumerConfig;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Arc::new(IggyClient::from_connection_string(
+        "iggy://iggy:iggy@localhost:8090",
+    )?);
+    client.connect().await?;
+
+    // `orders` トピックの 2 つのイベント型を 1 つのコンシューマで購読する。
+    let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
+        .iggy_consumer::<RecordOrder, _, _>()
+        .iggy_consumer::<ApplyPayment, _, _>()
+        .start(
+            client,
+            ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]),
+        )
+        .await?;
+
+    tokio::signal::ctrl_c().await?;
+    consumers.shutdown().await;
+    Ok(())
+}
+```
+
+3 つの型パラメータは `<Handler, Event, Position>` です。
+
+- **`Handler`** は組み立てるハンドラの型です。
+- **`Event`** は、ハンドラがちょうど 1 つのイベントに対して `EventHandler` を実装しているなら `_` にできます。1 つのハンドラ型が複数のイベントを扱う場合は名前を指定します: `.iggy_consumer::<MyHandler, MyEvent, _>()`。
+- **`Position`** は、ハンドラの `Dep` がビルダー内のどこにあるかを表します。その型が 1 回だけ登録されていれば `_` で推論できます。そうでなければ、他の [`provide`](/ja/docs/core/service-builder) 呼び出しと同様に `Here` / `There` で指定します。登録されていない依存はコンパイルエラーになります。
+
+`iggy_consumer` を呼ぶたびに、その場でハンドラが組み立てられます。ビルダーから `Dep` をクローンして `create_service` を呼び、ハンドラを `Arc` で包みます。チェーンの最後は次のどちらかです。
+
+- **`start(client, config)`**: 購読を開始し、サービスビルダーと実行中の [`ConsumerRuntime`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) を返します。続けてサービスの残りを組み立てられます。
+- **`into_parts()`**: サービスビルダーと未起動の `IggyConsumerRegisterCenter` を返します。後で起動したり、手で組み立てたハンドラを追加したりできます。
+
+## 直接登録する [#registering-directly]
+
+`ServiceBuilder::iggy_consumer` は、ハンドラの型レベルリストである [`IggyConsumerRegisterCenter`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/struct.IggyConsumerRegisterCenter.html) を便利に使うためのものです。ハンドラがサービスビルダーから来ない場合などは、これを直接使えます。
+
+```rust title="src/direct.rs"
+pub async fn start_by_hand(
+    client: Arc<IggyClient>,
+    store: OrderStore,
+) -> Result<ConsumerRuntime, Error> {
+    IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::new(store.clone())))
+        .push(Arc::new(ApplyPayment::new(store)))
+        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+        .await
+}
+```
+
+`new` で最初のハンドラからリストを始め、`push` のたびに 1 つ追加します。ハンドラは `Arc` で渡すので、1 つのハンドラの値で複数のイベント型を処理できます。ハンドラ型が複数のイベントに対して `EventHandler` を実装している場合は、イベントを指定します。ここでの `Audit` は依存を持たないハンドラで、`EventHandler<OrderPlaced>` と `EventHandler<PaymentReceived>` を実装しています。
+
+```rust title="src/direct.rs"
+pub async fn audit_only(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
+    let audit = Arc::new(Audit);
+    IggyConsumerRegisterCenter::<_, OrderPlaced>::new(audit.clone())
+        .push::<_, PaymentReceived>(audit)
+        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
+        .await
+}
+```
+
+2 つの方法は `into_parts` で組み合わせられます。
+
+```rust title="src/direct.rs"
+pub async fn mixed(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
+    let (services, orders) = ServiceBuilder::new(OrderStore::default())
+        .iggy_consumer::<RecordOrder, _, _>()
+        .into_parts();
+
+    let _store: &OrderStore = services.provide::<OrderStore, _>();
+
+    // `orders` は普通の `IggyConsumerRegisterCenter`。手で作ったハンドラを push できる。
+    orders
+        .push::<Audit, PaymentReceived>(Arc::new(Audit))
+        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
+        .await
+}
+```
+
+## 1 つのコンシューマにメイントピックは 1 つ [#one-main-topic-per-consumer]
+
+コンシューマが読むメイントピックは、イベントのキー型の `SUPER_PARTITION_NAME` ただ 1 つです。したがって 1 つのリストに入るハンドラはすべて、同じトピック名を持つキー型のイベントを扱う必要があります。`start` はこれを他のセットアップとあわせて検査し、問題があれば購読を始めずにエラーを返します。
+
+| エラー | 原因 |
+|---|---|
+| `Error::MixedTopics` | 登録したイベントが異なるトピックに属している |
+| `Error::DuplicateEventType` | 同じ `TYPE_TAG` に 2 つのハンドラが登録されている |
+| `Error::InvalidConfig` | `partitions` が空、`retry_delays` が空、または `poll_count` が `0` |
+| `Error::TopicNotFound` | ストリームにメイントピックが存在しない |
+| `Error::PartitionNotFound` | 設定したパーティションがメイントピックに存在しない |
+| `Error::PartitionCountMismatch` | `retry_<topic>` が、メイントピックと異なるパーティション数で存在する |
+| `Error::Iggy` | Iggy の呼び出しが失敗した（サーバーに到達できない、リトライトピックを作成できない、など）、またはストリーム名やコンシューマ名が有効な識別子でない |
+
+別のキー型のイベントを購読するには、2 つ目のコンシューマを起動します。登録したどのハンドラにも一致しないタグのレコードは、ログに記録されたうえで破棄され、オフセットはその先へ進みます。トピックのイベント型の一部だけを登録したコンシューマは、残りを単に読み飛ばします。意図的なら問題ありませんが、うっかりなら静かなデータ欠落です。トピックにイベント型を追加したら、それを必要とするすべてのコンシューマにも登録してください。
+
+## 設定 [#configuration]
+
+[`ConsumerConfig::new(stream, consumer_name, partitions)`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/struct.ConsumerConfig.html) は必須の 3 つのフィールドを設定し、残りを既定値にします。フィールドはすべて公開されています。
+
+<TypeTable
+  type={{
+    stream: {
+      type: 'String',
+      description: 'メイントピックとそのリトライトピックを含むストリーム。',
+      required: true,
+    },
+    consumer_name: {
+      type: 'String',
+      description: 'オフセットを保存する Iggy コンシューマの名前。オフセットはコンシューマ名とパーティションごとに保存されるので、新しい名前は保持されている最初のレコードから読み始めます。',
+      required: true,
+    },
+    partitions: {
+      type: 'Vec<u32>',
+      description: '購読するメイントピックのパーティション。それぞれに専用のタスクが割り当てられます。Iggy のパーティション ID は 0 から始まります。空にはできません。',
+      required: true,
+    },
+    mode: {
+      type: 'DeliveryMode',
+      description: 'オフセットを保存するタイミング。NoEventLose（at-least-once）または NoDoubleConsume（at-most-once）。',
+      default: 'DeliveryMode::NoEventLose',
+    },
+    retry_delays: {
+      type: "&'static [Duration]",
+      description: '失敗したキーのリトライ試行の間隔。一時的な失敗や Iggy 呼び出しの失敗の再試行間隔にも使われ、一時的な失敗では最後の値が繰り返されます。空にはできません。',
+      default: 'DEFAULT_RETRY_DELAYS（2 秒、4 秒、8 秒、16 秒）',
+    },
+    poll_count: {
+      type: 'u32',
+      description: '1 回のポーリングで取得するメッセージ数。つまりプランナーが扱うバッチの最大サイズです。0 にはできません。',
+      default: '1000',
+    },
+    poll_interval: {
+      type: 'Duration',
+      description: 'メイントピックのポーリングが空だったときのスリープ時間（それより早くリトライの期限が来る場合は短くなります）。',
+      default: '100 ms',
+    },
+    max_pending_retry: {
+      type: 'usize',
+      description: '1 つのパーティションについて、リトライパーティションで待機できるレコード数の上限。これを超えて新たに失敗したキーは破棄されます。',
+      default: '100000',
+    },
+  }}
+/>
+
+フィールドは構造体更新構文で上書きします。`retry_delays` は `&'static` のスライスなので、独自の間隔は `const` として宣言します。
+
+```rust title="src/config.rs"
+use std::time::Duration;
+use wakuwaku::iggy::{ConsumerConfig, DeliveryMode};
+
+const RETRY_DELAYS: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
+pub fn config(partitions: Vec<u32>) -> ConsumerConfig {
+    ConsumerConfig {
+        mode: DeliveryMode::NoEventLose,
+        retry_delays: RETRY_DELAYS,
+        poll_count: 500,
+        poll_interval: Duration::from_millis(250),
+        ..ConsumerConfig::new("shop", "order-projection", partitions)
+    }
+}
+```
+
+## パーティションとタスク [#partitions-and-tasks]
+
+`start` は **`partitions` の要素ごとに Tokio タスクを 1 つ**起動します。パーティション同士は並列に処理されます。1 つのパーティションの中では、ポーリングした 1 バッチのキーが並行に処理され、現在のバッチのすべてのキーが完了するか、リトライトピックへ移されるか、破棄されるまで、次のバッチはポーリングされません。
+
+すべてのパーティションを購読するには、ID をハードコードせずトピックから読み取ります。
+
+```rust title="src/setup.rs"
+/// メイントピックのすべてのパーティション ID（0 始まり）。
+pub async fn all_partitions(client: &IggyClient) -> Result<Vec<u32>, IggyError> {
+    let stream = Identifier::named("shop")?;
+    let topic = Identifier::named(OrderId::SUPER_PARTITION_NAME.0)?;
+    let details = client
+        .get_topic(&stream, &topic)
+        .await?
+        .ok_or_else(|| IggyError::TopicIdNotFound(topic.clone(), stream.clone()))?;
+    Ok(details.partitions.iter().map(|partition| partition.id).collect())
+}
+```
+
+<Callout type="warn" title="レプリカには重ならないパーティションを割り当てる">
+  コンシューマは名前付きの Iggy コンシューマで明示したパーティションを読みます。Iggy のコンシューマグループには参加しないので、自動的なリバランスはありません。同じ `consumer_name` で複数のレプリカを動かす場合は、それぞれに重ならない `partitions` を割り当ててください（たとえば `n` 個中 `i` 番目のレプリカは `id % n == i` のパーティションを担当する）。同じパーティションを 2 つのレプリカが読むと、どちらもそのレコードを処理します。
+</Callout>
+
+## 1 つのパーティションのパイプライン [#the-pipeline-of-one-partition]
+
+<ConsumerPipelineDiagram lang="ja" />
+
+各パーティションのタスクは次の処理を繰り返します。
+
+1. **リトライパーティションを読み切る。** `retry_<topic>` のパーティション *p* を最後まで読み、レコードをキーごとにキューに入れます。
+2. **期限の来たリトライを実行する。** 隔離中のキーのうち、次のリトライ間隔が過ぎたものを計画し直して再実行します。
+3. **ポーリングする。** メイントピックのパーティション *p* から、保存済みオフセットの次から最大 `poll_count` 件を取得します。1 件もなければ `poll_interval` だけスリープして最初に戻ります。
+4. **計画する。** ヘッダーを解析し、レコードをキーハッシュでグループ化し、各キーを順序フェンスでセグメントに分け、セグメントを型ごとのランにまとめます。[順序](/ja/docs/events/ordering) を参照してください。
+5. **隔離中のキーを迂回させる。** リトライトピックにまだレコードが残っているキーは実行しません。そのキーの新しいレコードは、古いレコードの後ろとしてリトライトピックに追記されるので、順序が保たれます。
+6. **実行する。** それ以外のキーを並行に実行します。各ランについて、ボディをデコードし、[代数](/ja/docs/events/algebra) で縮約し、チャンクごとにハンドラを呼び出します。
+7. **失敗をリトライへ書き込む。** リトライ可能なエラーで失敗したキーは、失敗した位置からリトライトピックに書き込まれ、隔離されます。
+8. **コミットする。** 配信モードの定めに従ってメイントピックのオフセットを保存します。
+
+Iggy 自体の失敗（ポーリング、オフセットの保存、リトライトピックへの書き込み）でタスクが止まることはありません。各呼び出しは成功するまで `retry_delays` の間隔で再試行され、そのたびに `tracing` で警告がログに記録されます。
+
+## 配信モード [#delivery-modes]
+
+[`DeliveryMode`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/config/enum.DeliveryMode.html) はオフセットを保存するタイミング、つまりクラッシュ時に何を失うかを決めます。
+
+| モード | 保証 | オフセットを保存するタイミング | クラッシュ後 |
+|---|---|---|---|
+| `NoEventLose`（既定） | at-least-once | メインのオフセットは、バッチのすべてのキーが完了・破棄・リトライトピックへの受け渡しのいずれかを終えた後。リトライのオフセットは、まだ保留中のレコードを越えない | 何も失われないが、最後に保存したオフセット以降に処理したイベントは再度処理される |
+| `NoDoubleConsume` | at-most-once | ポーリング直後、処理の前（リトライトピックも同様） | ポーリング済みで未処理のイベントはすべて失われる。二重に処理されるイベントはない |
+
+`NoEventLose` では、ハンドラを**冪等**に書いてください。同じイベントを 2 回適用しても害がないようにする必要があります。また、あるランのいくつかのチャンクが成功した後にリトライ試行が失敗すると、次の試行でそれらのチャンクがもう一度適用されます。`NoDoubleConsume` は、ベストエフォートの通知のように、イベントを失うほうが繰り返すより安くつく場合にだけ選んでください。
+
+## ハンドラが失敗したとき [#when-a-handler-fails]
+
+3 つのコンストラクタのいずれかで `HandleError` を作って返します。そのクラスによって何が起きるかが決まります。
+
+| コンストラクタ | クラス | 効果 |
+|---|---|---|
+| `HandleError::transient(e)` | `Transient` | 同じチャンクを、成功するまで `retry_delays` の間隔でその場で再試行する。その間パーティションは進まない |
+| `HandleError::retryable(e)` | `Retryable` | キーの未完了の処理をリトライトピックへ移し、キーを隔離する。他のキーは処理を続ける |
+| `HandleError::unrecoverable(e)` | `Unrecoverable` | チャンクを破棄してログに記録する。ランの残りは処理を続ける |
+
+`anyhow::Error` に変換できるエラーなら何でも包めます。これには `std::error::Error + Send + Sync + 'static` を満たすすべての型が含まれます。リトライのスケジュール、隔離、リトライトピックについては [エラー処理](/ja/docs/events/error-handling) で説明します。
+
+## シャットダウン [#shutdown]
+
+[`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) はすべてのパーティションのタスクを中断し、停止するまで待ちます。
+
+```rust
+tokio::signal::ctrl_c().await?;
+consumers.shutdown().await;
+```
+
+これは中断 (abort) であり、処理中の作業を流し切る (drain) ものではありません。実行中のハンドラ呼び出しは、次の `.await` の時点でキャンセルされます。`NoEventLose` なら何も失われません。コミットされていない作業は、同じ `consumer_name` を使う次のコンシューマがもう一度読むからです。`NoDoubleConsume` では、処理中だったバッチのイベントが失われます。
+
+<Callout type="error" title="ランタイムを生かしておく">
+  `ConsumerRuntime` をドロップしても、すべてのパーティションのタスクが中断されます。サービスが動いている間は名前付きの変数に束縛しておいてください。`let _ = … .start(…).await?;` と書くと即座にドロップされ、1 バッチも処理しないうちに購読が止まります。
+</Callout>
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="エラー処理" href="/ja/docs/events/error-handling" description="一時的・リトライ可能・回復不能な失敗を詳しく。" />
+  <Card title="順序" href="/ja/docs/events/ordering" description="1 つのキーの中でセグメントとランがどう計画されるか。" />
+  <Card title="代数" href="/ja/docs/events/algebra" description="ハンドラに届く前にランをまとめたり畳み込んだりする仕組み。" />
+  <Card title="サービスビルダー" href="/ja/docs/core/service-builder" description="ハンドラの組み立てに使う依存の登録。" />
+</Cards>
