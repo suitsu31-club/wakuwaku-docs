@@ -217,6 +217,7 @@ impl TransferFailed {
 }
 
 /// The state of a transfer.
+#[derive(Debug)]
 pub enum Transfer {
     Start { from: i64, to: i64, amount: i64 },
     Debited { from: i64, to: i64, amount: i64 },
@@ -298,7 +299,7 @@ impl TxFlow for Transfer {
 
 MySQL では `type Database = MySql;` 以外はまったく同じです。各クエリの結果は独自の型のままで、それを使うコードはクエリと同じ match アームにあります。クエリの enum も、行の enum も、起こりえない結果のための catch-all アームも要りません。
 
-`TxEnd` は何も derive しません（`Commit`、`Abort`、`Report` の型をそのまま保持するためです）。そのため、それを埋め込むフローの enum も `Clone` や `Debug` を derive できません。実際にどう影響するかは [リトライ](#retries) を参照してください。
+`TxEnd` は `Debug` を derive しているので、それを埋め込むフローの enum も `Debug` を derive できます（`Commit`、`Abort`、`Report` の型が `Debug` である必要があります）。一方、`Clone` は意図的に実装していません。フローの値はトランザクションの 1 回の実行であり、その終端状態はトランザクションの終了時に一度だけ消費されます。await 済みの future をもう一度 await しないのと同じです。実際にどう影響するかは [リトライ](#retries) を参照してください。
 
 `is_conflict` ヘルパーは、「別のトランザクションと競合したので、もう一度実行してほしい」という意味のエラーを判別します。
 
@@ -478,7 +479,7 @@ impl AsSqlxError for SaveError {
 
 wakuwaku はトランザクションを自動でリトライしません。シリアライゼーション失敗やデッドロックはクエリのエラーとしてステップに届き（送金の例では `TransferFailed::Conflict` に変換しています）、`SERIALIZABLE` のトランザクションは最後に `TxError::CommitRejected` で失敗することもあります。次にどうするかはあなたが決めます。
 
-`TxEnd`、したがってフローは `Clone` ではありません。リトライでは、普通の `Copy` なデータであるリクエストから開始状態を作り直します。
+フローの値は 1 回の実行であり `Clone` ではないので、リトライでは、普通の `Copy` なデータであるリクエストから新しい開始状態を作り直します。
 
 ```rust title="src/retry.rs"
 use crate::transfer::{Transfer, TransferFailed, is_conflict};

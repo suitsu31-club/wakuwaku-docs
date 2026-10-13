@@ -217,6 +217,7 @@ impl TransferFailed {
 }
 
 /// The state of a transfer.
+#[derive(Debug)]
 pub enum Transfer {
     Start { from: i64, to: i64, amount: i64 },
     Debited { from: i64, to: i64, amount: i64 },
@@ -298,7 +299,7 @@ impl TxFlow for Transfer {
 
 For MySQL, the flow is identical except `type Database = MySql;`. Each query result keeps its own type, and the code using it sits in the same match arm as the query: no enum of queries, no enum of rows, no catch-all arm for a result that cannot happen.
 
-`TxEnd` derives nothing (it holds your `Commit`, `Abort` and `Report` types as they are), so a flow enum that embeds it cannot derive `Clone` or `Debug` either. See [Retries](#retries) for what that means in practice.
+`TxEnd` derives `Debug`, so a flow enum that embeds it can derive `Debug` too, as long as its `Commit`, `Abort` and `Report` types are `Debug`. It is deliberately not `Clone`: a flow value is one run of the transaction, and its terminal state is consumed once when the transaction ends, the way an awaited future is not awaited again. See [Retries](#retries) for what that means in practice.
 
 The `is_conflict` helper recognizes the errors that mean "another transaction got in the way, run me again":
 
@@ -478,7 +479,7 @@ impl AsSqlxError for SaveError {
 
 wakuwaku does not retry transactions for you. A serialization failure or a deadlock reaches the step as a query error (the transfer turns it into `TransferFailed::Conflict`), and a `SERIALIZABLE` transaction can also fail at the end with `TxError::CommitRejected`. What to do next is your decision.
 
-`TxEnd`, and so the flow, is not `Clone`. Retrying means building the start state again from the request, which is plain `Copy` data:
+A flow value is one run and is not `Clone`, so retrying means building a fresh start state from the request, which is plain `Copy` data:
 
 ```rust title="src/retry.rs"
 use crate::transfer::{Transfer, TransferFailed, is_conflict};
