@@ -36,7 +36,7 @@ Every message declares its ordering through `Event::atomic_ordering(&self)`. The
 Think of `Acquire` as "this event opens something" (later events depend on it) and `Release` as "this event closes something" (it depends on everything before it).
 
 <Callout type="info" title="Fences are enforced conservatively">
-  The planner enforces fences more strictly than the table requires: an `Acquire` event also keeps every *earlier* event of the key before it, and a `Release` event also keeps every *later* event after it. In 1.0.0-rc1 this makes `AcqRel` behave exactly like `Acquire`. Still declare the ordering you actually need: the stricter behavior is an implementation choice of the planner, the table above is the contract.
+  The planner enforces fences more strictly than the table requires: an `Acquire` event also keeps every *earlier* event of the key before it, and a `Release` event also keeps every *later* event after it. Every segment is then totally ordered against its neighbours, which keeps execution simple. In 1.0.0-rc2 this makes `AcqRel` behave exactly like `Acquire`. Still declare the ordering you actually need: the stricter behavior is an implementation choice of the planner, the table above is the contract.
 </Callout>
 
 ## Worked example: a bank account [#worked-example]

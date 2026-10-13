@@ -90,7 +90,7 @@ A predicate can do I/O: its context holds the handles it needs, and its `IoError
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 ```
 
 First the query. It declares that it reads `User`, so it runs through a `Db<_, ReadOnly>`:
@@ -123,6 +123,7 @@ impl Query for FindUserByName {
 
 impl Execute<PgSource> for FindUserByName {
     type Output = Option<UserRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
         let row = sqlx::query_as::<_, (i64, String)>("SELECT id, name FROM users WHERE name = $1")

@@ -15,7 +15,7 @@ const text = {
     iggyOut: "consumer tasks",
     router: "Router",
     tonic: "tonic ",
-    built: "clone Dep → create_service",
+    built: "clone Dep → create_service, or compose_*",
     componentsUse: "Components use",
     entityDesc: "sqlx · Redis · Meilisearch",
     iggyDesc: "for events",
@@ -24,14 +24,14 @@ const text = {
     appDesc: "depends only on",
     appAfter: "",
     wakuwakuDesc:
-      "ServiceBuilder · cron_job · grpc_service · iggy_consumer · deps",
+      "ServiceBuilder · cron_job · grpc_service · iggy_consumer · compose_* · deps",
     entityCrate: "capability-typed data access",
     iggyCrate: "typed events on Apache Iggy",
     proofCrate: "proof-carrying validation",
     kanauDesc: "Processor",
     thirdParty: "third-party",
     caption:
-      "Every component is built from a dependency registered in one ServiceBuilder; the sub-crates are re-exported by wakuwaku.",
+      "Every component is built from dependencies registered in one ServiceBuilder: a single cloned dependency, or a compose_* closure over the whole builder. The sub-crates are re-exported by wakuwaku.",
   },
   ja: {
     title:
@@ -47,7 +47,7 @@ const text = {
     iggyOut: "コンシューマタスク",
     router: "Router",
     tonic: "tonic ",
-    built: "Dep を clone → create_service",
+    built: "Dep を clone → create_service、または compose_*",
     componentsUse: "コンポーネントが使う",
     entityDesc: "sqlx · Redis · Meilisearch",
     iggyDesc: "でイベント発行",
@@ -56,14 +56,14 @@ const text = {
     appDesc: "依存するのは",
     appAfter: "だけ",
     wakuwakuDesc:
-      "ServiceBuilder · cron_job · grpc_service · iggy_consumer · deps",
+      "ServiceBuilder · cron_job · grpc_service · iggy_consumer · compose_* · deps",
     entityCrate: "権限を型で表すデータアクセス",
     iggyCrate: "Apache Iggy 上の型付きイベント",
     proofCrate: "証明を伴う検証",
     kanauDesc: "Processor",
     thirdParty: "サードパーティ",
     caption:
-      "すべてのコンポーネントは 1 つの ServiceBuilder に登録された依存から作られます。サブクレートは wakuwaku から再エクスポートされます。",
+      "すべてのコンポーネントは 1 つの ServiceBuilder に登録された依存から作られます。1 つの依存を clone するか、ビルダー全体を借用する compose_* クロージャを使います。サブクレートは wakuwaku から再エクスポートされます。",
   },
 } as const;
 

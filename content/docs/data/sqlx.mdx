@@ -17,7 +17,7 @@ The sqlx integration lives in `wakuwaku::entity::sqlx` and is enabled by one of 
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 ```
 
 </Tab>
@@ -25,7 +25,7 @@ wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-mysql"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-mysql"] }
 ```
 
 </Tab>
@@ -38,7 +38,7 @@ Both features turn on `entity` and re-export sqlx as `wakuwaku::deps::sqlx`. The
 | `wakuwaku::entity::sqlx::backend::SqlxSource<DB>` | An sqlx `Pool<DB>` as a data source |
 | `wakuwaku::entity::sqlx::backend::PgSource` | `SqlxSource<Postgres>` (feature `sqlx-pg`) |
 | `wakuwaku::entity::sqlx::backend::MySqlSource` | `SqlxSource<MySql>` (feature `sqlx-mysql`) |
-| `wakuwaku::entity::sqlx::transaction` | Transactions written as pure state machines; see [Transactions](/en/docs/data/transactions) |
+| `wakuwaku::entity::sqlx::transaction` | Transactions written as state machines whose steps run queries; see [Transactions](/en/docs/data/transactions) |
 | `wakuwaku::deps::sqlx` | The sqlx crate itself, the same version wakuwaku is built against |
 
 ## Which sqlx features are enabled
@@ -66,7 +66,7 @@ You cannot turn these features on through `wakuwaku`: it has no feature that for
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "macros", "migrate"] }
 ```
 
@@ -145,7 +145,7 @@ pub async fn connect(url: &str) -> Result<Db<PgSource, ReadWrite>, Box<dyn std::
 A query for sqlx implements two traits:
 
 - `Query`, from `wakuwaku::entity`, declares its **effect**: which entities it reads and writes.
-- `Execute<SqlxSource<DB>>` says how it runs. `execute` receives `&mut DB::Connection` (`&mut PgConnection` or `&mut MySqlConnection`), which is an sqlx executor, so you write the body with plain sqlx calls.
+- `Execute<SqlxSource<DB>>` says how it runs. `execute` receives `&mut DB::Connection` (`&mut PgConnection` or `&mut MySqlConnection`), which is an sqlx executor, so you write the body with plain sqlx calls. `type Error` is usually `sqlx::Error`; a query that can refuse on its own uses [its own error type](/en/docs/data/queries#own-error-type).
 
 <Tabs items={['PostgreSQL', 'MySQL']}>
 <Tab value="PostgreSQL">
@@ -177,6 +177,7 @@ impl Query for FindUser {
 
 impl Execute<SqlxSource<Postgres>> for FindUser {
     type Output = Option<UserRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Self::Output, sqlx::Error> {
         let row: Option<(i64, String)> =
@@ -200,6 +201,7 @@ impl Query for RenameUser {
 
 impl Execute<SqlxSource<Postgres>> for RenameUser {
     type Output = bool;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
         let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
@@ -242,6 +244,7 @@ impl Query for FindUser {
 
 impl Execute<SqlxSource<MySql>> for FindUser {
     type Output = Option<UserRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut MySqlConnection) -> Result<Self::Output, sqlx::Error> {
         let row: Option<(i64, String)> =
@@ -265,6 +268,7 @@ impl Query for RenameUser {
 
 impl Execute<SqlxSource<MySql>> for RenameUser {
     type Output = bool;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut MySqlConnection) -> Result<bool, sqlx::Error> {
         let done = sqlx::query("UPDATE users SET name = ? WHERE id = ?")
@@ -284,7 +288,7 @@ The `Query` half is identical for both databases; only the `Execute` half (place
 
 Rows are decoded into tuples here because tuples implement sqlx's `FromRow` without the `derive` feature. With `derive` enabled you can write `#[derive(sqlx::FromRow)] struct UserRow { … }` and use `sqlx::query_as::<_, UserRow>(…)` instead.
 
-Inside `execute`, `conn` is either a pool connection (the query runs on its own) or the connection of an open transaction (the query runs as a [transaction step](/en/docs/data/transactions)). The same query type works in both places.
+Inside `execute`, `conn` is either a pool connection (the query runs on its own) or the connection of an open transaction (a [transaction step](/en/docs/data/transactions) runs it with `tx.run(query)`). The same query type works in both places. To run inside a transaction, the query's error must implement `AsSqlxError`; `sqlx::Error` does.
 
 <Callout type="info" title="Compile-time checked SQL">
 `sqlx::query!` and `sqlx::query_as!` work inside `execute` as well; they need the `macros` feature and, at build time, either `DATABASE_URL` or sqlx's offline query data. The capability check described below is independent of them: it checks *which* queries run where, not the SQL text.
@@ -292,7 +296,7 @@ Inside `execute`, `conn` is either a pool connection (the query runs on its own)
 
 ### Running a query
 
-`Db<S, C>` implements kanau's `Processor<Q>` for every query `Q` that executes on `S` and whose effect `C` covers. Running a query is a `process` call, and the error type is `sqlx::Error`:
+`Db<S, C>` implements kanau's `Processor<Q>` for every query `Q` that executes on `S` and whose effect `C` covers. Running a query is a `process` call, and the error is the query's `Error`, here `sqlx::Error`:
 
 ```rust title="src/rename.rs"
 use crate::queries::{FindUser, RenameUser};
@@ -374,7 +378,7 @@ pub async fn build(primary_url: &str, replica_url: &str) -> Result<(), sqlx::Err
 }
 ```
 
-The two handles have different types, so the `ServiceBuilder` can hold both and `provide` finds each by its type. In a real service you would hand the builder to `grpc_service`, `cron_job` or `iggy_consumer`, which call `create_service` for you; see [ServiceBuilder](/en/docs/core/service-builder). In a unit test, `Profiles` takes any fake that implements `Processor<FindUser>`, so it needs no database at all; see [Testing](/en/docs/core/testing).
+The two handles have different types, so the `ServiceBuilder` can hold both and `provide` finds each by its type. In a real service you would hand the builder to `grpc_service`, `cron_job` or `iggy_consumer`, which call `create_service` for you, or build a component from several handles with `compose_grpc_service`, `compose_cron_job` or `compose_iggy_consumer`; see [ServiceBuilder](/en/docs/core/service-builder). In a unit test, `Profiles` takes any fake that implements `Processor<FindUser>`, so it needs no database at all; see [Testing](/en/docs/core/testing).
 
 <Callout type="warn" title="What the types prove, and what they don't">
 The capability check proves **routing**: code wired to a `Db<_, ReadOnly>` never issues a query *declared* as a write. It cannot prove that a query declared as `Read<User>` contains no `UPDATE`. Keep the database's own guard on replicas: a hot standby rejects writes, and on a primary `default_transaction_read_only = on` (PostgreSQL) or a read-only user does the same.
@@ -389,7 +393,7 @@ A service that may write only some entities can define its own capability instea
 - [`wakuwaku::deps`](https://docs.rs/wakuwaku/latest/wakuwaku/deps/index.html)
 
 <Cards>
-  <Card title="Transactions" href="/en/docs/data/transactions" description="Several statements, atomically, written as a pure state machine." />
+  <Card title="Transactions" href="/en/docs/data/transactions" description="Several queries, atomically, written as a state machine whose steps run queries." />
   <Card title="Hooks" href="/en/docs/data/hooks" description="Run code before or after every write query." />
   <Card title="Queries and capabilities" href="/en/docs/data/queries" description="Entities, effects and custom capabilities." />
 </Cards>

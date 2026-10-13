@@ -53,7 +53,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wakuwaku = "1.0.0-rc1"
+wakuwaku = "1.0.0-rc2"
 tokio = { version = "1.53", features = ["full"] }
 # Required by the code that tonic-prost-build generates.
 tonic = "0.14"
@@ -121,7 +121,7 @@ This generates the message types, a `guestbook_server::Guestbook` trait to imple
 
 ### Define the shared dependency
 
-Components in wakuwaku are built from dependencies registered in a `ServiceBuilder`. Each component takes exactly one dependency, so when a component needs several things, group them in a struct. Both components of this service need the store, and the cron job also needs the retention period, so they share `AppState`:
+Components in wakuwaku are built from dependencies registered in a `ServiceBuilder`. A component that implements `ServiceCreation` names one registered dependency as its `Dep`; one that needs several can be [built by a closure](/en/docs/core/service-builder#composing-components-with-a-closure) instead (`compose_cron_job`, `compose_grpc_service`). Both components of this service need the store, and the cron job also needs the retention period, so they share `AppState`:
 
 ```rust title="src/state.rs"
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -196,7 +196,7 @@ A cron job is a [`Processor`](https://docs.rs/kanau) of `CronTick`s with a const
 use std::convert::Infallible;
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 use crate::state::AppState;
 
@@ -231,11 +231,11 @@ impl Processor<CronTick> for PruneGuestbook {
 }
 
 impl CronJob for PruneGuestbook {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 ```
 
-The job reads the current time from `tick.fired_at` instead of calling `SystemTime::now()`. That keeps it deterministic: a test decides what "now" is. The first run happens as soon as the job starts, then one run every `INTERVAL`. [Cron jobs](/en/docs/services/cron-jobs) covers the schedule, errors, and running several replicas.
+The job reads the current time from `tick.fired_at` instead of calling `SystemTime::now()`. That keeps it deterministic: a test decides what "now" is. The first run happens as soon as the job starts. `CronJobInterval::AtLeast` then starts runs at least `INTERVAL` apart and never lets two runs overlap; `AfterFinish` and `AfterStart` are the other modes. [Cron jobs](/en/docs/services/cron-jobs) covers the schedule, errors, and running several replicas.
 
 </Step>
 <Step>
@@ -352,7 +352,7 @@ What happens here:
 - `ServiceBuilder::new(state)` registers `AppState`. Register more dependencies with `.push(value)`.
 - `.cron_job::<PruneGuestbook, _>()` looks up `PruneGuestbook::Dep` (`AppState`), clones it, and calls `create_service`. The `_` is the dependency's position in the builder, which the compiler infers. `.start()` spawns the job and returns the builder together with a `CronRuntime`.
 - `.grpc_service::<GuestbookServer<_>, GuestbookService, _>(GuestbookServer::new)` does the same for the gRPC implementation and wraps it in its generated server. `.into_router_fn()` returns a function that adds every registered server to a tonic router.
-- On Ctrl-C, `serve_with_shutdown` stops accepting connections and finishes the requests in flight. `cron.shutdown().await` then lets a run in progress finish and stops the job. Dropping the `CronRuntime` without calling `shutdown` would abort the job instead.
+- On Ctrl-C, `serve_with_shutdown` stops accepting connections and finishes the requests in flight. `cron.shutdown().await` then stops scheduling and waits for a run in progress to finish; bound it with `tokio::time::timeout` if a run can take long. `cron.abort().await` would cancel the run instead, and dropping the `CronRuntime` aborts it without waiting.
 
 If you delete the `AppState` registration or register a different type, the program no longer compiles. The error says that the builder does not implement `ProvideAt<AppState, _>`, which means the builder holds no `AppState`. [Service builder](/en/docs/core/service-builder) explains how lookup works.
 

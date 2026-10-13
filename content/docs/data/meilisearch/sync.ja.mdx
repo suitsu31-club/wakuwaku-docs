@@ -21,7 +21,7 @@ wakuwaku は、どのプロジェクトでも共通する部品を提供しま�
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["meilisearch", "sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["meilisearch", "sqlx-pg"] }
 ```
 
 ## 射影を記述する
@@ -72,6 +72,7 @@ impl Query for LoadPosts {
 
 impl Execute<PgSource> for LoadPosts {
     type Output = Vec<PostRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
         let rows: Vec<PostTuple> = sqlx::query_as(
@@ -167,6 +168,7 @@ impl Query for PublishPost {
 
 impl Execute<PgSource> for PublishPost {
     type Output = u64;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
         let done = sqlx::query("UPDATE post SET published_at = now() WHERE id = $1")
@@ -239,9 +241,83 @@ pub fn wire(
   `AfterWrite` が見るのは単独で実行されたクエリです。[トランザクション](/ja/docs/data/transactions) 内のクエリはトランザクションのコネクション上で実行され、`AfterWrite` を通りません。代わりにトランザクションにフックを掛けます。
 </Callout>
 
-## トランザクションから変更を届ける
+## トランザクションから変更を届ける [#delivering-changes-from-transactions]
 
-`TxFlow` の中で行う書き込みには、ハンドルを `AfterTransaction` で包みます。そのフックは、フローのレポートとトランザクションの結末 ([`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)) を受け取ります。フローの `Report` を、触れた投稿の `Reindex` にして、インデクサーを適合させます。
+[トランザクション](/ja/docs/data/transactions) の中で行う書き込みには、ハンドルを `AfterTransaction` で包みます。フローが実行された各トランザクションの後、そのフックはフローの `Report` を、トランザクションの結末 ([`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)) と一緒に受け取ります。`Report` を、フローが触れた投稿の `Reindex` にしてください。どのキーを書いたかはフローが知っており、フックは結末が分かってから初めてそれらを再インデックスします。
+
+### 触れたものを報告するフロー [#a-flow-that-reports-what-it-touched]
+
+このフローは、複数の下書きをまとめて公開します。すべて公開するか、1 つも公開しないかのどちらかです。各ステップは上の `PublishPost` クエリで投稿を 1 つ公開し、存在しない投稿があればすべてをロールバックします。
+
+```rust title="src/search/sync.rs"
+use wakuwaku::deps::sqlx::Postgres;
+use wakuwaku::entity::sqlx::transaction::{Either, Tx, TxEnd, TxFlow, TxState};
+
+/// 複数の下書きを 1 つのトランザクションで公開する: すべてか、何もしないか。
+pub enum PublishAll {
+    /// `pending` はこれから公開するもの、`done` は公開済みのもの。
+    Running { pending: Vec<i64>, done: Vec<i64> },
+    End(TxEnd<PublishAll>),
+}
+
+/// `PublishAll` がロールバックした理由。
+pub enum PublishAllFailed {
+    /// この id の投稿がない。
+    Missing(i64),
+    Database(sqlx::Error),
+}
+
+impl Query for PublishAll {
+    type Effect = (Read<Post>, Write<Post>);
+}
+
+impl From<TxEnd<Self>> for PublishAll {
+    fn from(end: TxEnd<Self>) -> Self {
+        Self::End(end)
+    }
+}
+
+impl TxFlow for PublishAll {
+    type Database = Postgres;
+    type Commit = ();
+    type Abort = PublishAllFailed;
+    /// トランザクションが触れた投稿。フックのためのもの。
+    type Report = Reindex<PostIndex>;
+
+    async fn step(tx: Tx<'_, Self>, state: Self) -> TxState<'_, Self> {
+        let Self::Running { mut pending, mut done } = state else {
+            unreachable!("never stepped when terminal")
+        };
+        let Some(id) = pending.pop() else {
+            // すべて公開した: ドライバーがコミットする。
+            return tx.with(Self::End(TxEnd::Commit { output: (), report: Reindex::new(done) }));
+        };
+        let (tx, published) = tx.run(PublishPost { id }).await;
+        let failed = match published {
+            Ok(1) => {
+                done.push(id);
+                return tx.with(Self::Running { pending, done });
+            }
+            Ok(_) => PublishAllFailed::Missing(id),
+            Err(error) => PublishAllFailed::Database(error),
+        };
+        tx.with(Self::End(TxEnd::Rollback { output: failed, report: Reindex::new(done) }))
+    }
+
+    fn finished(self) -> Either<Self, TxEnd<Self>> {
+        match self {
+            Self::End(end) => Either::Right(end),
+            state => Either::Left(state),
+        }
+    }
+}
+```
+
+どちらの終わり方にもレポートが付きます。ロールバックの後は何も変わっていないので、下のフックはそれを無視します。
+
+### コミットされたものを再インデックスする [#reindexing-what-committed]
+
+フックは、コミットされたトランザクションのレポートを再インデックスします。書き込みフックと同じインデクサーで接続します。
 
 ```rust title="src/search/sync.rs"
 use wakuwaku::entity::meilisearch::sync::Reindexed;
@@ -281,7 +357,23 @@ pub fn wire_transactions(
 }
 ```
 
-キーによる再インデックスが真価を発揮するのが `CommitUnknown` です。`COMMIT` の結果が失われると投稿が変わったかどうかは分かりませんが、読み直せばどちらの場合でも正しい結果になります。単独で実行されたクエリは `AfterTransaction` をそのまま通過するので、2 つのフックを重ねられます: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>`。
+フローは包んだハンドルで実行します。呼び出し側は結果を、フックはレポートを受け取ります。
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::sqlx::transaction::{Transaction, TxError, TxOutput};
+
+/// `ids` を公開する。トランザクションがコミットされたら、フックがそれらを再インデックスする。
+pub async fn publish_all<D>(db: &D, ids: Vec<i64>) -> Result<TxOutput<(), PublishAllFailed>, TxError>
+where
+    D: Processor<Transaction<PublishAll>, Output = TxOutput<(), PublishAllFailed>, Error = TxError>,
+{
+    db.process(Transaction(PublishAll::Running { pending: ids, done: Vec::new() })).await
+}
+```
+
+キーによる再インデックスが真価を発揮するのが `CommitUnknown` です。`COMMIT` の結果が失われると投稿が変わったかどうかは分かりませんが、読み直せばどちらの場合でも正しい結果になります。始まらなかったトランザクション (`TxError::Begin`) はフックに届きません。
+
+単独で実行されたクエリは `AfterTransaction` をそのまま通過するので、2 つのフックを重ねられます: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>`。書き込みフックはトランザクションを転送しないので、トランザクションは `AfterWrite::inner()` で実行します。[トランザクションの終了にフックする](/ja/docs/data/transactions#hooking-the-end-of-a-transaction) も参照してください。
 
 ## 永続的なログで変更を届ける
 
@@ -314,6 +406,7 @@ impl Query for PostPage {
 
 impl Execute<PgSource> for PostPage {
     type Output = Vec<PostRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
         let rows: Vec<PostTuple> = sqlx::query_as(
@@ -361,6 +454,37 @@ pub async fn rebuild_posts(
 
 [cron ジョブ](/ja/docs/services/cron-jobs) でスケジュールしてください。まずは毎晩が妥当です。
 
+```rust title="src/search/rebuild.rs"
+use std::time::Duration;
+use wakuwaku::{CronJob, CronJobInterval, CronTick};
+
+/// 毎晩 `posts` を再構築する。
+pub struct RebuildPosts {
+    pub source: Db<PgSource, ReadOnly>,
+    pub meili: Db<MeiliSource, PostIndexer>,
+}
+
+impl Processor<CronTick> for RebuildPosts {
+    type Output = ();
+    type Error = SyncError<sqlx::Error>;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), Self::Error> {
+        rebuild_posts(&self.source, &self.meili).await?;
+        Ok(())
+    }
+}
+
+impl CronJob for RebuildPosts {
+    // 再構築の終了から次の開始まで 1 日: 実行は決して重ならない。
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(24 * 60 * 60));
+}
+```
+
+- **`AfterFinish` か `AtLeast` を使い、`AfterStart` は使わないでください。** 1 つのインデックスの再構築は重なってはいけません。各再構築は、もう一方が埋めているコピーの削除から始まるからです。
+- **最初の実行は起動時です。** そのため、デプロイのたびにインデックスも一度再構築されます。
+- **`compose_cron_job` で組み立ててください。** 必要な 2 つのハンドルから作ります。
+- **すべてのレプリカを通じて再構築は 1 つだけです。** 複数のレプリカがこのジョブを実行する場合は、1 つのレプリカでだけ実行するか、[cron ジョブのガイド](/ja/docs/services/cron-jobs) にあるようにロックで守ってください。
+
 ### 再構築の仕組み
 
 1. (以前に失敗した実行の) 残っている `posts__wakuwaku_rebuild` という名前のコピーを削除し、新たに作成します。
@@ -399,6 +523,7 @@ impl Query for ChangedSince {
 
 impl Execute<PgSource> for ChangedSince {
     type Output = Vec<i64>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error> {
         let since = self.since.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();

@@ -1,8 +1,8 @@
 const text = {
   en: {
     title:
-      "gRPC registration: each implementation is built from a dependency cloned out of the ServiceBuilder, wrapped in its tonic server and pushed onto a GrpcServiceRegisterCenter; into_router_fn adds every server to a router built by Server::builder, which is then served",
-    stage1: "Build each server, once per grpc_service call",
+      "gRPC registration: each implementation is built by grpc_service from a dependency cloned out of the ServiceBuilder, or by compose_grpc_service from a closure over the whole builder; it is wrapped in its tonic server and pushed onto a GrpcServiceRegisterCenter; into_router_fn adds every server to a router built by Server::builder, which is then served",
+    stage1: "Build each server, once per registration",
     stage2: "Build the router and serve",
     dep: "Dep",
     generated: "tonic-generated",
@@ -10,13 +10,14 @@ const text = {
     addsAll: "adds each server in order",
     router: "router",
     register: "register",
+    composeSub: "borrows the builder; nothing registered as a service",
     caption:
-      "Each server is created when grpc_service is called; into_router_fn adds them with add_service in registration order.",
+      "Each server is created when it is registered (grpc_service, or compose_grpc_service for a closure over the whole builder); into_router_fn adds them with add_service in registration order.",
   },
   ja: {
     title:
-      "gRPC の登録: 各実装は ServiceBuilder から clone した依存で作られ、tonic のサーバーで包まれて GrpcServiceRegisterCenter に push される。into_router_fn が Server::builder で作ったルーターに全サーバーを追加し、serve する",
-    stage1: "各サーバーを作る (grpc_service の呼び出しごと)",
+      "gRPC の登録: 各実装は grpc_service なら ServiceBuilder から clone した依存で、compose_grpc_service ならビルダー全体を借用するクロージャで作られ、tonic のサーバーで包まれて GrpcServiceRegisterCenter に push される。into_router_fn が Server::builder で作ったルーターに全サーバーを追加し、serve する",
+    stage1: "各サーバーを作る (登録ごと)",
     stage2: "ルーターを組み立てて serve する",
     dep: "Dep",
     generated: "tonic が生成",
@@ -24,8 +25,9 @@ const text = {
     addsAll: "登録順に各サーバーを追加",
     router: "router",
     register: "register",
+    composeSub: "ビルダーを借用。サービスとしては登録されない",
     caption:
-      "各サーバーは grpc_service の呼び出し時に作られ、into_router_fn が登録順に add_service で追加します。",
+      "各サーバーは登録時 (grpc_service、またはビルダー全体を借用する compose_grpc_service) に作られ、into_router_fn が登録順に add_service で追加します。",
   },
 } as const;
 
@@ -101,7 +103,6 @@ function StepNumber({ x, y, n }: { x: number; y: number; n: number }) {
 const lanes = [
   { y: 146, dep: "UserStore", impl: "UserImpl", server: "UserServer" },
   { y: 206, dep: "OrderStore", impl: "OrderImpl", server: "OrderServer" },
-  { y: 266, dep: "AuditedStore", impl: "AdminImpl", server: "AdminServer" },
 ];
 
 export function GrpcRegistrationDiagram({
@@ -323,6 +324,97 @@ export function GrpcRegistrationDiagram({
             </text>
           </g>
         ))}
+
+        {/* compose path: one closure borrows the whole builder */}
+        {[
+          { y: 252, dep: "AdminStore" },
+          { y: 280, dep: "AuditLayer" },
+        ].map((d) => (
+          <g key={d.dep}>
+            <rect
+              x={30}
+              y={d.y - 12}
+              width={120}
+              height={24}
+              rx={6}
+              fill={card}
+              stroke={border}
+            />
+            <text
+              x={90}
+              y={d.y + 5}
+              fontSize={13}
+              fontFamily={mono}
+              fill={fg}
+              textAnchor="middle"
+            >
+              {d.dep}
+            </text>
+            <path
+              d={`M150,${d.y} L186,266`}
+              stroke={muted}
+              strokeWidth={1.5}
+              markerEnd={arrow}
+            />
+          </g>
+        ))}
+        <Box x={188} y={238} w={484} h={56} tone="indigo" />
+        <text
+          x={430}
+          y={255}
+          fontSize={13}
+          fontWeight={700}
+          fontFamily={mono}
+          fill={fg}
+          textAnchor="middle"
+        >
+          {"compose_grpc_service(|s| …)"}
+        </text>
+        <text
+          x={430}
+          y={271}
+          fontSize={12}
+          fontFamily={mono}
+          fill={fg}
+          textAnchor="middle"
+        >
+          {"AdminServer::new(AdminImpl { … s.provide() … })"}
+        </text>
+        <text
+          x={430}
+          y={287}
+          fontSize={12}
+          fontFamily="inherit"
+          fill={muted}
+          textAnchor="middle"
+        >
+          {t.composeSub}
+        </text>
+        <path
+          d="M672,266 L710,266"
+          stroke={muted}
+          strokeWidth={1.5}
+          markerEnd={arrow}
+        />
+        <rect
+          x={712}
+          y={248}
+          width={156}
+          height={36}
+          rx={6}
+          fill={card}
+          stroke={border}
+        />
+        <text
+          x={790}
+          y={271}
+          fontSize={13}
+          fontFamily={mono}
+          fill={fg}
+          textAnchor="middle"
+        >
+          AdminServer
+        </text>
 
         {/* Stage 2 */}
         <StepNumber x={31} y={327} n={2} />

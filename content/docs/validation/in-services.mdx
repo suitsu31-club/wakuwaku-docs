@@ -44,6 +44,7 @@ impl Query for InsertUser {
 
 impl Execute<PgSource> for InsertUser {
     type Output = i64;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
         let (id,) = sqlx::query_as::<_, (i64,)>("INSERT INTO users (name) VALUES ($1) RETURNING id")
@@ -124,7 +125,7 @@ message RegisterReply {
 }
 ```
 
-Generate the code as described in [gRPC services](/en/docs/services/grpc#generating-code-from-a-proto-file); the generated code needs direct `tonic`, `tonic-prost` and `prost` dependencies and `tonic-prost-build` as a build dependency. The service holds the validation context and the write handle, and is built from one registered dependency through `ServiceCreation`:
+Generate the code as described in [gRPC services](/en/docs/services/grpc#generating-code-from-a-proto-file); the generated code needs direct `tonic`, `tonic-prost` and `prost` dependencies and `tonic-prost-build` as a build dependency. The service holds the validation context and the write handle. It is assembled from those two registered services when the server is built (see [Wiring the context](#wiring-the-context)), so it needs no `ServiceCreation` impl:
 
 ```rust title="src/accounts.rs"
 pub mod pb {
@@ -133,29 +134,13 @@ pub mod pb {
 
 use pb::accounts_server::{Accounts, AccountsServer};
 use pb::{RegisterReply, RegisterRequest};
-use wakuwaku::ServiceCreation;
 use wakuwaku::deps::tonic::{Request, Response, Status};
 use wakuwaku::entity::{Db, ReadWrite};
 use wakuwaku::proof::{CheckOrder, prove};
 
-/// Registered once in the `ServiceBuilder`; cloned into the service.
-#[derive(Clone)]
-pub struct AccountsDeps {
-    pub directory: Directory,
-    pub writer: Db<PgSource, ReadWrite>,
-}
-
 pub struct AccountsService {
     directory: Directory,
     writer: Db<PgSource, ReadWrite>,
-}
-
-impl ServiceCreation for AccountsService {
-    type Dep = AccountsDeps;
-
-    fn create_service(dep: AccountsDeps) -> Self {
-        Self { directory: dep.directory, writer: dep.writer }
-    }
 }
 
 #[tonic::async_trait]
@@ -197,7 +182,7 @@ The subject does not have to be a single field. A predicate can be implemented f
 
 ## Wiring the context
 
-The context is a dependency like any other. Register it with the service builder; the service clones it out when it is created, and `And` clones it again on every check, so it must be cheap to clone. A `Db` over a `PgSource` wraps a pool handle, so cloning it is cheap.
+The context is a dependency like any other. Register it with the service builder next to the write handle, and build the server with `compose_grpc_service`, which borrows the builder so the service can take a clone of each. `And` clones the context again on every check, so it must be cheap to clone. A `Db` over a `PgSource` wraps a pool handle, so cloning it is cheap.
 
 ```rust title="src/accounts.rs"
 use wakuwaku::ServiceBuilder;
@@ -209,17 +194,20 @@ use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
 pub async fn serve(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect(database_url).await?;
 
-    let deps = AccountsDeps {
-        directory: Directory {
-            // Validation only reads, so it gets a read-only handle.
-            users: Db::<_, ReadOnly>::new(PgSource::new(pool.clone())),
-            limits: Limits { max_len: 32 },
-        },
-        writer: Db::<_, ReadWrite>::new(PgSource::new(pool)),
+    let directory = Directory {
+        // Validation only reads, so it gets a read-only handle.
+        users: Db::<_, ReadOnly>::new(PgSource::new(pool.clone())),
+        limits: Limits { max_len: 32 },
     };
 
-    let (_services, register) = ServiceBuilder::new(deps)
-        .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    let (_services, register) = ServiceBuilder::new(directory)
+        .push(Db::<_, ReadWrite>::new(PgSource::new(pool)))
+        .compose_grpc_service(|s| {
+            AccountsServer::new(AccountsService {
+                directory: s.provide::<Directory, _>().clone(),
+                writer: s.provide::<Db<PgSource, ReadWrite>, _>().clone(),
+            })
+        })
         .into_router_fn();
 
     let router = Server::builder().add_routes(Routes::default());
@@ -275,7 +263,7 @@ A few guidelines:
 
 - **Test both check orders** for composites whose outcome you rely on. They differ in which operands run and which error is reported when several fail (see [Check order](/en/docs/validation/composition#check-order)).
 - **Test the evidence**, not only success. Later code reads it, so a wrong `spare` or a wrong row is a bug even when the check passes.
-- **Functions that take a `Proven` are tested with real proofs.** There is no test-only constructor, by design: get the proof from `prove` in the test. For pure predicates this costs nothing.
+- **Functions that take a `Proven` are tested with real proofs.** There is no test-only constructor, by design: get the proof from `prove` (or the evidence type's `PureVerifier`) in the test. For pure checks this costs nothing, and a verifier needs no runtime: it is a plain `#[test]`.
 - **I/O predicates** read through a concrete context (`Directory` holds a `Db<PgSource, ReadOnly>`), so test them against a real database in integration tests. Keep the decision itself trivial, as in `UsernameAvailable`, so the interesting logic stays in pure predicates. See [Testing](/en/docs/core/testing) for the overall approach.
 
 ## Next steps

@@ -21,7 +21,7 @@ The examples sync the `posts` index from the [overview](/en/docs/data/meilisearc
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["meilisearch", "sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["meilisearch", "sqlx-pg"] }
 ```
 
 ## Describing the projection
@@ -72,6 +72,7 @@ impl Query for LoadPosts {
 
 impl Execute<PgSource> for LoadPosts {
     type Output = Vec<PostRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
         let rows: Vec<PostTuple> = sqlx::query_as(
@@ -167,6 +168,7 @@ impl Query for PublishPost {
 
 impl Execute<PgSource> for PublishPost {
     type Output = u64;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
         let done = sqlx::query("UPDATE post SET published_at = now() WHERE id = $1")
@@ -241,7 +243,81 @@ A few things to know about this setup:
 
 ## Delivering changes from transactions
 
-For writes that happen in a `TxFlow`, wrap the handle in `AfterTransaction`. Its hook receives the flow's report together with how the transaction ended ([`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)). Let the flow's `Report` be the `Reindex` of the posts it touched, and adapt the indexer:
+For writes made inside a [transaction](/en/docs/data/transactions), wrap the handle in `AfterTransaction`. After each transaction whose flow ran, its hook receives the flow's `Report`, tagged with how the transaction ended ([`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)). Make the `Report` the `Reindex` of the posts the flow touched: the flow knows which keys it wrote, and the hook reindexes them only once the outcome is known.
+
+### A flow that reports what it touched
+
+This flow publishes several drafts at once, all or none. Each step publishes one post with the `PublishPost` query from above; a post that doesn't exist rolls everything back.
+
+```rust title="src/search/sync.rs"
+use wakuwaku::deps::sqlx::Postgres;
+use wakuwaku::entity::sqlx::transaction::{Either, Tx, TxEnd, TxFlow, TxState};
+
+/// Publish several drafts in one transaction: all of them or none.
+pub enum PublishAll {
+    /// `pending` still to publish, `done` published so far.
+    Running { pending: Vec<i64>, done: Vec<i64> },
+    End(TxEnd<PublishAll>),
+}
+
+/// Why `PublishAll` rolled back.
+pub enum PublishAllFailed {
+    /// No post has this id.
+    Missing(i64),
+    Database(sqlx::Error),
+}
+
+impl Query for PublishAll {
+    type Effect = (Read<Post>, Write<Post>);
+}
+
+impl From<TxEnd<Self>> for PublishAll {
+    fn from(end: TxEnd<Self>) -> Self {
+        Self::End(end)
+    }
+}
+
+impl TxFlow for PublishAll {
+    type Database = Postgres;
+    type Commit = ();
+    type Abort = PublishAllFailed;
+    /// The posts the transaction touched, for the hook.
+    type Report = Reindex<PostIndex>;
+
+    async fn step(tx: Tx<'_, Self>, state: Self) -> TxState<'_, Self> {
+        let Self::Running { mut pending, mut done } = state else {
+            unreachable!("never stepped when terminal")
+        };
+        let Some(id) = pending.pop() else {
+            // Every post published: the driver commits.
+            return tx.with(Self::End(TxEnd::Commit { output: (), report: Reindex::new(done) }));
+        };
+        let (tx, published) = tx.run(PublishPost { id }).await;
+        let failed = match published {
+            Ok(1) => {
+                done.push(id);
+                return tx.with(Self::Running { pending, done });
+            }
+            Ok(_) => PublishAllFailed::Missing(id),
+            Err(error) => PublishAllFailed::Database(error),
+        };
+        tx.with(Self::End(TxEnd::Rollback { output: failed, report: Reindex::new(done) }))
+    }
+
+    fn finished(self) -> Either<Self, TxEnd<Self>> {
+        match self {
+            Self::End(end) => Either::Right(end),
+            state => Either::Left(state),
+        }
+    }
+}
+```
+
+Both ends carry a report. After a rollback nothing changed, so the hook below ignores it.
+
+### Reindexing what committed
+
+The hook reindexes the report of a committed transaction. Wire it with the same indexer as the write hook:
 
 ```rust title="src/search/sync.rs"
 use wakuwaku::entity::meilisearch::sync::Reindexed;
@@ -281,7 +357,23 @@ pub fn wire_transactions(
 }
 ```
 
-`CommitUnknown` is where reindexing by key pays off: when the `COMMIT` result was lost, you can't know whether the post changed, but reloading it is correct either way. Queries run on their own pass through `AfterTransaction` untouched, so you can stack both hooks: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>`.
+Run the flow on the wrapped handle; the caller gets the outcome, the hook gets the report:
+
+```rust title="src/search/sync.rs"
+use wakuwaku::entity::sqlx::transaction::{Transaction, TxError, TxOutput};
+
+/// Publish `ids`. Once the transaction committed, the hook reindexes them.
+pub async fn publish_all<D>(db: &D, ids: Vec<i64>) -> Result<TxOutput<(), PublishAllFailed>, TxError>
+where
+    D: Processor<Transaction<PublishAll>, Output = TxOutput<(), PublishAllFailed>, Error = TxError>,
+{
+    db.process(Transaction(PublishAll::Running { pending: ids, done: Vec::new() })).await
+}
+```
+
+`CommitUnknown` is where reindexing by key pays off: when the `COMMIT` result was lost, you can't know whether the posts changed, but reloading them is correct either way. A transaction that never began (`TxError::Begin`) doesn't reach the hook.
+
+Queries run on their own pass through `AfterTransaction` untouched, so you can stack both hooks: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>`. Write hooks don't forward transactions; run those on `AfterWrite::inner()`. See [Hooking the end of a transaction](/en/docs/data/transactions#hooking-the-end-of-a-transaction).
 
 ## Delivering changes through a durable log
 
@@ -314,6 +406,7 @@ impl Query for PostPage {
 
 impl Execute<PgSource> for PostPage {
     type Output = Vec<PostRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<PostRow>, sqlx::Error> {
         let rows: Vec<PostTuple> = sqlx::query_as(
@@ -359,7 +452,38 @@ pub async fn rebuild_posts(
 }
 ```
 
-Schedule it with a [cron job](/en/docs/services/cron-jobs); nightly is a reasonable start.
+Schedule it with a [cron job](/en/docs/services/cron-jobs); nightly is a reasonable start:
+
+```rust title="src/search/rebuild.rs"
+use std::time::Duration;
+use wakuwaku::{CronJob, CronJobInterval, CronTick};
+
+/// Rebuilds `posts` every night.
+pub struct RebuildPosts {
+    pub source: Db<PgSource, ReadOnly>,
+    pub meili: Db<MeiliSource, PostIndexer>,
+}
+
+impl Processor<CronTick> for RebuildPosts {
+    type Output = ();
+    type Error = SyncError<sqlx::Error>;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), Self::Error> {
+        rebuild_posts(&self.source, &self.meili).await?;
+        Ok(())
+    }
+}
+
+impl CronJob for RebuildPosts {
+    // A day from the end of one rebuild to the start of the next: runs never overlap.
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(24 * 60 * 60));
+}
+```
+
+- **Use `AfterFinish` or `AtLeast`, never `AfterStart`.** Two rebuilds of one index must not overlap: each starts by deleting the copy the other is filling.
+- **The first run is at startup**, so every deployment also rebuilds the index once.
+- **Build it with `compose_cron_job`**, from the two handles it needs.
+- **One rebuild across all replicas.** If several replicas run the job, run it on one of them only, or fence it with a lock as shown in the [cron jobs guide](/en/docs/services/cron-jobs).
 
 ### How a rebuild works
 
@@ -399,6 +523,7 @@ impl Query for ChangedSince {
 
 impl Execute<PgSource> for ChangedSince {
     type Output = Vec<i64>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error> {
         let since = self.since.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();

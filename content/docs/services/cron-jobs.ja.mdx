@@ -1,12 +1,12 @@
 ---
 title: cron ジョブ
-description: ServiceBuilder から組み立てたローカルジョブを一定間隔で実行します。実行が重なることはなく、エラーや panic が起きてもスケジュールは続きます。
+description: ServiceBuilder から組み立てたローカルジョブを一定間隔で実行します。実行の間隔の取り方は三種類あり、エラーや panic が起きてもスケジュールは続きます。
 icon: Clock
 ---
 
-マイクロサービスにおける「cron」処理の多くはスキャンです。期限切れセッションの削除、詰まった処理の再試行、検索インデックスの整合などです。[`CronJob`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/trait.CronJob.html) はまさにそのためのもので、固定の `INTERVAL` を持つ [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html) の [`Processor`](https://docs.rs/kanau/0.6/kanau/processor/trait.Processor.html) です。間隔はカレンダー式ではなくジョブ型の定数なので、「毎日 3:00 に」のような書き方はありません。
+マイクロサービスにおける「cron」処理の多くはスキャンです。期限切れセッションの削除、詰まった処理の再試行、検索インデックスの整合などです。[`CronJob`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/trait.CronJob.html) はまさにそのためのもので、定数 `INTERVAL` を持つ [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html) の [`Processor`](https://docs.rs/kanau/0.6/kanau/processor/trait.Processor.html) です。`INTERVAL` は実行の間隔の取り方を表す [`CronJobInterval`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/enum.CronJobInterval.html) です。間隔はカレンダー式ではなくジョブ型の定数なので、「毎日 3:00 に」のような書き方はありません。
 
-Spring でいえば、Bean のメソッドに付ける `@Scheduled(fixedRate = ...)` がいちばん近いものです。違いは後述します。時間がかかりすぎた実行は、その間の実行をキューに積まずにスキップします。また、サービスのレプリカはそれぞれがすべてのジョブを実行します。
+Spring でいえば、Bean のメソッドに付ける `@Scheduled` がいちばん近いもので、三種類の間隔はそのオプションに対応します。`AfterFinish` は `fixedDelay`、`AtLeast` は実行が重ならない `fixedRate`、`AfterStart` は `@Async` を付けた `fixedRate` です。違いの一つは [後述](#running-on-several-replicas) します。サービスのレプリカはそれぞれがすべてのジョブを実行します。
 
 ## ジョブを定義する [#defining-a-job]
 
@@ -22,7 +22,7 @@ Spring でいえば、Bean のメソッドに付ける `@Scheduled(fixedRate = .
 use std::time::Duration;
 
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 pub struct ExpireSessions {
     store: SessionStore,
@@ -48,7 +48,7 @@ impl Processor<CronTick> for ExpireSessions {
 }
 
 impl CronJob for ExpireSessions {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 ```
 
@@ -89,7 +89,7 @@ impl fmt::Display for StoreError {
 | `run` | `u64` | ランタイム開始以降、このジョブがそれまでに実行された回数。最初の実行では `0`。 |
 | `fired_at` | `SystemTime` | 実行を開始した時点の実時間。 |
 
-`run` は実際に行われた実行を数えます。超過によってスキップされたグリッド点([スケジュール](#the-schedule) を参照)は数えないので、`run` は「開始からの経過時間 ÷ 間隔」ではありません。「N 回に一回は全件処理する」といった用途に向いています。
+`run` は実際に行われた実行を数えます。実行の間隔は [間隔の種類](#the-schedule) と各実行にかかる時間で決まり、`AfterStart` はスキップせざるを得なかったグリッド点を数えないので、`run` は「開始からの経過時間 ÷ 間隔」ではありません。「N 回に一回は全件処理する」といった用途に向いています。
 
 ```rust
 impl Processor<CronTick> for ReindexSearch {
@@ -110,7 +110,7 @@ impl Processor<CronTick> for ReindexSearch {
 }
 
 impl CronJob for ReindexSearch {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(60 * 60));
 }
 ```
 
@@ -134,6 +134,7 @@ cron.shutdown().await;
 ```
 
 - `Position` は、`Dep` 型が複数回登録されていない限り `_` で構いません(複数回登録している場合は `Here` / `There` を使います。[サービスビルダー](/ja/docs/core/service-builder) を参照)。登録されていない `Dep` はコンパイルエラーになります。
+- 複数の登録値が必要なジョブは、代わりに `compose_cron_job` で登録します。[複数のサービスから組み立てるジョブ](#jobs-built-from-several-services) を参照してください。
 - `start` は **ジョブごとに一つの Tokio タスク** を起動し、サービスビルダーと [`CronRuntime`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html) を返します。Tokio ランタイムの中で呼ぶ必要があり、外で呼ぶと panic します。
 - ジョブは、gRPC サーバーやサービスビルダー自体と同じく型レベルのリストに保持されます。Box 化も動的ディスパッチもありません。
 
@@ -141,19 +142,40 @@ cron.shutdown().await;
 
 <CronScheduleDiagram lang="ja" />
 
-各ジョブは自分専用のグリッド `start + k × INTERVAL` に沿って動きます。`start` は `start` を呼んだ時点です。
+**どのジョブも、最初の実行は `start` の時点です。** `start` を呼んだ時点であり、一間隔待ってからではありません。その後の実行がいつ始まるかは、`INTERVAL` のバリアントとその長さ `d` で決まります。
 
-- **最初の実行は `start` の時点です。** 一間隔待ってからではありません。
-- **同じジョブの実行が重なることはありません。** `INTERVAL` より長くかかった実行は、その間に過ぎたグリッド点をスキップします。次の実行は、実行が終わった時点より前ではない最初のグリッド点です。実行がちょうどグリッド点で終わった場合は、次の実行がすぐに始まります。
-- したがって、連続する二つの実行の開始時刻は必ず間隔の整数倍(0 ではない)だけ離れ、スケジュールがずれていくことはありません。
+| `INTERVAL` | 次の実行が始まるのは | 同じジョブの実行の重なり | Spring |
+| --- | --- | --- | --- |
+| `AfterFinish(d)` | 前の実行が **終わって** から `d` 後 | なし | `fixedDelay` |
+| `AtLeast(d)` | 前の実行が **始まって** から `d` 後。前の実行がそれより遅く終わった場合は終わった直後 | なし | 重ならない `fixedRate` |
+| `AfterStart(d)` | 前の実行の状態にかかわらず、グリッド `start + k × d` 上 | あり | `@Async` を付けた `fixedRate` |
 
-たとえば間隔が 10 秒で、最初の実行に 25 秒かかった場合、実行は 0 秒、30 秒、40 秒、50 秒、… に始まります。10 秒と 20 秒の点はキューに積まれるのではなく、スキップされます。
+三つの違いが表れるのは、実行に時間がかかったときだけです。図では、最初の実行に `2.5·d`、それ以降の実行にそれぞれ `0.25·d` かかっています。
+
+| `INTERVAL` | 実行の開始時刻 | |
+| --- | --- | --- |
+| `AfterFinish(d)` | 0、3.5·d、4.75·d、6·d、… | 実行の間には必ず `d` の休みが入るので、開始時刻の間隔は `d` + 実行時間です。 |
+| `AtLeast(d)` | 0、2.5·d、3.5·d、4.5·d、… | 超過した実行の直後に次が始まり、その後は `d` ごとに一回に戻ります。 |
+| `AfterStart(d)` | 0、d、2·d、3·d、… | `d` と `2·d` の実行は、最初の実行がまだ続いているうちに始まります。 |
 
 ジョブ同士は独立しています。`ReindexSearch` が遅くても `ExpireSessions` が遅れることはありません。
 
+### 間隔の選び方 [#choosing-an-interval]
+
+**`AtLeast(d)`: `d` ごとに多くても一回、同時には一つだけ。** 「だいたい `d` ごとに」動かしたいスキャンなら、ふつうはこれを選びます。時間を超過した実行は、未処理の回を溜め込む代わりに次の実行を遅らせます。次の実行は超過した実行が終わった直後に始まり、その後はジョブが元のペースに戻ります。連続する開始時刻は単調時計で少なくとも `d` 離れるので、その間に実時間の時計が調整されない限り、`fired_at` も少なくとも `d` 離れます。
+
+**`AfterFinish(d)`: 実行と実行の間に必ず休みを入れる。** 二つの開始時刻の間隔は `d` + 実行時間なので、スケジュールは各実行の長さの分だけずれていきます。その代わり、ジョブが負荷をかける相手(データベースやレート制限のある API)は、実行がどれだけ長くかかっても、その後に必ず `d` の休みを得られます。溜まった作業をバッチで消化する処理や、負荷に応じて実行時間が伸びる処理に向いています。
+
+**`AfterStart(d)`: 固定のグリッド。実行が重なることがある。** 各グリッド点で、前の実行が終わったかどうかにかかわらず、専用のタスクで実行を始めます。排他よりタイミングが重要な場合、たとえば一回の実行が遅れても後ろにずれてはいけないサンプリングやハートビートに向いています。次の点に注意してください。
+
+- ジョブは自分自身と並行して動きます。`process` は `&self` を受け取るので、実行間で共有する状態には同期が必要で、処理自体も二つの実行が同時に動くことに耐えなければなりません。
+- 実行が `d` より長くかかり続けると、実行は溜まり続けます。同時に動く数に上限はありません。
+- ランタイムがブロックされていた(たとえばワーカースレッド上のブロッキングなコードによって)ために逃したグリッド点は、まとめて実行されずにスキップされ、`run` にも数えられません。
+- `fired_at` には起床の遅れが含まれるので、連続する二つの `fired_at` の間隔が `d` よりわずかに **短く** なることがあります。これは [レプリカ間のフェンス](#once-per-interval-across-replicas) で問題になります。
+
 ### エラーと panic [#errors-and-panics]
 
-`Err` を返した実行は、[`tracing`](https://docs.rs/tracing) で error レベルとしてログに出力されます(`cron job failed` とエラーの `Display` 出力)。**panic** した実行も捕捉され、同様にログに出力されます(`cron job panicked` と panic メッセージ)。どちらの場合もジョブのスケジュールは保たれ、次の実行はいつもどおり次のグリッド点で行われます。
+`Err` を返した実行は、[`tracing`](https://docs.rs/tracing) で error レベルとしてログに出力されます(`cron job failed` とエラーの `Display` 出力)。**panic** した実行も捕捉され、同様にログに出力されます(`cron job panicked` と panic メッセージ)。どちらの場合もジョブのスケジュールは保たれ、次の実行は、実行が成功した場合と同じく間隔の定めるとおりに始まります。
 
 各実行は `job`(ジョブの型名)と `run` のフィールドを持つ `cron_job` という tracing スパンの中で動くので、ジョブが出力したログはどの実行のものか追跡できます。これらのログを見るには、`main` で `tracing` のサブスクライバーを設定してください。
 
@@ -163,11 +185,11 @@ panic の捕捉はアンワインドに依存しています。リリースプ�
 
 ## 間隔 0 はビルドできない [#a-zero-interval-does-not-build]
 
-`INTERVAL` が 0 ではスケジュールが成り立たないため、そのようなジョブの登録はコンパイル時に拒否されます。ここで `Busy` は通常どおり `ServiceCreation` と `Processor<CronTick>` を実装しています。
+長さ 0 の間隔は、三つのどのバリアントでもスケジュールが成り立たないため、そのようなジョブの登録はコンパイル時に拒否されます。ここで `Busy` は通常どおり `ServiceCreation` と `Processor<CronTick>` を実装しています。
 
 ```rust
 impl CronJob for Busy {
-    const INTERVAL: Duration = Duration::ZERO; // no schedule
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::ZERO); // no schedule
 }
 
 #[tokio::main]
@@ -183,9 +205,9 @@ async fn main() {
 
 ```text
 error[E0080]: evaluation panicked: CronJob::INTERVAL must not be zero
-   --> wakuwaku/src/services/cron_job.rs:250:17
+   --> wakuwaku/src/services/cron_job.rs:300:17
     |
-250 |         const { assert_interval::<Job>() };
+300 |         const { assert_interval::<Job>() };
     |                 ^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `wakuwaku::services::cron_job::CronRegisterCenter::<Busy>::new::{constant#0}` failed inside this call
 ...
 note: the above error was encountered while instantiating `fn CronRegisterCenter::<Busy>::new`
@@ -199,7 +221,7 @@ note: the above error was encountered while instantiating `fn CronRegisterCenter
 
 ## 複数のレプリカで動かす [#running-on-several-replicas]
 
-ジョブは **ローカルで** 動きます。ジョブを起動したプロセスはすべてそれを実行します。サービスのレプリカが三つあれば各実行は三回行われ、各レプリカのグリッドはそのレプリカが起動した時点から始まるため、三つの実行の時刻も揃いません。
+ジョブは **ローカルで** 動きます。ジョブを起動したプロセスはすべてそれを実行します。サービスのレプリカが三つあれば各実行は三回行われ、各レプリカのスケジュールはそのレプリカが起動した時点から始まるため、三つの実行の時刻も揃いません。
 
 ジョブはこれを前提に設計します。おすすめ順に挙げます。
 
@@ -217,7 +239,7 @@ use wakuwaku::deps::redis::RedisError;
 use wakuwaku::entity::redis::RedisSource;
 use wakuwaku::entity::redis::collection::lock::Lock;
 use wakuwaku::entity::{Db, ReadWrite};
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 /// ジョブ名ごとに一つのロック。リースは一回の実行より長くする。
 const CRON_LOCKS: Lock<str> = Lock::new("cron", Duration::from_secs(5 * 60));
@@ -252,22 +274,40 @@ impl Processor<CronTick> for SendDailyDigest {
 }
 
 impl CronJob for SendDailyDigest {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60 * 60));
 }
 ```
 
 取得は決して待ちません。`try_lock` はロックが空いていれば `Some(token)` を、そうでなければ `None` を出力します。保持者がクラッシュしたときにロックを解放するのはリース(ロックの TTL)なので、リースより長くかかる可能性のある処理では `token.extend()` を呼ぶ必要があります。
 
 <Callout type="warn" title="ロックが防ぐのは重複実行ではなく同時実行">
-実行の最後にロックを解放する方式で保証されるのは、二つのレプリカがジョブを **同時に** 実行しないことだけです。レプリカ同士のグリッドはずれているので、数秒後に別のレプリカが空いたロックを取り、同じ間隔のうちにもう一度実行するかもしれません。全レプリカを通じて一間隔に一回程度に抑えたいなら、ロックを解放せず、リースを `INTERVAL` より少し短く設定して自然に切れるのを待ちます。こうするとロック自体が「最近だれかが実行した」という記録になります。その場合、処理はリースより十分短い時間で終わる必要があります。
+実行の最後にロックを解放する方式で保証されるのは、二つのレプリカがジョブを **同時に** 実行しないことだけです。レプリカ同士のスケジュールはずれているので、数秒後に別のレプリカが空いたロックを取り、同じ間隔のうちにもう一度実行するかもしれません。
 </Callout>
 
-## 複数の依存が必要なジョブ [#jobs-that-need-several-dependencies]
+### レプリカ全体で一間隔に一回 [#once-per-interval-across-replicas]
 
-gRPC サーバーと同じく、`cron_job` で組み立てるジョブが受け取れる登録値は **一つ** です。必要なものをまとめた構造体を登録して `Dep` にするか、ジョブを手作業で組み立てます。後者の場合はチェーンを `into_parts` で締めます。サービスビルダーと、まだ起動していない [`CronRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRegisterCenter.html) が返るので、ジョブを `push` してから `start` します。
+全レプリカを通じて各回を `d` ごとに一回程度に抑えたいなら、実行が共有ストレージでその回を **確保** するようにし、`fired_at` によるフェンスをかけます。実行が先へ進めるのは、自分の `fired_at` をアトミックに記録でき、かつ前回記録された値が少なくとも `d` 前である場合だけです。ジョブごとに一行を持つ SQL なら次のようになります。
+
+```sql
+-- $1 = ジョブ名、$2 = ティックの fired_at
+-- この UPDATE が行を変更した場合だけ実行を進める
+-- (各ジョブの行は古い last_fired_at で用意しておく)
+UPDATE cron_claims
+SET    last_fired_at = $2
+WHERE  job = $1
+  AND  last_fired_at <= $2 - INTERVAL '1 hour';
+```
+
+Redis のロックも同じ役割を果たせます。ロックを解放せず、リースを `d` より少し短く設定して自然に切れるのを待ちます。こうするとロック自体が「最近だれかが実行した」という記録になります。その場合、処理はリースより十分短い時間で終わる必要があります。
+
+フェンスをかけるジョブには `AfterFinish` か `AtLeast` を使います。これらでは一つのレプリカ上の連続する `fired_at` が少なくとも `d` 離れるので、レプリカが自分の次の実行をフェンスで締め出すことはありません。`AfterStart` の実行は `d` よりわずかに短い間隔で始まることがあり、その場合フェンスは進めるべき実行を拒否して、一回分をまるごと飛ばしてしまいます。
+
+## 複数のサービスから組み立てるジョブ [#jobs-built-from-several-services]
+
+`cron_job` がジョブの組み立てに使う登録値は **一つ**、その `Dep` だけです。複数の登録値が必要なジョブや、手作業で組み立てるジョブは `compose_cron_job` で登録します。クロージャはサービスビルダーを借用し、必要なものを `provide` して、ジョブを返します([クロージャでコンポーネントを組み立てる](/ja/docs/core/service-builder#composing-components-with-a-closure) を参照)。このジョブには `ServiceCreation` の実装は不要で、サービスとしても登録されません。`cron_job` と `compose_cron_job` は自由に組み合わせてチェーンできます。
 
 ```rust
-/// 二つの登録値が必要なので、手作業で組み立てる。
+/// 二つの登録値が必要なので、compose で組み立てる。
 pub struct ReconcileIndex {
     store: SessionStore,
     index: SearchIndex,
@@ -275,19 +315,17 @@ pub struct ReconcileIndex {
 ```
 
 ```rust title="src/main.rs"
-let (services, jobs) = ServiceBuilder::new(SessionStore::default())
+let (services, cron) = ServiceBuilder::new(SessionStore::default())
     .push(SearchIndex::default())
     .cron_job::<ExpireSessions, _>()
-    .into_parts();
-
-let reconcile = ReconcileIndex {
-    store: services.provide::<SessionStore, _>().clone(),
-    index: services.provide::<SearchIndex, _>().clone(),
-};
-let cron = jobs.push(reconcile).start();
+    .compose_cron_job(|s| ReconcileIndex {
+        store: s.provide::<SessionStore, _>().clone(),
+        index: s.provide::<SearchIndex, _>().clone(),
+    })
+    .start();
 ```
 
-手作業で組み立てるジョブも `Processor<CronTick>` と `CronJob` は実装します。省けるのは `ServiceCreation` だけです。`CronRegisterCenter` はサービスビルダーなしでも使えます。
+compose で組み立てたジョブも `Processor<CronTick>` と `CronJob` は実装します。省けるのは `ServiceCreation` だけです。ジョブを後で起動したいときは、チェーンを `start` の代わりに `into_parts` で締めます。サービスビルダーと、まだ起動していない [`CronRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRegisterCenter.html) が返ります。`CronRegisterCenter` はサービスビルダーなしでも使えます。
 
 ```rust
 use wakuwaku::services::cron_job::CronRegisterCenter;
@@ -303,14 +341,15 @@ cron.shutdown().await;
 
 ## 停止する [#shutting-down]
 
-`CronRuntime` にはジョブを止める方法が二つあります。
+`CronRuntime` にはジョブを止める方法が三つあります。
 
 | | 何が起きるか |
 | --- | --- |
-| `cron.shutdown().await` | 新しい実行はスケジュールされなくなります。次のグリッド点を待っているジョブはすぐに止まり、実行中の処理は **最後まで終わります**。すべてのジョブが止まると戻ります。 |
-| `cron` を drop する | 実行中の処理も含め、すべてのジョブが次の `.await` で **中断** されます。 |
+| `cron.shutdown().await` | **グレースフル。** 新しい実行は始まらず、次の実行を待っているジョブはすぐに止まります。実行中の処理は、重なって動いている `AfterStart` の実行も含めてすべて **最後まで終わります**。すべてのジョブが止まると戻ります。 |
+| `cron.abort().await` | 実行中の処理は次の `.await` で **キャンセル** されます。副作用の途中で止まることもあります。すべてのジョブが止まると戻ります。 |
+| `cron` を drop する | `abort` と同じですが、待ちません。 |
 
-バッチ処理の途中で打ち切られないよう、`shutdown` を使いましょう。`shutdown` は実行中の処理を待つので、処理がハングすると永遠に戻りません。問題になる場合はタイムアウトで上限を設けます。
+バッチ処理の途中で打ち切られないよう、`shutdown` を使いましょう。`shutdown` は実行にかかるだけ待つので、処理がハングすると永遠に戻りません。問題になる場合はタイムアウトで上限を設けます。
 
 ```rust
 if tokio::time::timeout(Duration::from_secs(30), cron.shutdown()).await.is_err() {
@@ -378,7 +417,8 @@ async fn the_first_run_happens_at_start() {
         .cron_job::<ExpireSessions, _>()
         .start();
 
-    tokio::time::sleep(ExpireSessions::INTERVAL / 2).await;
+    // 60 秒の間隔の半分: 最初の実行だけが済んでいる
+    tokio::time::sleep(Duration::from_secs(30)).await;
     cron.shutdown().await;
 
     assert_eq!(store.expired.load(Ordering::Relaxed), 1);

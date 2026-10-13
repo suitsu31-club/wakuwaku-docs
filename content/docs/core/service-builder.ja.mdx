@@ -6,7 +6,7 @@ icon: Boxes
 
 wakuwaku のサービスは、すべて [`ServiceBuilder`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html) から始まります。データベースハンドル、クライアント、設定など、コンポーネント間で共有する依存を登録しておくレジストリです。cron ジョブ、イベントハンドラ、gRPC サービスはここから組み立てられます。
 
-Spring でいえばアプリケーションコンテキストにあたりますが、違いが二つあります。依存はアプリケーションの起動時ではなく **コンパイル時** に型で解決されます。また、コンポーネントスキャンもアノテーションもプロキシもありません。値は明示的に登録し、各コンポーネントは自分がどの値から作られるかを宣言します。
+Spring でいえばアプリケーションコンテキストにあたりますが、違いが二つあります。依存はアプリケーションの起動時ではなく **コンパイル時** に型で解決されます。また、コンポーネントスキャンもアノテーションもプロキシもありません。値は明示的に登録し、各コンポーネントは自分がどの値から作られるかを明示します。
 
 <ServiceBuilderDiagram lang="ja" />
 
@@ -47,9 +47,22 @@ ServiceBuilder<Mailer, ServiceBuilder<AccountStore, ServiceBuilder<AppConfig>>>
 
 重要なのはその帰結です。登録されていない型を要求すると **コンパイルが通りません** ([後述](#reading-the-compile-errors))。
 
+## コンポーネントを作る二つの方法 [#two-ways-to-build-a-component]
+
+どの種類のコンポーネントも、ビルダーから二通りの方法で作れます。コンポーネントが実装するトレイトを通して **登録済みの依存一つ** から作る方法と、**ビルダーを借用するクロージャ** が完成したコンポーネントを返す方法です。
+
+| コンポーネント | 登録済みの依存一つから | クロージャで |
+|---|---|---|
+| cron ジョブ | `.cron_job::<Job, _>()` | `.compose_cron_job(\|s\| job)` |
+| イベントハンドラ | `.iggy_consumer::<Handler, _, _>()` | `.compose_iggy_consumer(\|s\| Arc::new(handler))` |
+| gRPC サーバー | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)` | `.compose_grpc_service(\|s\| XxxServer::new(implementation))` |
+| 登録するサービス | `.construct_subservice::<Service, _>()` | `.compose_subservice(\|s\| service)` |
+
+左の列ではコンポーネントが `ServiceCreation` を実装している必要があります。右の列では値そのもの以外に何も要りません。最後の行は、結果をコンポーネントではなく新しいサービスとして登録します。[ほかのサービスから作るサービス](#services-built-from-other-services) を参照してください。
+
 ## コンポーネントの組み立て: `ServiceCreation` [#building-components-servicecreation]
 
-コンポーネントは自分で依存を探しに行きません。[`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装して、自分が作られる元になる登録済みの型を一つ宣言します。
+一つ目の方法で作るコンポーネントは、自分で依存を探しに行きません。[`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装して、自分が作られる元になる登録済みの型を一つ宣言します。
 
 ```rust
 pub trait ServiceCreation {
@@ -90,59 +103,136 @@ pub struct SessionStore {
 同じ `Dep` から作られるコンポーネントは、それぞれ登録時に一度だけ取られた別々の clone を受け取ります。共有したい状態は、すべての clone から見えるようにハンドル (`Arc` やプール) の裏に置いてください。
 </Callout>
 
-### 複数の依存を一つの構造体にまとめる [#several-dependencies-in-one-struct]
+## クロージャでコンポーネントを組み立てる [#composing-components-with-a-closure]
 
-`Dep` は一つの型です。複数の依存が必要なコンポーネントには、それらをまとめた構造体 (またはタプル) を登録し、それを `Dep` にします。
+`compose_*` メソッドは型パラメータの代わりにクロージャを受け取ります。クロージャはビルダーを参照で受け取り、必要なものを `provide` で取り出して、完成したコンポーネントを返します。`SendInvoices` はアカウントとメーラーの両方を必要とします。
 
 ```rust title="src/billing.rs"
-/// Everything the billing components need, registered as one value.
-#[derive(Clone)]
-pub struct BillingDeps {
+use std::time::Duration;
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::{CronJob, CronJobInterval, CronTick};
+
+/// Built from two registered values, so it implements no `ServiceCreation`.
+pub struct SendInvoices {
     pub accounts: AccountStore,
     pub mailer: Mailer,
 }
 
-pub struct SendInvoices {
-    deps: BillingDeps,
+impl Processor<CronTick> for SendInvoices {
+    type Output = ();
+    type Error = MailError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), MailError> {
+        for account in self.accounts.with_open_invoices() {
+            self.mailer.send_invoice(&account).await?;
+        }
+        Ok(())
+    }
 }
 
-impl ServiceCreation for SendInvoices {
-    type Dep = BillingDeps;
-    fn create_service(deps: BillingDeps) -> Self {
-        Self { deps }
-    }
+impl CronJob for SendInvoices {
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(60 * 60));
 }
 ```
 
 ```rust title="src/main.rs"
-let accounts = AccountStore::default();
-let mailer = Mailer::default();
-
-let (_services, cron) = ServiceBuilder::new(accounts.clone())
-    .push(mailer.clone())
-    .push(BillingDeps { accounts, mailer })
-    .cron_job::<SendInvoices, _>()
+let (_services, cron) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .push(Mailer::default())
+    .cron_job::<ExpireSessions, _>()
+    .compose_cron_job(|s| SendInvoices {
+        accounts: s.provide::<AccountStore, _>().clone(),
+        mailer: s.provide::<Mailer, _>().clone(),
+    })
     .start();
 ```
 
-ここでは部品も個別に登録しているので、`AccountStore` だけ、あるいは `Mailer` だけから作られるコンポーネントも組み立てられます。部品はハンドルなので、`BillingDeps` はそれらと状態を共有します。
+`ServiceCreation` と比べて変わる点です。
+
+- **実装すべきトレイトはありません。** クロージャがコンストラクタです。登録済みの値をいくつでも取れ、途中で追加の処理もでき、引数を無視して、登録していないものから事前に作った値を move することもできます (`.compose_cron_job(|_| job)` のように)。
+- **取得は引き続きコンパイラが検査します。** クロージャ内の `provide` はそれぞれ普通の `ProvideAt` 境界なので、登録されていない型を要求するとコンパイルが通りません。
+- **自動では何も clone されません。** `provide` は参照を貸すだけで、保持するハンドルはクロージャが clone します。返したコンポーネントはそのままレジスタセンターに move され、その後 clone されることはありません。
+- **コンポーネントはサービスとしては登録されません。** 入るのはレジスタセンターだけなので、`provide` では見つからず、ほかのコンポーネントの元にもなりません。値をコンポーネント間で共有したいときは、代わりに [`compose_subservice`](#services-built-from-other-services) で登録してください。
+- **クロージャはすぐに実行されます。** `create_service` と同じく、登録メソッドを呼んだ時点です。
+
+上の `cron_job` と `compose_cron_job` のように、二つの形は同じレジスタセンター上で順序を問わず自由につなげられます。
+
+### どちらを使うか [#which-one-to-use]
+
+コンポーネントが一つのハンドルから自然に作れるなら `ServiceCreation` を選んでください。依存が型の隣に記録され、登録は型パラメータ一つで済み、どのサービスでもどのテストでも `create_service` で同じように作れます。
+
+コンポーネントが複数の登録値を必要とするとき、登録していない値 (`main` で読んだ設定や事前に作ったクライアント) を必要とするとき、途中で追加の処理が要るとき (メッセージサイズの上限を設定した gRPC サーバーなど) は `compose_*` メソッドを使います。配線は `main` の登録呼び出しの場所に、ほかの配線と並んで書かれます。
+
+コンポーネントを `ServiceCreation` に合わせるためだけに、ほかの登録値を束ねた構造体を登録するのはやめましょう。コンポーネントをクロージャで組み立ててください。構造体をビルダーに登録すべきなのは、それ自体が複数のコンポーネントで共有する振る舞いを持つサービスであるときです。それが次の節です。
+
+## ほかのサービスから作るサービス [#services-built-from-other-services]
+
+`construct_subservice` と `compose_subservice` は同じ二通りの方法で値を作り、それをビルダーに **push** します。結果は普通の登録済みサービスです。`Here` の位置にあり、`provide` で取得でき、後から登録するすべてのコンポーネントの `Dep` にできます。
+
+```rust title="src/billing.rs"
+/// Account queries on top of the store.
+#[derive(Clone)]
+pub struct AccountRepo {
+    store: AccountStore,
+}
+
+impl ServiceCreation for AccountRepo {
+    type Dep = AccountStore;
+    fn create_service(store: AccountStore) -> Self {
+        Self { store }
+    }
+}
+
+/// Billing logic shared by several components. Cheap to clone: it holds handles.
+#[derive(Clone)]
+pub struct Billing {
+    accounts: AccountRepo,
+    mailer: Mailer,
+}
+```
+
+```rust title="src/main.rs"
+let services = ServiceBuilder::new(AccountStore::default())
+    .push(Mailer::default())
+    // From one registered dependency, through `ServiceCreation`.
+    .construct_subservice::<AccountRepo, _>()
+    // From several, through a closure.
+    .compose_subservice(|s| Billing {
+        accounts: s.provide::<AccountRepo, _>().clone(),
+        mailer: s.provide::<Mailer, _>().clone(),
+    });
+
+// Both jobs implement `ServiceCreation` with `type Dep = Billing`.
+let (_services, cron) = services
+    .cron_job::<CloseBillingPeriod, _>()
+    .cron_job::<RemindOverdue, _>()
+    .start();
+```
+
+補足です。
+
+- これらは `ServiceBuilder` 自身のメソッドで、`push` と同じくノードを一つ追加します。サービスはレジスタセンターに入る前か、終了メソッドが返したビルダーの上で登録してください。
+- 登録したサービスは、ほかの `Dep` と同じく、そこから作るコンポーネントごとに clone されます。リソースそのものではなくハンドル (`Arc`、プール、クライアント) を持たせてください。
+- `compose_*` との違いは結果の行き先だけです。`compose_subservice` はビルダーに登録し、`compose_cron_job` などはレジスタセンターに入れます。
 
 ## レジスタセンターはビルダーを受け取り、返す [#register-centers-take-the-builder-and-give-it-back]
 
-コンポーネントの種類ごとに *レジスタセンター* があります。ビルダーから埋めていく、コンポーネントの型レベルのリストです。`ServiceBuilder` のメソッドで開始し、登録をつなげ、ビルダーを返すメソッドで終了します。
+コンポーネントの種類ごとに *レジスタセンター* があります。ビルダーから埋めていく、コンポーネントの型レベルのリストです。最初の登録で `ServiceBuilder` から入り、以降の登録はどちらの形でもそこにつながり、終了メソッドがビルダーを返します。
 
-| コンポーネント | 開始 | 追加 | 終了 | 戻り値 |
-|---|---|---|---|---|
-| cron ジョブ | `.cron_job::<Job, _>()` | `.cron_job::<Job, _>()` | `.start()` | `(ServiceBuilder, CronRuntime)` |
-| イベントハンドラ | `.iggy_consumer::<Handler, _, _>()` | `.iggy_consumer::<Handler, _, _>()` | `.start(client, config).await?` | `(ServiceBuilder, ConsumerRuntime)` |
-| gRPC サービス | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)` | 同左 | `.into_router_fn()` | `(ServiceBuilder, impl FnOnce(Router<L>) -> Router<L>)` |
-| いずれも | | | `.into_parts()` | `(ServiceBuilder, 未起動のレジスタセンター)` |
+| コンポーネント | 登録 | 終了 | 戻り値 |
+|---|---|---|---|
+| cron ジョブ | `.cron_job::<Job, _>()`、`.compose_cron_job(\|s\| …)` | `.start()` | `(ServiceBuilder, CronRuntime)` |
+| イベントハンドラ | `.iggy_consumer::<Handler, _, _>()`、`.compose_iggy_consumer(\|s\| …)` | `.start(client, config).await?` | `(ServiceBuilder, ConsumerRuntime)` |
+| gRPC サービス | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)`、`.compose_grpc_service(\|s\| …)` | `.into_router_fn()` | `(ServiceBuilder, impl FnOnce(Router<L>) -> Router<L>)` |
+| いずれも | | `.into_parts()` | `(ServiceBuilder, 未起動のレジスタセンター)` |
 
 登録メソッドはどれもビルダーを **値で** 受け取り、返すレジスタセンタービルダーの中 (公開フィールド `builder`) に保持します。そのため、次の登録でも依存を探せます。終了メソッドがビルダーを返すので、それを次の種類のコンポーネントに渡していきます。
 
 ```rust title="src/main.rs"
 let services = ServiceBuilder::new(AccountStore::default())
     .push(SessionStore::default())
+    .push(AuditLog::default())
     .push(Mailer::default());
 
 let (services, consumers) = services
@@ -152,14 +242,20 @@ let (services, consumers) = services
 
 let (services, add_grpc) = services
     .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .compose_grpc_service(|s| {
+        AdminServer::new(AdminService {
+            store: s.provide::<AccountStore, _>().clone(),
+            audit: s.provide::<AuditLog, _>().clone(),
+        })
+    })
     .into_router_fn();
 
 let (_services, cron) = services.cron_job::<ExpireSessions, _>().start();
 ```
 
-コンポーネントは登録メソッドを呼んだ時点で **即座に** 作られます。`Dep` が clone され、`create_service` が実行されるのはこのときです。各ステップを実行すべき順序や停止の方法を含めた完全なプログラムは [ライフサイクル](/ja/docs/core/lifecycle) にあります。各レジスタセンターの詳細は [cron ジョブ](/ja/docs/services/cron-jobs)、[gRPC](/ja/docs/services/grpc)、[イベントの消費](/ja/docs/events/consuming) を参照してください。
+コンポーネントは登録メソッドを呼んだ時点で **即座に** 作られます。`Dep` が clone されて `create_service` が実行される、あるいはクロージャが実行されるのはこのときです。各ステップを実行すべき順序や停止の方法を含めた完全なプログラムは [ライフサイクル](/ja/docs/core/lifecycle) にあります。各レジスタセンターの詳細は [cron ジョブ](/ja/docs/services/cron-jobs)、[gRPC](/ja/docs/services/grpc)、[イベントの消費](/ja/docs/events/consuming) を参照してください。
 
-`into_parts` は逃げ道です。ビルダーとレジスタセンターを別々に返すので、手で組み立てたコンポーネントを起動前にリストへ `push` できます。
+`into_parts` はビルダーと未起動のレジスタセンターを別々に返します。リストを後で起動するコードや、チェーンの外で `push` して伸ばすコードのためのものです。手で組み立てたコンポーネントに `into_parts` は要りません。対応する `compose_*` メソッドで登録してください。
 
 ## 同じ型の重複 [#duplicate-types]
 

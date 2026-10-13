@@ -4,7 +4,7 @@ description: Generate tonic servers from a .proto file, build their implementati
 icon: Network
 ---
 
-wakuwaku does not replace [tonic](https://docs.rs/tonic/0.14/tonic/). Your `.proto` files are compiled by tonic's code generator, your service implements the generated trait, and tonic's `Server` serves it. What wakuwaku adds is the wiring in between: each service implementation is **built from a dependency registered in the [`ServiceBuilder`](/en/docs/core/service-builder)**, wrapped into its generated server, and collected into one type-level list that adds every server to the router in a single call.
+wakuwaku does not replace [tonic](https://docs.rs/tonic/0.14/tonic/). Your `.proto` files are compiled by tonic's code generator, your service implements the generated trait, and tonic's `Server` serves it. What wakuwaku adds is the wiring in between: each service implementation is **built from dependencies registered in the [`ServiceBuilder`](/en/docs/core/service-builder)**, wrapped into its generated server, and collected into one type-level list that adds every server to the router in a single call.
 
 If you come from Spring, this is the job of `@GrpcService` beans in a gRPC starter, with two differences: nothing is discovered by scanning (every server is registered explicitly, in code), and a server whose dependency was never registered does not compile.
 
@@ -17,6 +17,8 @@ The flow in the diagram, step by step:
 3. The constructor you pass (usually `XxxServer::new`) wraps it into the generated server.
 4. The server is pushed onto a `GrpcServiceRegisterCenter`, a type-level list. No boxing, no dynamic dispatch.
 5. `into_router_fn` turns the list into an `impl FnOnce(Router<L>) -> Router<L>` that adds every server to a tonic router, in registration order.
+
+For a service built from several dependencies, `compose_grpc_service` replaces steps 1 to 3 with a closure that returns the finished server; see [Servers built from several dependencies](#servers-built-from-several-dependencies).
 
 ## Generating code from a .proto file
 
@@ -45,7 +47,7 @@ Everything else in wakuwaku is imported through `wakuwaku` alone, but generated 
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = "1.0.0-rc1"  # the default features include `grpc`
+wakuwaku = "1.0.0-rc2"  # the default features include `grpc`
 # Named directly by the generated code.
 tonic = "0.14"
 tonic-prost = "0.14"
@@ -56,7 +58,7 @@ tokio = { version = "1", features = ["full"] }
 tonic-prost-build = "0.14"
 ```
 
-Keep `tonic` on the same minor version as wakuwaku (0.14 for wakuwaku 1.0.0-rc1). Cargo then resolves both to one crate, so `tonic` and `wakuwaku::deps::tonic` are the same types. With a different version, the generated servers would implement the traits of another `tonic` and would not be accepted by wakuwaku.
+Keep `tonic` on the same minor version as wakuwaku (0.14 for wakuwaku 1.0.0-rc2). Cargo then resolves both to one crate, so `tonic` and `wakuwaku::deps::tonic` are the same types. With a different version, the generated servers would implement the traits of another `tonic` and would not be accepted by wakuwaku.
 
 The code generator calls `protoc`, the Protocol Buffers compiler. Install it from your package manager (or point the `PROTOC` environment variable at it) before the first build.
 
@@ -140,7 +142,7 @@ For each `service Xxx` you now have, in `proto::xxx_server`, a trait `Xxx` to im
 
 ## Implementing a service
 
-A service implementation is a plain struct. It implements the generated trait, and [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) to say which registered value it is built from.
+A service implementation is a plain struct that implements the generated trait. When it is built from one registered value, it also implements [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) to say which.
 
 The examples use these shared dependencies. They are stand-ins for a connection pool, a Redis handle and so on: what matters is that they are **cheap to clone** and every clone shares the same state, because `grpc_service` clones the dependency out of the service builder for each server it builds.
 
@@ -319,7 +321,7 @@ register(router).serve("[::1]:50051".parse()?).await?;
 
 Some details worth knowing:
 
-- **Servers are built immediately**, when `grpc_service` is called, not when the first request arrives. There is no lazy initialization to surprise you.
+- **Servers are built immediately**, when they are registered, not when the first request arrives. There is no lazy initialization to surprise you.
 - **The service builder comes back.** `into_router_fn` returns it next to the register function, so the same dependencies can be used for [cron jobs](/en/docs/services/cron-jobs) and [event consumers](/en/docs/events/consuming).
 - **`register` is called once**, with a router. It adds the servers in the order they were registered and leaves the router's middleware alone (see [Middleware](#middleware-layers-and-interceptors)).
 - When the same `Dep` type is registered more than once, `_` cannot be inferred: name the position with `Here` / `There<Here>` as described in [The service builder](/en/docs/core/service-builder).
@@ -334,50 +336,9 @@ let (_services, register) = ServiceBuilder::new(AccountStore::default())
     .into_router_fn();
 ```
 
-## Services that need several dependencies
+## Servers built from several dependencies
 
-`ServiceCreation` builds a service from **one** registered value. The `Admin` service needs both the `AccountStore` and the `AuditLog`. There are two ways to give it both.
-
-### Register a group
-
-The preferred way: register one value that bundles what the service needs, and use it as `Dep`. The service stays buildable by `grpc_service`, and the group documents the service's dependencies in one place. (Its `Admin` implementation is the one shown [below](#build-it-by-hand-with-into_parts), reading `self.deps.store` and `self.deps.audit`.)
-
-```rust
-/// One registered value that bundles what `AdminService` needs.
-#[derive(Clone)]
-pub struct AdminDeps {
-    pub store: AccountStore,
-    pub audit: AuditLog,
-}
-
-pub struct GroupedAdminService {
-    deps: AdminDeps,
-}
-
-impl ServiceCreation for GroupedAdminService {
-    type Dep = AdminDeps;
-
-    fn create_service(deps: AdminDeps) -> Self {
-        Self { deps }
-    }
-}
-```
-
-```rust
-let store = AccountStore::default();
-let audit = AuditLog::default();
-
-let (_services, register) = ServiceBuilder::new(store.clone())
-    .push(audit.clone())
-    .push(AdminDeps { store, audit })
-    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
-    .grpc_service::<AdminServer<_>, GroupedAdminService, _>(AdminServer::new)
-    .into_router_fn();
-```
-
-### Build it by hand with `into_parts`
-
-When a service does not fit `ServiceCreation` at all, end the chain with `into_parts` instead of `into_router_fn`. It returns the service builder and the [`GrpcServiceRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/struct.GrpcServiceRegisterCenter.html) itself; build the service from whatever `provide` gives you and `push` its server:
+`ServiceCreation` builds a service from **one** registered value, but the `Admin` service needs both the `AccountStore` and the `AuditLog`. Register it with [`compose_grpc_service`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html#method.compose_grpc_service) instead. Its closure borrows the service builder, takes what it needs with `provide`, and returns the finished server. The implementation is a plain struct with no `ServiceCreation` impl:
 
 ```rust title="src/admin.rs"
 use tonic::{Request, Response, Status};
@@ -386,7 +347,7 @@ use crate::deps::{AccountStore, AuditLog};
 use crate::proto::admin_server::Admin;
 use crate::proto::{DeleteAccountRequest, DeleteAccountResponse};
 
-/// Needs two registered values, so it is built by hand.
+/// Needs two registered values, so it is composed in `main`.
 pub struct AdminService {
     pub store: AccountStore,
     pub audit: AuditLog,
@@ -407,19 +368,39 @@ impl Admin for AdminService {
 ```
 
 ```rust title="src/main.rs"
-let (services, register) = services
+let (services, register) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .push(AuditLog::default())
     .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .compose_grpc_service(|s| {
+        AdminServer::new(AdminService {
+            store: s.provide::<AccountStore, _>().clone(),
+            audit: s.provide::<AuditLog, _>().clone(),
+        })
+    })
     .grpc_service::<SessionsServer<_>, SessionsService, _>(SessionsServer::new)
-    .into_parts();
-
-let admin = AdminService {
-    store: services.provide::<AccountStore, _>().clone(),
-    audit: services.provide::<AuditLog, _>().clone(),
-};
-let register = register.push(AdminServer::new(admin)).into_router_fn();
+    .into_router_fn();
 ```
 
-`push` accepts any server, built however you like; `provide` is still checked at compile time, so asking for an unregistered type fails to build here too.
+- **The server type is inferred** from what the closure returns. There are no type parameters to write.
+- **Each `provide` is checked at compile time**, so asking for a type that was never registered fails to build here too.
+- **The builder clones nothing.** The closure clones the handles it keeps, and the server it returns goes into the list as is. It is not registered in the service builder, so no other component can be built from it.
+- **Both forms chain in any order** on the same list, as above. The servers are added to the router in registration order either way.
+
+The closure may also ignore the service builder and move in a server assembled beforehand, for example from values that are not registered:
+
+```rust
+let store = AccountStore::default();
+// Only the admin service writes to this log, so it is not registered.
+let admin = AdminService { store: store.clone(), audit: AuditLog::default() };
+
+let (_services, register) = ServiceBuilder::new(store)
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .compose_grpc_service(|_| AdminServer::new(admin))
+    .into_router_fn();
+```
+
+Which of the two forms fits which service is discussed in [The service builder](/en/docs/core/service-builder#which-one-to-use). In short: `grpc_service` when one registered handle is enough, `compose_grpc_service` for everything else. There is no need to register a struct that only bundles the dependencies.
 
 ## Middleware: layers and interceptors
 
@@ -465,15 +446,15 @@ let _router = register(router);
 
 ### An interceptor for one server only
 
-Generated servers have `XxxServer::with_interceptor`, but the server it returns (`InterceptedService`) responds with a different body type than `RoutableService` requires (see [below](#what-the-compiler-checks)), so `grpc_service` and `push` reject it. Add such a server to the router **after** the register function has run; the router returned by `register` is an ordinary tonic router:
+Generated servers have `XxxServer::with_interceptor`, but the server it returns (`InterceptedService`) responds with a different body type than `RoutableService` requires (see [below](#what-the-compiler-checks)), so `grpc_service`, `compose_grpc_service` and `push` reject it. Add such a server to the router **after** the register function has run; the router returned by `register` is an ordinary tonic router:
 
 ```rust
-let (_services, register) = ServiceBuilder::new(AccountStore::default())
+let (services, register) = ServiceBuilder::new(AccountStore::default())
     .push(SessionStore::default())
     .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
     .into_router_fn();
 
-let sessions = SessionsService::create_service(SessionStore::default());
+let sessions = SessionsService::create_service(services.provide::<SessionStore, _>().clone());
 
 let router = Server::builder().add_routes(Routes::default());
 register(router)
@@ -485,7 +466,7 @@ register(router)
 
 ## Serving with graceful shutdown
 
-The complete `main.rs`: shared dependencies, servers built from them plus one built by hand, middleware, and a server that stops on Ctrl-C.
+The complete `main.rs`: shared dependencies, servers built from them, middleware, and a server that stops on Ctrl-C.
 
 ```rust title="src/main.rs"
 mod accounts;
@@ -528,17 +509,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .push(SessionStore::default())
         .push(AuditLog::default());
 
-    // 2. Servers built from them, plus one built by hand.
-    let (services, register) = services
+    // 2. Servers built from them.
+    let (_services, register) = services
         .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
         .grpc_service::<SessionsServer<_>, SessionsService, _>(SessionsServer::new)
-        .into_parts();
-
-    let admin = AdminService {
-        store: services.provide::<AccountStore, _>().clone(),
-        audit: services.provide::<AuditLog, _>().clone(),
-    };
-    let register = register.push(AdminServer::new(admin)).into_router_fn();
+        .compose_grpc_service(|s| {
+            AdminServer::new(AdminService {
+                store: s.provide::<AccountStore, _>().clone(),
+                audit: s.provide::<AuditLog, _>().clone(),
+            })
+        })
+        .into_router_fn();
 
     // 3. Middleware goes on the server before the router exists.
     let router = Server::builder()
@@ -561,7 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## What the compiler checks
 
-Both `grpc_service` and `push` require the server to implement [`RoutableService`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/trait.RoutableService.html). There is nothing to implement: it is a name for these bounds, and every type that meets them has it.
+`grpc_service`, `compose_grpc_service` and `push` all require the server to implement [`RoutableService`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/trait.RoutableService.html). There is nothing to implement: it is a name for these bounds, and every type that meets them has it.
 
 | Bound | Meaning |
 | --- | --- |
@@ -574,7 +555,7 @@ Every tonic-generated `XxxServer<T>` meets them as long as `T` is `Send + Sync +
 
 The other checks:
 
-- **A dependency that was never registered is a compile error.** If `AccountsService::Dep` is `AccountStore` and no `AccountStore` was pushed, `grpc_service::<AccountsServer<_>, AccountsService, _>` does not build.
+- **A dependency that was never registered is a compile error.** If `AccountsService::Dep` is `AccountStore` and no `AccountStore` was pushed, `grpc_service::<AccountsServer<_>, AccountsService, _>` does not build. The same holds for every `provide` in a `compose_grpc_service` closure.
 - **A missing trait method is a compile error**, as usual for tonic: the generated trait lists every `rpc` of the proto.
 
 <Callout type="error" title="Duplicate service names panic at startup">
@@ -599,7 +580,7 @@ let register = GrpcServiceRegisterCenter::new(AccountsServer::new(
 let _router = register(Server::builder().add_routes(Routes::default()));
 ```
 
-The same works after `into_parts`, which is how hand-built servers and servers built from the service builder end up in one list. Any server that meets the `RoutableService` bounds can be pushed this way; for one that does not, add it to the router after `register` has run.
+`into_parts` on a `ServiceBuilder` chain returns the same `GrpcServiceRegisterCenter`, for code that extends the list with `push` outside the chain. Any server that meets the `RoutableService` bounds can be pushed; for one that does not, add it to the router after `register` has run. Inside the chain, a server built by hand goes through `compose_grpc_service`.
 
 ## Testing a service
 

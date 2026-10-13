@@ -1,7 +1,7 @@
 const text = {
   en: {
     title:
-      "ServiceBuilder as a type-level linked list: provide::<B, _>() is resolved at compile time to position There<Here>, then the dependency is cloned to build a component",
+      "ServiceBuilder as a type-level linked list: provide::<B, _>() is resolved at compile time to position There<Here>; a component is built either by cloning one dependency (ServiceCreation) or by a compose_* closure that borrows the whole builder",
     exA: "e.g. DB pool",
     exB: "e.g. Redis",
     exC: "e.g. Iggy client",
@@ -14,15 +14,15 @@ const text = {
       "A type that was never registered has no ProvideAt impl: a compile error, not a panic.",
     step1: "resolved at compile time",
     step2: "cheap: Arc, pool, handle",
-    step3: "ServiceCreation",
+    step3: "ServiceCreation | compose_*",
     step4: "component",
     step4sub: "cron · gRPC · Iggy",
     caption:
-      "Each push wraps the builder in a new node; lookup is by type, with no Any, no downcast and no runtime map.",
+      "Each push wraps the builder in a new node; lookup is by type, with no Any, no downcast and no runtime map. A compose_* closure borrows the whole builder and can provide several services.",
   },
   ja: {
     title:
-      "型レベルの連結リストとしての ServiceBuilder: provide::<B, _>() はコンパイル時に位置 There<Here> へ解決され、依存を clone してコンポーネントを作る",
+      "型レベルの連結リストとしての ServiceBuilder: provide::<B, _>() はコンパイル時に位置 There<Here> へ解決される。コンポーネントは 1 つの依存を clone して作る (ServiceCreation) か、ビルダー全体を借用する compose_* クロージャで作る",
     exA: "例: DB プール",
     exB: "例: Redis",
     exC: "例: Iggy クライアント",
@@ -35,11 +35,11 @@ const text = {
       "登録されていない型には ProvideAt の実装がなく、パニックではなくコンパイルエラーになります。",
     step1: "コンパイル時に解決",
     step2: "Arc・プール・ハンドル",
-    step3: "ServiceCreation",
+    step3: "ServiceCreation | compose_*",
     step4: "コンポーネント",
     step4sub: "cron・gRPC・Iggy",
     caption:
-      "push のたびにビルダーが新しいノードで包まれます。型で検索し、Any もダウンキャストも実行時マップも使いません。",
+      "push のたびにビルダーが新しいノードで包まれます。型で検索し、Any もダウンキャストも実行時マップも使いません。compose_* クロージャはビルダー全体を借用し、複数のサービスを取り出せます。",
   },
 } as const;
 

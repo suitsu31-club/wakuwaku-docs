@@ -27,7 +27,7 @@ Enable the `redis` feature. Bodies stored in Redis are serialized with [kanau](h
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["redis"] }
 kanau = { version = "0.6", features = ["serde_json"] }  # JsonMessageSer / JsonMessageDe
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -111,6 +111,7 @@ impl Query for StoreSession {
 
 impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for StoreSession {
     type Output = ();
+    type Error = redis::RedisError;
 
     async fn execute(self, conn: &mut C) -> redis::RedisResult<()> {
         conn.set_ex(format!("session:{}", self.token), self.user, 3600).await
@@ -118,7 +119,55 @@ impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for StoreS
 }
 ```
 
-The error type of every Redis query is `RedisError`. The built-in structures also report a body that fails to (de)serialize, and a key whose contents don't match what the structure wrote (`"corrupted item"`), as a `RedisError`.
+Every query declares its error type. It must convert from `RedisError`, the error of `RedisSource`, so a failure to talk to Redis can always be reported. The built-in structures use `RedisError` itself, and also report a body that fails to (de)serialize, and a key whose contents don't match what the structure wrote (`"corrupted item"`), as a `RedisError`.
+
+### Queries that can refuse
+
+A query that can refuse on its own, because a seat is already taken or a business rule says no, declares its own error type instead. The refusal then reaches the caller as an `Err` next to the Redis failures, and a single `?` handles both:
+
+```rust title="src/seat.rs"
+use wakuwaku::deps::redis::aio::ConnectionLike;
+use wakuwaku::deps::redis::{self, AsyncCommands};
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Entity, Execute, Query, Write};
+
+pub struct Seat;
+impl Entity for Seat {}
+
+#[derive(Debug)]
+pub enum ClaimError {
+    /// Someone else holds the seat.
+    Taken,
+    Redis(redis::RedisError),
+}
+
+impl From<redis::RedisError> for ClaimError {
+    fn from(error: redis::RedisError) -> Self {
+        Self::Redis(error)
+    }
+}
+
+pub struct ClaimSeat {
+    pub seat: u32,
+    pub user: u64,
+}
+
+impl Query for ClaimSeat {
+    type Effect = Write<Seat>;
+}
+
+impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for ClaimSeat {
+    type Output = ();
+    type Error = ClaimError;
+
+    async fn execute(self, conn: &mut C) -> Result<(), ClaimError> {
+        let claimed: bool = conn.set_nx(format!("seat:{}", self.seat), self.user).await?;
+        if claimed { Ok(()) } else { Err(ClaimError::Taken) }
+    }
+}
+```
+
+`redis.process(ClaimSeat { seat, user }).await` then outputs `Result<(), ClaimError>`: no `Result` nested in the output, and no separate check after the query.
 
 ## Names and keys
 

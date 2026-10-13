@@ -4,7 +4,7 @@ description: Publisher で型付きイベントを Iggy に送り、書き込ま
 icon: Send
 ---
 
-発行に必要なのは 1 つの型と 1 つのメソッド、[`Publisher`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/publisher/struct.Publisher.html) と `publish` だけです。トピック、パーティション、ヘッダー、エンコードといったそれ以外のことは、[イベントの定義](/ja/docs/events/defining-events) で定義したイベント型から決まります。
+発行に必要なのは 1 つの型と 2 つのメソッドだけです。[`Publisher`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/publisher/struct.Publisher.html) の、1 つのイベントを送る `publish` と、1 つの型の多数のイベントを送る `publish_batch` です。トピック、パーティション、ヘッダー、エンコードといったそれ以外のことは、[イベントの定義](/ja/docs/events/defining-events) で定義したイベント型から決まります。
 
 ## パブリッシャーを作って発行する [#create-a-publisher-and-publish]
 
@@ -49,26 +49,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 3. ボディをペイロードとし、[wakuwaku のヘッダー](#headers-on-the-wire) を付けた Iggy メッセージを 1 つ組み立てます。
 4. そのメッセージを、ストリーム内の、キー型の `SUPER_PARTITION_NAME` という名前のトピックへ、キーハッシュを Iggy のメッセージキーとしてパーティショニングして送信します。
 
-したがって 1 つのキーのイベントはすべて同じパーティションに、発行した順で入ります。`publish` の 1 回の呼び出しで送るメッセージはちょうど 1 つで、クライアント側でのバッチ処理はありません。
+したがって 1 つのキーのイベントはすべて同じパーティションに、発行した順で入ります。`publish` の 1 回の呼び出しで送るメッセージはちょうど 1 つです。多数のイベントを少ないリクエストで送るには [`publish_batch`](#publishing-many-events-at-once) を使います。
+
+## 多数のイベントをまとめて発行する [#publishing-many-events-at-once]
+
+`publish_batch(events)` は、**1 つ**のイベント型のイベントを任意の数だけ、キーが許す限り少ないリクエストで発行します。
+
+```rust title="src/settlement.rs"
+use wakuwaku::iggy::Publisher;
+use wakuwaku::iggy::error::Error;
+
+/// 決済ファイルの支払いを記録する。
+pub async fn import_settlement(publisher: &Publisher) -> Result<(), Error> {
+    publisher
+        .publish_batch([
+            PaymentReceived { order_id: 42, amount_cents: 5_000 },
+            PaymentReceived { order_id: 43, amount_cents: 1_000 },
+            PaymentReceived { order_id: 42, amount_cents: 7_000 },
+        ])
+        .await
+}
+```
+
+イベントはキーハッシュでグループ化され、各グループが 1 つのリクエストで送られます。この例ではリクエストは 2 つです。まず注文 42 の 2 つの支払い（5 000、次に 7 000）、次に注文 43 の支払いです。規則は次のとおりです。
+
+- **キーごとの順序は保たれます。** グループの中ではイベントは `events` での順序を保つので、キーのイベントはその順でパーティションに入ります。グループは、そのキーが最初に現れた順に 1 つずつ送られます。異なるキーのイベント同士はもともと順序づけられないので、それ以上の約束はありません。
+- **シリアライズは全部か無かです。** 何かを送る前に、すべてのイベントをシリアライズしてメッセージに組み立てます。1 つでも失敗すれば呼び出しはそのエラーを返し、何も発行されません。
+- **送信エラーはバッチを途中で止めます。** 失敗したグループより前のグループは発行済みで、失敗したグループとそれ以降は発行されていません。エラーからはどこで止まったかはわかりません。
+- **何もリトライされません。** `publish` と同じです。
+
+1 つの操作が 1 つの型のイベントを多数生む場合に使ってください。インポート、バックフィル、多数のキーに触れるコマンドなどです。イベントごとの往復が省け、キーのイベントは順序どおりに届きます。送信エラーの後で呼び出し全体をリトライすると、前のグループがもう一度発行されます。ハンドラが冪等なら（`NoEventLose` ではもともと必要です。[配信モード](/ja/docs/events/consuming#delivery-modes) を参照）これは無害です。異なる型のイベントは型ごとに呼び出しを分け、1 つのキーの中での順序が重要なら、1 つずつ await してから次を呼んでください。
 
 ## パブリッシャーを共有する [#sharing-a-publisher]
 
-`Publisher` は `Send + Sync` ですが `Clone` ではありません。起動時に 1 回だけ作って `Arc` で包み、[`ServiceBuilder`](/ja/docs/core/service-builder) に登録すれば、各コンポーネントがそれを依存として受け取れます。
+`Publisher` は `Clone` で、クローンは安価です。クローン同士は同じ `IggyClient` を共有します。起動時に 1 回だけ作って [`ServiceBuilder`](/ja/docs/core/service-builder) に登録すれば、各コンポーネントがそれを依存として受け取れます。
 
 ```rust title="src/checkout.rs"
-use std::sync::Arc;
 use wakuwaku::ServiceCreation;
 use wakuwaku::iggy::Publisher;
 use wakuwaku::iggy::error::Error;
 
-/// イベントを発行するコンポーネント。依存は `Arc<Publisher>`。
+/// イベントを発行するコンポーネント。依存は `Publisher`。
 pub struct Checkout {
-    publisher: Arc<Publisher>,
+    publisher: Publisher,
 }
 
 impl ServiceCreation for Checkout {
-    type Dep = Arc<Publisher>;
-    fn create_service(publisher: Arc<Publisher>) -> Self {
+    type Dep = Publisher;
+    fn create_service(publisher: Publisher) -> Self {
         Self { publisher }
     }
 }
@@ -88,7 +116,7 @@ impl Checkout {
 ```
 
 ```rust title="src/main.rs"
-let publisher = Arc::new(Publisher::new(client.clone(), "shop")?);
+let publisher = Publisher::new(client.clone(), "shop")?;
 let services = ServiceBuilder::new(client).push(publisher);
 ```
 
@@ -164,14 +192,14 @@ pub async fn ensure_topology(client: &IggyClient) -> Result<(), IggyError> {
 
 ## エラー [#errors]
 
-`Publisher::new` と `publish` は [`wakuwaku::iggy::error::Error`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.Error.html) を返します。発行で起こりうるバリアントは次のとおりです。
+`Publisher::new`、`publish`、`publish_batch` は [`wakuwaku::iggy::error::Error`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.Error.html) を返します。発行で起こりうるバリアントは次のとおりです。
 
 | バリアント | 原因 |
 |---|---|
 | `Error::Iggy` | ストリーム名やトピック名が有効な識別子でない、メッセージを組み立てられない、または送信に失敗した（サーバーに到達できない、トピックがない、権限がない、など） |
 | `Error::Serialize` | ボディの `MessageSer::to_bytes` が失敗した |
 
-送信は**リトライされません**。`publish` がエラーを返した場合、wakuwaku が知る限りイベントは書き込まれていません。リトライするか、リクエストを失敗させるか、エラーを呼び出し元に返すかはアプリケーションが決めます。`publish` が行うのは Iggy へのメッセージ 1 件の書き込みだけです。データベースのトランザクションのコミットと同時にイベントを発行する必要がある場合、その調整はアプリケーションのコードの責任です。
+送信は**リトライされません**。`publish` がエラーを返した場合、wakuwaku が知る限りイベントは書き込まれていません。リトライするか、リクエストを失敗させるか、エラーを呼び出し元に返すかはアプリケーションが決めます（`publish_batch` については [送信エラーが何を残すか](#publishing-many-events-at-once) を参照してください）。発行が行うのは Iggy への書き込みだけです。データベースのトランザクションのコミットと同時にイベントを発行する必要がある場合、その調整はアプリケーションのコードの責任です。
 
 ## 次のステップ [#next-steps]
 

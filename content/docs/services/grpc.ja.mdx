@@ -18,6 +18,8 @@ Spring でいえば gRPC スターターの `@GrpcService` Bean に相当しま�
 4. サーバーは型レベルのリストである `GrpcServiceRegisterCenter` に push されます。Box 化も動的ディスパッチもありません。
 5. `into_router_fn` がリストを `impl FnOnce(Router<L>) -> Router<L>` に変換します。この関数は登録順にすべてのサーバーを tonic のルーターに追加します。
 
+複数の依存から作るサービスでは、`compose_grpc_service` がステップ 1 から 3 を、完成したサーバーを返すクロージャで置き換えます。[複数の依存から作るサーバー](#servers-built-from-several-dependencies) を参照してください。
+
 ## .proto ファイルからコードを生成する [#generating-code-from-a-proto-file]
 
 ### プロジェクト構成 [#project-layout]
@@ -45,7 +47,7 @@ wakuwaku の機能は基本的に `wakuwaku` 一つから import しますが、
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = "1.0.0-rc1"  # デフォルト feature に `grpc` が含まれる
+wakuwaku = "1.0.0-rc2"  # デフォルト feature に `grpc` が含まれる
 # 生成コードが直接参照するクレート
 tonic = "0.14"
 tonic-prost = "0.14"
@@ -56,7 +58,7 @@ tokio = { version = "1", features = ["full"] }
 tonic-prost-build = "0.14"
 ```
 
-`tonic` は wakuwaku と同じマイナーバージョン(wakuwaku 1.0.0-rc1 では 0.14)にしてください。そうすれば Cargo が両者を一つのクレートに解決し、`tonic` と `wakuwaku::deps::tonic` は同じ型になります。バージョンが異なると、生成されたサーバーは別の `tonic` のトレイトを実装することになり、wakuwaku に受け付けられません。
+`tonic` は wakuwaku と同じマイナーバージョン(wakuwaku 1.0.0-rc2 では 0.14)にしてください。そうすれば Cargo が両者を一つのクレートに解決し、`tonic` と `wakuwaku::deps::tonic` は同じ型になります。バージョンが異なると、生成されたサーバーは別の `tonic` のトレイトを実装することになり、wakuwaku に受け付けられません。
 
 コード生成器は Protocol Buffers コンパイラ `protoc` を呼び出します。最初のビルドの前に、パッケージマネージャーでインストールする(または環境変数 `PROTOC` でパスを指定する)必要があります。
 
@@ -140,7 +142,7 @@ pub mod proto {
 
 ## サービスを実装する [#implementing-a-service]
 
-サービス実装はただの構造体です。生成されたトレイトを実装し、さらに [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装して、どの登録済みの値から作られるかを示します。
+サービス実装は、生成されたトレイトを実装するただの構造体です。登録済みの値一つから作る場合は、さらに [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装して、どの値から作られるかを示します。
 
 例では次の共有依存を使います。コネクションプールや Redis ハンドルの代わりとなるダミーです。大事なのは **clone が安価** で、すべての clone が同じ状態を共有することです。`grpc_service` はサーバーを作るたびに依存をサービスビルダーから clone するためです。
 
@@ -319,7 +321,7 @@ register(router).serve("[::1]:50051".parse()?).await?;
 
 知っておくとよい点です。
 
-- **サーバーはすぐに作られます。** 最初のリクエストが来たときではなく、`grpc_service` を呼んだ時点です。遅延初期化による驚きはありません。
+- **サーバーはすぐに作られます。** 最初のリクエストが来たときではなく、登録した時点です。遅延初期化による驚きはありません。
 - **サービスビルダーは返ってきます。** `into_router_fn` は登録関数と一緒にサービスビルダーを返すので、同じ依存を [cron ジョブ](/ja/docs/services/cron-jobs) や [イベントコンシューマー](/ja/docs/events/consuming) にも使えます。
 - **`register` はルーターを渡して一度だけ呼びます。** 登録順にサーバーを追加し、ルーターのミドルウェアには手を触れません([ミドルウェア](#middleware-layers-and-interceptors) を参照)。
 - 同じ `Dep` 型を複数回登録している場合、`_` は推論できません。[サービスビルダー](/ja/docs/core/service-builder) で説明している `Here` / `There<Here>` で位置を指定します。
@@ -334,50 +336,9 @@ let (_services, register) = ServiceBuilder::new(AccountStore::default())
     .into_router_fn();
 ```
 
-## 複数の依存が必要なサービス [#services-that-need-several-dependencies]
+## 複数の依存から作るサーバー [#servers-built-from-several-dependencies]
 
-`ServiceCreation` は **一つ** の登録済みの値からサービスを作ります。`Admin` サービスは `AccountStore` と `AuditLog` の両方を必要とします。両方を渡す方法は二つあります。
-
-### まとめて登録する [#register-a-group]
-
-おすすめの方法です。サービスが必要とするものをまとめた値を一つ登録し、それを `Dep` にします。サービスは引き続き `grpc_service` で組み立てられ、サービスの依存が一か所にまとまって見通しもよくなります。(この `Admin` 実装は [後述](#build-it-by-hand-with-into_parts) のものと同じで、`self.deps.store` と `self.deps.audit` を使います。)
-
-```rust
-/// `AdminService` が必要とするものをまとめた、一つの登録値。
-#[derive(Clone)]
-pub struct AdminDeps {
-    pub store: AccountStore,
-    pub audit: AuditLog,
-}
-
-pub struct GroupedAdminService {
-    deps: AdminDeps,
-}
-
-impl ServiceCreation for GroupedAdminService {
-    type Dep = AdminDeps;
-
-    fn create_service(deps: AdminDeps) -> Self {
-        Self { deps }
-    }
-}
-```
-
-```rust
-let store = AccountStore::default();
-let audit = AuditLog::default();
-
-let (_services, register) = ServiceBuilder::new(store.clone())
-    .push(audit.clone())
-    .push(AdminDeps { store, audit })
-    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
-    .grpc_service::<AdminServer<_>, GroupedAdminService, _>(AdminServer::new)
-    .into_router_fn();
-```
-
-### `into_parts` で手作業で組み立てる [#build-it-by-hand-with-into_parts]
-
-サービスがそもそも `ServiceCreation` に合わない場合は、チェーンを `into_router_fn` ではなく `into_parts` で締めます。サービスビルダーと [`GrpcServiceRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/struct.GrpcServiceRegisterCenter.html) そのものが返るので、`provide` で得たものからサービスを作り、そのサーバーを `push` します。
+`ServiceCreation` は **一つ** の登録済みの値からサービスを作りますが、`Admin` サービスは `AccountStore` と `AuditLog` の両方を必要とします。この場合は代わりに [`compose_grpc_service`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html#method.compose_grpc_service) で登録します。クロージャがサービスビルダーを借用し、必要なものを `provide` で取り出して、完成したサーバーを返します。実装は `ServiceCreation` を実装しない、ただの構造体です。
 
 ```rust title="src/admin.rs"
 use tonic::{Request, Response, Status};
@@ -386,7 +347,7 @@ use crate::deps::{AccountStore, AuditLog};
 use crate::proto::admin_server::Admin;
 use crate::proto::{DeleteAccountRequest, DeleteAccountResponse};
 
-/// 二つの登録値が必要なので、手作業で組み立てる。
+/// 二つの登録値が必要なので、`main` でクロージャから組み立てる。
 pub struct AdminService {
     pub store: AccountStore,
     pub audit: AuditLog,
@@ -407,19 +368,39 @@ impl Admin for AdminService {
 ```
 
 ```rust title="src/main.rs"
-let (services, register) = services
+let (services, register) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .push(AuditLog::default())
     .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .compose_grpc_service(|s| {
+        AdminServer::new(AdminService {
+            store: s.provide::<AccountStore, _>().clone(),
+            audit: s.provide::<AuditLog, _>().clone(),
+        })
+    })
     .grpc_service::<SessionsServer<_>, SessionsService, _>(SessionsServer::new)
-    .into_parts();
-
-let admin = AdminService {
-    store: services.provide::<AccountStore, _>().clone(),
-    audit: services.provide::<AuditLog, _>().clone(),
-};
-let register = register.push(AdminServer::new(admin)).into_router_fn();
+    .into_router_fn();
 ```
 
-`push` はどのように作ったサーバーでも受け付けます。`provide` は引き続きコンパイル時に検査されるので、未登録の型を要求すればここでもビルドが失敗します。
+- **サーバーの型はクロージャの戻り値から推論されます。** 書くべき型パラメータはありません。
+- **`provide` はそれぞれコンパイル時に検査されます。** 未登録の型を要求すれば、ここでもビルドが失敗します。
+- **ビルダーは何も clone しません。** 保持するハンドルはクロージャが clone し、返したサーバーはそのままリストに入ります。サービスビルダーには登録されないので、ほかのコンポーネントの元にはなりません。
+- **二つの形は同じリスト上で順序を問わずつなげられます。** 上の例のとおりです。どちらの場合も、サーバーは登録順にルーターへ追加されます。
+
+クロージャはサービスビルダーを無視して、事前に組み立てたサーバーを move することもできます。たとえば登録していない値から作る場合です。
+
+```rust
+let store = AccountStore::default();
+// Only the admin service writes to this log, so it is not registered.
+let admin = AdminService { store: store.clone(), audit: AuditLog::default() };
+
+let (_services, register) = ServiceBuilder::new(store)
+    .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .compose_grpc_service(|_| AdminServer::new(admin))
+    .into_router_fn();
+```
+
+どちらの形がどのサービスに合うかは [サービスビルダー](/ja/docs/core/service-builder#which-one-to-use) で説明しています。要するに、登録済みのハンドル一つで足りるなら `grpc_service`、それ以外は `compose_grpc_service` です。依存を束ねるだけの構造体を登録する必要はありません。
 
 ## ミドルウェア: レイヤーとインターセプター [#middleware-layers-and-interceptors]
 
@@ -465,15 +446,15 @@ let _router = register(router);
 
 ### 一つのサーバーだけにインターセプターを掛ける [#an-interceptor-for-one-server-only]
 
-生成されたサーバーには `XxxServer::with_interceptor` がありますが、これが返すサーバー(`InterceptedService`)は `RoutableService` が要求するものとは別のボディ型で応答するため([後述](#what-the-compiler-checks))、`grpc_service` にも `push` にも渡せません。こうしたサーバーは、登録関数を呼んだ **後で** ルーターに追加します。`register` が返すルーターは普通の tonic のルーターです。
+生成されたサーバーには `XxxServer::with_interceptor` がありますが、これが返すサーバー(`InterceptedService`)は `RoutableService` が要求するものとは別のボディ型で応答するため([後述](#what-the-compiler-checks))、`grpc_service` にも `compose_grpc_service` にも `push` にも渡せません。こうしたサーバーは、登録関数を呼んだ **後で** ルーターに追加します。`register` が返すルーターは普通の tonic のルーターです。
 
 ```rust
-let (_services, register) = ServiceBuilder::new(AccountStore::default())
+let (services, register) = ServiceBuilder::new(AccountStore::default())
     .push(SessionStore::default())
     .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
     .into_router_fn();
 
-let sessions = SessionsService::create_service(SessionStore::default());
+let sessions = SessionsService::create_service(services.provide::<SessionStore, _>().clone());
 
 let router = Server::builder().add_routes(Routes::default());
 register(router)
@@ -485,7 +466,7 @@ register(router)
 
 ## グレースフルシャットダウン付きで公開する [#serving-with-graceful-shutdown]
 
-`main.rs` の全体です。共有依存、それらから作るサーバーと手作業で作るサーバー、ミドルウェア、そして Ctrl-C で止まるサーバーです。
+`main.rs` の全体です。共有依存、それらから作るサーバー、ミドルウェア、そして Ctrl-C で止まるサーバーです。
 
 ```rust title="src/main.rs"
 mod accounts;
@@ -528,17 +509,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .push(SessionStore::default())
         .push(AuditLog::default());
 
-    // 2. 依存から作るサーバーと、手作業で作るサーバー
-    let (services, register) = services
+    // 2. 依存から作るサーバー
+    let (_services, register) = services
         .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
         .grpc_service::<SessionsServer<_>, SessionsService, _>(SessionsServer::new)
-        .into_parts();
-
-    let admin = AdminService {
-        store: services.provide::<AccountStore, _>().clone(),
-        audit: services.provide::<AuditLog, _>().clone(),
-    };
-    let register = register.push(AdminServer::new(admin)).into_router_fn();
+        .compose_grpc_service(|s| {
+            AdminServer::new(AdminService {
+                store: s.provide::<AccountStore, _>().clone(),
+                audit: s.provide::<AuditLog, _>().clone(),
+            })
+        })
+        .into_router_fn();
 
     // 3. ミドルウェアはルーターを作る前に Server に設定する
     let router = Server::builder()
@@ -561,7 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## コンパイラが検査すること [#what-the-compiler-checks]
 
-`grpc_service` と `push` はどちらも、サーバーが [`RoutableService`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/trait.RoutableService.html) を実装していることを要求します。実装すべきものはありません。次の境界に付けた名前にすぎず、境界を満たす型はすべて自動的にこれを実装します。
+`grpc_service`、`compose_grpc_service`、`push` はいずれも、サーバーが [`RoutableService`](https://docs.rs/wakuwaku/latest/wakuwaku/services/grpc_service/trait.RoutableService.html) を実装していることを要求します。実装すべきものはありません。次の境界に付けた名前にすぎず、境界を満たす型はすべて自動的にこれを実装します。
 
 | 境界 | 意味 |
 | --- | --- |
@@ -574,7 +555,7 @@ tonic が生成する `XxxServer<T>` は、`T` が `Send + Sync + 'static` で�
 
 そのほかの検査です。
 
-- **登録されていない依存はコンパイルエラーです。** `AccountsService::Dep` が `AccountStore` なのに `AccountStore` を push していなければ、`grpc_service::<AccountsServer<_>, AccountsService, _>` はビルドできません。
+- **登録されていない依存はコンパイルエラーです。** `AccountsService::Dep` が `AccountStore` なのに `AccountStore` を push していなければ、`grpc_service::<AccountsServer<_>, AccountsService, _>` はビルドできません。`compose_grpc_service` のクロージャ内の `provide` も同様です。
 - **トレイトメソッドの実装漏れはコンパイルエラーです。** これは tonic の通常どおりで、生成されたトレイトには proto のすべての `rpc` が並びます。
 
 <Callout type="error" title="サービス名の重複は起動時に panic する">
@@ -599,7 +580,7 @@ let register = GrpcServiceRegisterCenter::new(AccountsServer::new(
 let _router = register(Server::builder().add_routes(Routes::default()));
 ```
 
-`into_parts` の後でも同じことができます。手作業で作ったサーバーとサービスビルダーから作ったサーバーは、こうして一つのリストにまとまります。`RoutableService` の境界を満たすサーバーなら何でもこの方法で push できます。満たさないものは、`register` を呼んだ後でルーターに追加します。
+`ServiceBuilder` のチェーンで `into_parts` を呼ぶと、同じ `GrpcServiceRegisterCenter` が返ります。チェーンの外で `push` してリストを伸ばすコードのためのものです。`RoutableService` の境界を満たすサーバーなら何でも push できます。満たさないものは、`register` を呼んだ後でルーターに追加します。チェーンの中で手作業で作ったサーバーを登録するには `compose_grpc_service` を使います。
 
 ## サービスをテストする [#testing-a-service]
 

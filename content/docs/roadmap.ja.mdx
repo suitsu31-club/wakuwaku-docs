@@ -8,9 +8,21 @@ wakuwaku は、Java における Spring のような、強力で堅牢な Rust �
 
 ## マイルストーン
 
-### 1.0.0-rc1 (現在)
+### 1.0.0-rc1
 
-現在のリリースはリリース候補です。サービスビルダー、gRPC の登録、cron ジョブ、Apache Iggy 上の型付きイベント、PostgreSQL・MySQL・Redis・Meilisearch へのケイパビリティで型付けされたデータアクセス、証明を伴うバリデーションを含みます。下の表で「提供中」となっているものは、すべてこのリリースに含まれています。
+最初のリリース候補です。サービスビルダー、gRPC の登録、cron ジョブ、Apache Iggy 上の型付きイベント、PostgreSQL・MySQL・Redis・Meilisearch へのケイパビリティで型付けされたデータアクセス、証明を伴うバリデーションを含んでいました。
+
+### 1.0.0-rc2 (現在)
+
+現在のリリース候補は、rc1 の内容をすべて引き継ぎ、次の点を改良しています。
+
+- **データアクセス**: すべてのクエリが自分のエラー型を宣言します。そのため、自ら拒否しうるクエリ (楽観ロックの喪失、ビジネスルール違反) はそれをエラーで伝えます。トランザクションは、開いたトランザクションの中でステップがクエリを実行するフローです。BEGIN・COMMIT・ROLLBACK と、トランザクションが中断されたときや COMMIT の結果が失われたときの意味は、ライブラリが受け持ちます。
+- **サービス**: 複数の依存から作るコンポーネントは、クロージャで登録します (`compose_cron_job`、`compose_grpc_service`、`compose_iggy_consumer`)。cron ジョブはスケジュールのモードを選べます。前回の実行が終わってから、少なくとも間隔を空けて、または固定のグリッドで、のいずれかです。
+- **シャットダウン**: cron ジョブとイベントコンシューマーは `shutdown` でグレースフルに後片付けし、`abort` でキャンセルできます。
+- **イベント**: 同じ型の多数のイベントをバッチで発行できます。
+- **バリデーション**: 定数として宣言できる純粋な検証器が、コンテキストや I/O を必要としない性質を証明します。
+
+下の表で「提供中」となっているものは、すべてこのリリースに含まれています。
 
 ### 1.0.0
 
@@ -24,14 +36,14 @@ wakuwaku は、Java における Spring のような、強力で堅牢な Rust �
 
 ## Spring のモジュールと対応物
 
-「提供中」は、1.0.0-rc1 に対応物があることを意味します。Spring の API をそのまま写しているという意味ではありません。対応物はできるだけ多くをコンパイラが検査できるように設計されているため、動作が異なることもよくあります。違いは [Spring から来た方へ](/ja/docs/guides/coming-from-spring) で説明しています。
+「提供中」は、1.0.0-rc2 に対応物があることを意味します。Spring の API をそのまま写しているという意味ではありません。対応物はできるだけ多くをコンパイラが検査できるように設計されているため、動作が異なることもよくあります。違いは [Spring から来た方へ](/ja/docs/guides/coming-from-spring) で説明しています。
 
 | Spring                                                    | wakuwaku                                                                                | 状況     |
 | --------------------------------------------------------- | --------------------------------------------------------------------------------------- | -------- |
 | Spring Framework のコア: IoC コンテナ、依存性注入         | [`ServiceBuilder`、`ServiceCreation`](/ja/docs/core/service-builder)                   | 提供中   |
 | Spring Boot のスターター                                  | [フィーチャーフラグ](/ja/docs/getting-started/installation) 付きの `wakuwaku` 依存ひとつ | 提供中   |
 | Spring Boot の自動構成、`@ConfigurationProperties`、プロファイル | なし                                                                             | 未対応   |
-| タスクスケジューリング (`@Scheduled(fixedRate = ...)`)    | [cron ジョブ](/ja/docs/services/cron-jobs) (固定間隔のみ、cron 式なし)                 | 提供中   |
+| タスクスケジューリング (`@Scheduled(fixedDelay/fixedRate = ...)`) | [cron ジョブ](/ja/docs/services/cron-jobs) (間隔のモードあり、cron 式なし)     | 提供中   |
 | gRPC (Spring gRPC、grpc-spring-boot-starter)              | [gRPC サービス](/ja/docs/services/grpc)                                                 | 提供中   |
 | Spring for Apache Kafka、Spring Cloud Stream、Spring AMQP | [Apache Iggy 上のイベント](/ja/docs/events)                                             | 提供中   |
 | Spring Data JDBC / JPA のリポジトリ                       | [クエリ](/ja/docs/data/queries) と [sqlx](/ja/docs/data/sqlx) (SQL を明示、ORM なし)   | 提供中   |
@@ -55,4 +67,4 @@ wakuwaku は、Java における Spring のような、強力で堅牢な Rust �
 
 ## 0.3 からの変更
 
-0.3 は RabbitMQ・Redis・sqlx まわりのユーティリティ集でした。1.0.0-rc1 はそのほとんどを置き換えています。[0.3 からの移行](/ja/docs/guides/migrating-from-0.3) を参照してください。
+0.3 は RabbitMQ・Redis・sqlx まわりのユーティリティ集でした。1.0.0-rc2 はそのほとんどを置き換えています。[0.3 からの移行](/ja/docs/guides/migrating-from-0.3) を参照してください。

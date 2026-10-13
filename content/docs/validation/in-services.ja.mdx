@@ -44,6 +44,7 @@ impl Query for InsertUser {
 
 impl Execute<PgSource> for InsertUser {
     type Output = i64;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
         let (id,) = sqlx::query_as::<_, (i64,)>("INSERT INTO users (name) VALUES ($1) RETURNING id")
@@ -124,7 +125,7 @@ message RegisterReply {
 }
 ```
 
-コードは [gRPC サービス](/ja/docs/services/grpc#generating-code-from-a-proto-file) の説明に従って生成します。生成されたコードには `tonic`、`tonic-prost`、`prost` への直接の依存と、ビルド依存の `tonic-prost-build` が必要です。サービスは検証用のコンテキストと書き込み用のハンドルを持ち、`ServiceCreation` を通して登録済みの 1 つの依存から作られます。
+コードは [gRPC サービス](/ja/docs/services/grpc#generating-code-from-a-proto-file) の説明に従って生成します。生成されたコードには `tonic`、`tonic-prost`、`prost` への直接の依存と、ビルド依存の `tonic-prost-build` が必要です。サービスは検証用のコンテキストと書き込み用のハンドルを持ちます。サーバーを組み立てるときに、登録済みのこの 2 つのサービスから作られるので ([コンテキストの組み込み](#wiring-the-context) を参照)、`ServiceCreation` の実装は不要です。
 
 ```rust title="src/accounts.rs"
 pub mod pb {
@@ -133,29 +134,13 @@ pub mod pb {
 
 use pb::accounts_server::{Accounts, AccountsServer};
 use pb::{RegisterReply, RegisterRequest};
-use wakuwaku::ServiceCreation;
 use wakuwaku::deps::tonic::{Request, Response, Status};
 use wakuwaku::entity::{Db, ReadWrite};
 use wakuwaku::proof::{CheckOrder, prove};
 
-/// `ServiceBuilder` に一度だけ登録し、サービスにクローンされる
-#[derive(Clone)]
-pub struct AccountsDeps {
-    pub directory: Directory,
-    pub writer: Db<PgSource, ReadWrite>,
-}
-
 pub struct AccountsService {
     directory: Directory,
     writer: Db<PgSource, ReadWrite>,
-}
-
-impl ServiceCreation for AccountsService {
-    type Dep = AccountsDeps;
-
-    fn create_service(dep: AccountsDeps) -> Self {
-        Self { directory: dep.directory, writer: dep.writer }
-    }
 }
 
 #[tonic::async_trait]
@@ -197,7 +182,7 @@ impl Accounts for AccountsService {
 
 ## コンテキストの組み込み [#wiring-the-context]
 
-コンテキストは他の依存と変わりません。サービスビルダーに登録すると、サービスの生成時にクローンされ、さらに `And` がチェックのたびにクローンするので、クローンが安価である必要があります。`PgSource` 上の `Db` はプールのハンドルを包んでいるだけなので、クローンは安価です。
+コンテキストは他の依存と変わりません。書き込み用のハンドルと並べてサービスビルダーに登録し、`compose_grpc_service` でサーバーを組み立てます。このクロージャはビルダーを借用するので、サービスはそれぞれのクローンを受け取れます。`And` はチェックのたびにコンテキストをさらにクローンするので、クローンが安価である必要があります。`PgSource` 上の `Db` はプールのハンドルを包んでいるだけなので、クローンは安価です。
 
 ```rust title="src/accounts.rs"
 use wakuwaku::ServiceBuilder;
@@ -209,17 +194,20 @@ use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
 pub async fn serve(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect(database_url).await?;
 
-    let deps = AccountsDeps {
-        directory: Directory {
-            // 検証は読み取りだけなので、読み取り専用のハンドルを渡す
-            users: Db::<_, ReadOnly>::new(PgSource::new(pool.clone())),
-            limits: Limits { max_len: 32 },
-        },
-        writer: Db::<_, ReadWrite>::new(PgSource::new(pool)),
+    let directory = Directory {
+        // 検証は読み取りだけなので、読み取り専用のハンドルを渡す
+        users: Db::<_, ReadOnly>::new(PgSource::new(pool.clone())),
+        limits: Limits { max_len: 32 },
     };
 
-    let (_services, register) = ServiceBuilder::new(deps)
-        .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    let (_services, register) = ServiceBuilder::new(directory)
+        .push(Db::<_, ReadWrite>::new(PgSource::new(pool)))
+        .compose_grpc_service(|s| {
+            AccountsServer::new(AccountsService {
+                directory: s.provide::<Directory, _>().clone(),
+                writer: s.provide::<Db<PgSource, ReadWrite>, _>().clone(),
+            })
+        })
         .into_router_fn();
 
     let router = Server::builder().add_routes(Routes::default());
@@ -275,7 +263,7 @@ mod predicate_tests {
 
 - 結果に依存している合成述語は、**両方のチェック順序でテスト** してください。どのオペランドが実行されるか、複数が失敗したときにどのエラーが報告されるかが異なります ([チェック順序](/ja/docs/validation/composition#check-order) を参照)。
 - 成功だけでなく **証拠もテスト** してください。後続のコードが証拠を読むので、チェックが通っても `spare` や行が間違っていればバグです。
-- **`Proven` を受け取る関数は本物の証明でテスト** します。テスト専用のコンストラクターは意図的に用意されていません。テスト内で `prove` から証明を得てください。純粋な述語なら手間はかかりません。
+- **`Proven` を受け取る関数は本物の証明でテスト** します。テスト専用のコンストラクターは意図的に用意されていません。テスト内で `prove` (または証拠の型の `PureVerifier`) から証明を得てください。純粋なチェックなら手間はかかりません。検証器ならランタイムも不要で、普通の `#[test]` で済みます。
 - **I/O を行う述語** は具体的なコンテキスト (`Directory` は `Db<PgSource, ReadOnly>` を持ちます) を通して読むので、統合テストで本物のデータベースに対してテストします。`UsernameAvailable` のように判定そのものは単純にしておき、込み入ったロジックは純粋な述語に置いてください。全体的な方針は [テスト](/ja/docs/core/testing) を参照してください。
 
 ## 次のステップ [#next-steps]

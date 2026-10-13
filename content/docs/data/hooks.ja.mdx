@@ -3,7 +3,7 @@ title: 書き込みフック
 description: 書き込みを発行するハンドラを変えずに、すべての書き込みクエリの前後で、監査ログ・キャッシュ無効化・検索同期などの処理を実行します。
 ---
 
-書き込みフックはハンドルをラップし、そのハンドルを通るすべての**書き込み**クエリの前後でプロセッサを実行します。ハンドラ側の変更は不要です。ラップしたハンドルは元のハンドルと同じ出力・同じエラーを返すので、`D: Processor<RenameUser>` を受け取る関数はどちらも受け付けます。
+書き込みフックはハンドルをラップし、そのハンドルを通るすべての**書き込み**クエリの前後でプロセッサを実行します。ハンドラ側の変更は不要です。ラップしたハンドルは元のハンドルと同じ出力・同じエラー（`Db` ならクエリ自身の `Output` と `Error`）を返すので、`D: Processor<RenameUser>` を受け取る関数はどちらも受け付けます。
 
 ラッパーは 2 つあり、どちらも [`wakuwaku::entity`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/index.html) にあります。
 
@@ -81,6 +81,7 @@ impl Query for RecordAudit {
 
 impl Execute<PgSource> for RecordAudit {
     type Output = ();
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO audit_log (subject, action, at) VALUES ($1, $2, now())")
@@ -236,7 +237,7 @@ error[E0277]: the trait bound `AuditTrail: Processor<PostChanged>` is not satisf
 
 ## トランザクションは書き込みフックを通らない
 
-[トランザクション](/ja/docs/data/transactions)内のクエリはトランザクションのコネクションで実行されるので、`BeforeWrite` / `AfterWrite` を通りません。トランザクションに反応したいときは、`AfterTransaction` で最終状態にフックします。そのフックは、フローのレポートと、トランザクションがどうなったか（コミット、ロールバック、コミット結果不明）を受け取ります。2 つは組み合わせられます。`AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>` とすれば、単独で実行されるクエリとトランザクションの*両方*にフックできます。トランザクションのフックには `AfterWrite::inner()` で戻れます。
+[トランザクション](/ja/docs/data/transactions)内のクエリはトランザクションのコネクションで実行されるので、`BeforeWrite` / `AfterWrite` を通りません。トランザクションに反応したいときは、[`AfterTransaction`](/ja/docs/data/transactions#hooking-the-end-of-a-transaction) で最終状態にフックします。そのフックは、フローのレポートと、トランザクションがどうなったか（コミット、ロールバック、コミット結果不明）を受け取ります。単独で実行されるクエリはそのまま素通りするので、2 つは組み合わせられます。`AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>` とすれば、単独で実行されるクエリとトランザクションの*両方*にフックできます。トランザクションのフックには `AfterWrite::inner()` で戻れます。
 
 ## フックをテストする
 

@@ -13,15 +13,15 @@ The Java snippets on this page are illustrations only. They show the Spring idio
 | Spring                                                    | wakuwaku                                                                 | Notes |
 | --------------------------------------------------------- | ------------------------------------------------------------------------ | ----- |
 | `ApplicationContext`, `@Configuration` + `@Bean`          | [`ServiceBuilder::new(..).push(..)`](/en/docs/core/service-builder)      | You build the registry yourself in `main`. Lookup is by type, resolved by the compiler. |
-| Constructor injection                                     | [`ServiceCreation::Dep`](/en/docs/core/service-builder)                  | Exactly one dependency per component. Group several in a struct and register that. |
+| Constructor injection                                     | [`ServiceCreation::Dep`](/en/docs/core/service-builder)                  | A component built from one registered dependency names it as `Dep`. A component that needs several is built by a closure: `compose_cron_job`, `compose_grpc_service`, `compose_iggy_consumer`. |
 | `@Component` scanning                                     | none                                                                     | Every component is registered explicitly. |
 | `@Value`, `@ConfigurationProperties`                      | none                                                                     | Build a config struct yourself and register it like any other dependency. |
-| `@Scheduled(fixedRate = ...)`                             | [`CronJob::INTERVAL`](/en/docs/services/cron-jobs)                       | Runs of a job never overlap. A run that overruns skips the ticks it covered. No cron expressions. |
+| `@Scheduled`                                              | [`CronJob::INTERVAL`](/en/docs/services/cron-jobs)                       | A `CronJobInterval`: `AfterFinish` ≈ `fixedDelay`, `AtLeast` ≈ `fixedRate` (runs never overlap), `AfterStart` ≈ `fixedRate` + `@Async` (runs may overlap). No cron expressions. |
 | `@KafkaListener`                                          | [`EventHandler`](/en/docs/events/consuming) + `ServiceBuilder::iggy_consumer` | The broker is Apache Iggy, not Kafka. A handler receives a batch of events of one key. |
 | `KafkaTemplate.send`                                      | [`Publisher::publish`](/en/docs/events/publishing)                       | The event's key picks the topic and the partition. |
 | Spring Data repository methods                            | [Query values](/en/docs/data/queries) implementing `Query` + `Execute`   | Each query is a struct that declares the entities it reads and writes. No ORM, no derived queries. |
 | `@Transactional(readOnly = true)`                         | [`Db<S, ReadOnly>`](/en/docs/data/queries)                               | A capability of the handle, checked at compile time. See below. |
-| `@Transactional`                                          | [`Transaction` + `TxFlow`](/en/docs/data/transactions)                   | The transaction is a value: a state machine run by a driver, not a proxy around a method. |
+| `@Transactional`                                          | [`Transaction` + `TxFlow`](/en/docs/data/transactions)                   | The transaction is a value: a flow whose steps run queries, driven by the library, not a proxy around a method. |
 | JPA entity listeners, `@TransactionalEventListener`       | [`BeforeWrite` / `AfterWrite` hooks](/en/docs/data/hooks)                | Hooks wrap a handle and run around write queries. |
 | Bean Validation (`@Valid`, `@NotBlank`)                   | [`wakuwaku::proof`](/en/docs/validation)                                 | A check returns `Proven<T, P>`, and functions that need valid input take that type. |
 | `@Cacheable`                                              | [Redis `Cache`](/en/docs/data/redis)                                     | Not annotation-driven: you call `get` and `put` yourself, as you would with Spring's `Cache` or `RedisTemplate`. |
@@ -58,48 +58,36 @@ use std::convert::Infallible;
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
 use wakuwaku::deps::sqlx::PgPool;
-use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceBuilder};
 
 #[derive(Clone)]
 struct Mailer;
 
-/// Everything `DigestJob` needs, registered as one value.
-#[derive(Clone)]
-struct DigestDeps {
+struct DigestJob {
     pool: PgPool,
     mailer: Mailer,
-}
-
-struct DigestJob {
-    deps: DigestDeps,
-}
-
-impl ServiceCreation for DigestJob {
-    type Dep = DigestDeps;
-    fn create_service(deps: DigestDeps) -> Self {
-        Self { deps }
-    }
 }
 
 impl Processor<CronTick> for DigestJob {
     type Output = ();
     type Error = Infallible;
     async fn process(&self, _tick: CronTick) -> Result<(), Infallible> {
-        // Query `self.deps.pool`, send mail with `self.deps.mailer`.
+        // Query `self.pool`, send mail with `self.mailer`.
         Ok(())
     }
 }
 
 impl CronJob for DigestJob {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60 * 60));
 }
 
 async fn run(pool: PgPool) {
-    let mailer = Mailer;
-    let (services, cron) = ServiceBuilder::new(pool.clone())
-        .push(mailer.clone())
-        .push(DigestDeps { pool, mailer })
-        .cron_job::<DigestJob, _>()
+    let (_services, cron) = ServiceBuilder::new(pool)
+        .push(Mailer)
+        .compose_cron_job(|s| DigestJob {
+            pool: s.provide::<PgPool, _>().clone(),
+            mailer: s.provide::<Mailer, _>().clone(),
+        })
         .start();
 
     tokio::signal::ctrl_c().await.ok();
@@ -110,9 +98,9 @@ async fn run(pool: PgPool) {
 Things to notice:
 
 - **Registration is explicit.** `ServiceBuilder::new(..).push(..)` plays the role of `@Bean` methods. Nothing is discovered on the classpath.
-- **One dependency per component.** Instead of a constructor with several parameters, a component names one `Dep` type. When it needs several things, register a struct that holds them, like `DigestDeps`. The dependency is cloned into the component, so keep it cheap to clone (pools, handles, `Arc`s).
-- **The schedule is a constant.** `INTERVAL` is part of the job's type. A zero interval does not build.
-- **Shutdown is yours.** `start()` returns a `CronRuntime`. Calling `shutdown().await` lets a run in progress finish.
+- **The constructor is a closure.** `compose_cron_job` hands the closure the builder, and `s.provide::<T, _>()` looks up each registered dependency by type, as constructor injection would. A missing one is a compile error. A component built from a single dependency can instead implement `ServiceCreation` and be registered with `cron_job::<Job, _>()`. Dependencies are cloned out of the registry, so keep them cheap to clone (pools, handles, `Arc`s).
+- **The schedule is a constant.** `INTERVAL` is part of the job's type. `AtLeast` starts runs at least an hour apart, like `fixedRate`, but never lets two runs overlap. A zero interval does not build.
+- **Shutdown is yours.** `start()` returns a `CronRuntime`. Calling `shutdown().await` stops scheduling and lets a run in progress finish; `abort().await` cancels it instead.
 
 ## Key differences
 

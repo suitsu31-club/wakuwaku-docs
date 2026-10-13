@@ -137,14 +137,14 @@ pub async fn reprice(redis: &Redis, shop: &str) -> RedisResult<bool> {
 
 ## 複数レプリカでの cron ジョブ
 
-[cron ジョブ](/ja/docs/services/cron-jobs) は、それを起動したすべてのレプリカで、各レプリカ自身のスケジュールに従って実行されます。デプロイ全体でインターバルごとに 1 回だけ実行するには、インターバルの大部分をカバーするリースのロックを取り、*解放しない* ようにします。最初に tick したレプリカがロックを取り、他のレプリカは次のインターバルまでロックが保持されているのを見ることになります。
+[cron ジョブ](/ja/docs/services/cron-jobs) は、それを起動したすべてのレプリカで、起動時の 1 回目を皮切りに、各レプリカ自身のスケジュールに従って実行されます。デプロイ全体でインターバルごとに 1 回だけ実行するには、インターバルの大部分をカバーするリースのロックを取り、*解放しない* ようにします。最初に tick したレプリカがロックを取り、他のレプリカは次のインターバルまでロックが保持されているのを見ることになります。
 
 ```rust title="src/report.rs"
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
 use wakuwaku::deps::redis::RedisError;
 use wakuwaku::entity::redis::collection::lock::Lock;
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -179,7 +179,8 @@ impl Processor<CronTick> for HourlyReport {
 }
 
 impl CronJob for HourlyReport {
-    const INTERVAL: Duration = HOUR;
+    /// 各レプリカで、少なくとも 1 時間空けて、重ならずに開始する。
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(HOUR);
 }
 ```
 
@@ -195,14 +196,17 @@ pub async fn main_like() -> Result<(), Box<dyn std::error::Error>> {
         .cron_job::<HourlyReport, _>()
         .start();
     // … シャットダウンまでサービスを提供する …
+    // スケジューリングを止め、実行中のものがあれば終わるまで待つ。
     cron.shutdown().await;
     Ok(())
 }
 ```
 
-なぜ実行後にロックを解放しないのでしょうか。解放で防げるのは *重なった* 実行だけです。レプリカは起動時刻が異なるため、スケジュールがずれています。解放する場合、レプリカ A が 12:00 に実行して 12:01 に解放し、グリッドが 12:20 にあるレプリカ B が空いたロックを取って、同じ時間帯のレポートをもう一度実行してしまいます。
+なぜ実行後にロックを解放しないのでしょうか。解放で防げるのは *重なった* 実行だけです。レプリカは起動時刻が異なるため、スケジュールがずれています。解放する場合、レプリカ A が 12:00 に実行して 12:01 に解放し、スケジュールが 12:20 にあるレプリカ B が空いたロックを取って、同じ時間帯のレポートをもう一度実行してしまいます。
 
 リースはインターバルより短くしなければなりません。リースが 1 時間以上だと、12:00 にロックを取ったレプリカ自身ですら 13:00 の tick でまだ保持されているのを見て、その 1 時間がスキップされることがあります。実行がリースより長くかかるかもしれないなら、上の `while_held` で包み、実行中はリースが延長され続けるようにしてください。
+
+このようなジョブの間隔は `CronJobInterval::AtLeast` か `AfterFinish` で指定します。どちらも、1 つのレプリカの実行が重ならず、少なくともインターバル分空けて開始されることを保証し、上のリースの計算はこれを前提にしています。`AfterStart` はどちらも保証しません。遅い実行は次の実行と重なり、実行の間隔がインターバルをわずかに下回ることもあります。
 
 返された `RedisError` は cron ランタイムがログに記録し、ジョブはスケジュールを維持します。それでもジョブは冪等にしておきましょう。Redis がキーを失う（永続化なしのフェイルオーバーや eviction）と、2 つのレプリカが同じインターバルで両方とも実行することがあります。
 

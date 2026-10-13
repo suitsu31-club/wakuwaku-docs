@@ -9,7 +9,7 @@ description: エンティティとクエリを定義し、ケイパビリティ�
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -34,7 +34,7 @@ impl Entity for Post {}
 クエリは 2 つのトレイトを実装します。
 
 - [`Query`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Query.html) は**何に触れるか**、つまり `Effect` を表します。どこで実行されるかには依存しないので、ケイパビリティ検査や[フック](/ja/docs/data/hooks)はどのデータソースでも同じように働きます。
-- [`Execute<S>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html) はデータソース `S` で**どう実行するか**、つまり `Output` と、コネクション上で動くコードを表します。移植性のある SQL で書いたクエリなら、複数のデータソースに対して実装できます。
+- [`Execute<S>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html) はデータソース `S` で**どう実行するか**、つまり `Output`、`Error`、そしてコネクション上で動くコードを表します。移植性のある SQL で書いたクエリなら、複数のデータソースに対して実装できます。
 
 ```rust title="src/queries.rs"
 use crate::entities::{Post, User};
@@ -59,6 +59,7 @@ impl Query for FindUser {
 
 impl Execute<PgSource> for FindUser {
     type Output = Option<UserRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
         let row: Option<(i64, String)> = sqlx::query_as("SELECT id, name FROM users WHERE id = $1")
@@ -70,7 +71,7 @@ impl Execute<PgSource> for FindUser {
 }
 ```
 
-`execute` は普通の `&mut PgConnection` を受け取り、データソースのエラー型（sqlx のデータソースなら `sqlx::Error`）を返します。クエリを単独で実行すると、コネクションはプールから取得され、自動コミットで動きます。[トランザクション](/ja/docs/data/transactions)の中では、そのトランザクションのコネクションが渡されます。同じクエリをどちらでも使えます。
+`execute` は普通の `&mut PgConnection` を受け取り、クエリの `Error` を返します。データベースと同じ理由でしか失敗しないクエリは、データソースのエラー（sqlx のデータソースなら `sqlx::Error`）を使います。自分の判断で拒否することもあるクエリは、[独自のエラー型](#own-error-type)を宣言します。クエリを単独で実行すると、コネクションはプールから取得され、自動コミットで動きます。[トランザクション](/ja/docs/data/transactions)の中では、そのトランザクションのコネクションが渡されます。同じクエリをどちらでも使えます。
 
 複数のエンティティに触れるクエリでは、そのすべてを列挙します。タプルは要素のエフェクトの和集合です。
 
@@ -87,6 +88,7 @@ impl Query for PostsByAuthor {
 
 impl Execute<PgSource> for PostsByAuthor {
     type Output = Vec<String>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar(
@@ -116,6 +118,7 @@ impl Query for RenameUser {
 impl Execute<PgSource> for RenameUser {
     /// 影響を受けた行数
     type Output = u64;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
         let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
@@ -134,7 +137,7 @@ impl Execute<PgSource> for RenameUser {
 
 ## データソース
 
-[`DataSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.DataSource.html) は、コネクションプールや多重化クライアントなど、クエリを実行できるものです。クエリが受け取るコネクションの型と、返すエラーの型を決めます。
+[`DataSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.DataSource.html) は、コネクションプールや多重化クライアントなど、クエリを実行できるものです。クエリが受け取るコネクションの型と、データソース自身のエラー型を決めます。どのクエリの `Error` も、このエラー型から変換できなければなりません。
 
 ```rust
 pub trait DataSource: Send + Sync + Sized {
@@ -144,18 +147,20 @@ pub trait DataSource: Send + Sync + Sized {
     fn run<Q: Execute<Self>>(
         &self,
         query: Q,
-    ) -> impl Future<Output = Result<Q::Output, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Q::Output, Q::Error>> + Send;
 }
 ```
 
+`run` はクエリ自身の結果を返します。コネクションを取得できなかったときなど、クエリが始まる前にデータソースが失敗した場合は、そのエラーが `From<Self::Error>` で `Q::Error` に変換されます。
+
 自分で実装することはまずありません。バックエンドごとに用意されています。
 
-| データソース | フィーチャー | コネクション | エラー |
+| データソース | フィーチャー | コネクション | データソースのエラー |
 |---|---|---|---|
 | `entity::sqlx::backend::PgSource` | `sqlx-pg` | `PgConnection` | `sqlx::Error` |
 | `entity::sqlx::backend::MySqlSource` | `sqlx-mysql` | `MySqlConnection` | `sqlx::Error` |
-| `entity::redis::RedisSource` | `redis` | [Redis](/ja/docs/data/redis) を参照 | |
-| `entity::meilisearch::MeiliSource` | `meilisearch` | [Meilisearch](/ja/docs/data/meilisearch) を参照 | |
+| `entity::redis::RedisSource` | `redis` | [Redis](/ja/docs/data/redis) を参照 | `redis::RedisError` |
+| `entity::meilisearch::MeiliSource` | `meilisearch` | [Meilisearch](/ja/docs/data/meilisearch) を参照 | `meilisearch_sdk::errors::Error` |
 
 `PgSource` は `SqlxSource<Postgres>` の別名です。単独で実行されるクエリは、それぞれプールからコネクションを取得します。
 
@@ -164,13 +169,15 @@ pub trait DataSource: Send + Sync + Sized {
 `Db<S, C>` はデータソース `S` を所有し、ケイパビリティ `C` を持ちます。ケイパビリティは型パラメータにすぎないので、ハンドルを作るときに選びます。プライマリとリードレプリカを持つサービスでは、ハンドルを 2 つ作ります。
 
 ```rust title="src/wiring.rs"
-use crate::queries::{DeactivateUsers, DormantUsers, FindUser, PostsByAuthor, RenameUser, UserRow};
+use crate::queries::{
+    DeactivateUsers, DormantUsers, EditPostError, EditPostTitle, FindUser, PostsByAuthor, RenameUser, UserRow,
+};
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
 use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
 use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
 use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
-use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceBuilder};
 
 /// サービスの 2 つのハンドル。書き込みはプライマリへ、
 /// レプリケーション遅延を許容できる読み取りはレプリカへ送る
@@ -211,7 +218,7 @@ pub async fn run_one(dbs: &Databases) -> Result<(), sqlx::Error> {
 }
 ```
 
-`process` はクエリの `Output` か、データソースの `Error` を返します。
+`process` はクエリの `Output` か、クエリの `Error` を返します。
 
 ## ハンドラはハンドルに対してジェネリックにする
 
@@ -248,6 +255,95 @@ where
 
 - ハンドラは、そのクエリを処理できるものなら何でも受け取ります。`Db`、[書き込みフック](/ja/docs/data/hooks)でラップした `Db`、[ユニットテスト](/ja/docs/core/testing)用のフェイクのどれでも構いません。
 - `Processor` 境界が複数あるときは、上の例のように各境界で `Output` と `Error` を固定します。そうすると `db.process(...)` の結果の型が一意に決まります。
+
+## クエリ独自のエラー型 [#own-error-type]
+
+データベースの失敗だけでなく、自分の理由で失敗するクエリもあります。楽観ロックで守られた更新が、先に誰かが行を変更していたことに気づく場合や、出金が口座の残高を超える場合です。こうした拒否は操作の失敗なので、`Output` ではなくクエリの `Error` に入れます。
+
+`Output` に入れること（`Output = bool` や `Output = Result<Post, Conflict>`）もできますが、そうすると呼び出し側は `?` の後でもう一度結果を確かめなければならず、確かめ忘れてもコンパイルは通り、拒否が成功として扱われてしまいます。独自のエラー型なら、拒否もほかのエラーと同じように扱えます。`?` で伝播し、`match` で処理します。
+
+条件は `type Error: From<S::Error>` だけです。データソースのエラーをその型に収められれば十分です。次の例では `posts` の行が `version` 列を持ち、編集はクライアントが最後に読んだバージョンに対してだけ適用されます。
+
+```rust title="src/queries.rs"
+/// Why an edit of a post failed.
+#[derive(Debug)]
+pub enum EditPostError {
+    /// The post changed, or was deleted, since `version` was read.
+    Stale,
+    /// The database failed.
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for EditPostError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+/// Change a post's title, if nobody changed the post since `version` was read.
+pub struct EditPostTitle {
+    pub id: i64,
+    pub version: i64,
+    pub title: String,
+}
+
+impl Query for EditPostTitle {
+    type Effect = Write<Post>;
+}
+
+impl Execute<PgSource> for EditPostTitle {
+    /// The new version of the post.
+    type Output = i64;
+    type Error = EditPostError;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<i64, EditPostError> {
+        let version: Option<i64> = sqlx::query_scalar(
+            "UPDATE posts SET title = $3, version = version + 1 \
+             WHERE id = $1 AND version = $2 RETURNING version",
+        )
+        .bind(self.id)
+        .bind(self.version)
+        .bind(self.title)
+        .fetch_optional(conn)
+        .await?; // sqlx::Error -> EditPostError::Database
+        version.ok_or(EditPostError::Stale)
+    }
+}
+```
+
+`Db::process` は `Result<i64, EditPostError>` を返すので、それぞれの失敗が何を意味するかを呼び出し側が 1 か所で決められます。
+
+```rust title="src/wiring.rs"
+pub async fn save_title(dbs: &Databases, id: i64, version: i64, title: String) -> Result<Option<i64>, sqlx::Error> {
+    match dbs.primary.process(EditPostTitle { id, version, title }).await {
+        Ok(new_version) => Ok(Some(new_version)),
+        // Someone else won: tell the client to reload and retry.
+        Err(EditPostError::Stale) => Ok(None),
+        Err(EditPostError::Database(error)) => Err(error),
+    }
+}
+```
+
+`EditPostError` を返す関数では、同じ `From` 実装により、エラーが `sqlx::Error` のクエリにも `?` を使えます。フックもこれを変えません。[フックを付けたハンドル](/ja/docs/data/hooks)は、クエリのエラーをそのまま返します。
+
+<Callout type="info" title="トランザクションの中で使う">
+[トランザクション](/ja/docs/data/transactions)の中で実行するクエリのエラーは、[`AsSqlxError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.AsSqlxError.html) を実装している必要があります。このトレイトは、エラーがデータベースから来たもの（トランザクションを中断させた可能性がある）か、クエリ独自のもの（決して中断させない）かをトランザクションに伝えます。`sqlx::Error` は実装済みです。独自のエラー型では、包んでいる `sqlx::Error` を返します。
+
+```rust title="src/queries.rs"
+use wakuwaku::entity::sqlx::transaction::AsSqlxError;
+
+impl AsSqlxError for EditPostError {
+    fn as_sqlx_error(&self) -> Option<&sqlx::Error> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::Stale => None,
+        }
+    }
+}
+```
+
+[トランザクション内のエラー](/ja/docs/data/transactions#errors-inside-a-transaction)を参照してください。
+</Callout>
 
 ## 読み取りはレプリカへ、書き込みはプライマリへ
 
@@ -301,22 +397,15 @@ note は下から読みます。`rename_user` には `Processor<RenameUser>` が
 
 ## ハンドルをコンポーネントに注入する
 
-ハンドルは普通の値なので、ほかの共有依存と同じように [`ServiceBuilder`](/ja/docs/core/service-builder) に登録できます。コンポーネントは [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装し、`Dep` 型を 1 つだけ持ちます。両方のハンドルが必要なコンポーネントは、`Databases` 構造体を依存として使います（`Dep` には `Clone` が必要なので、`Databases` は `Clone` を derive しています）。
+ハンドルは普通の値なので、ほかの共有依存と同じように [`ServiceBuilder`](/ja/docs/core/service-builder) に登録できます。`Db<PgSource, ReadOnly>` と `Db<PgSource, ReadWrite>` は別の型なので、両方を登録し、各コンポーネントが必要なものを取り出します。
 
 次の [cron ジョブ](/ja/docs/services/cron-jobs)は、休眠ユーザーをレプリカで探し、プライマリで無効化します。
 
 ```rust title="src/wiring.rs"
 /// 1 年間サインインしていないユーザーを無効化する
 pub struct DeactivateDormantUsers {
-    dbs: Databases,
-}
-
-impl ServiceCreation for DeactivateDormantUsers {
-    type Dep = Databases;
-
-    fn create_service(dbs: Databases) -> Self {
-        Self { dbs }
-    }
+    replica: Db<PgSource, ReadOnly>,
+    primary: Db<PgSource, ReadWrite>,
 }
 
 impl Processor<CronTick> for DeactivateDormantUsers {
@@ -324,20 +413,20 @@ impl Processor<CronTick> for DeactivateDormantUsers {
     type Error = sqlx::Error;
 
     async fn process(&self, _tick: CronTick) -> Result<(), sqlx::Error> {
-        let ids = self.dbs.replica.process(DormantUsers { days: 365 }).await?;
+        let ids = self.replica.process(DormantUsers { days: 365 }).await?;
         if !ids.is_empty() {
-            self.dbs.primary.process(DeactivateUsers { ids }).await?;
+            self.primary.process(DeactivateUsers { ids }).await?;
         }
         Ok(())
     }
 }
 
 impl CronJob for DeactivateDormantUsers {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(60 * 60));
 }
 ```
 
-`DormantUsers`（`Read<User>`）と `DeactivateUsers`（`Write<User>`）は、上のクエリと同じように定義します。ハンドルとジョブを登録します。
+`DormantUsers`（`Read<User>`）と `DeactivateUsers`（`Write<User>`）は、上のクエリと同じように定義します。ハンドルを登録し、その両方からジョブを組み立てます。
 
 ```rust title="src/wiring.rs"
 pub async fn start() -> Result<(), sqlx::Error> {
@@ -347,24 +436,29 @@ pub async fn start() -> Result<(), sqlx::Error> {
     )
     .await?;
 
-    let (services, cron) = ServiceBuilder::new(dbs)
-        .cron_job::<DeactivateDormantUsers, _>()
+    let (services, cron) = ServiceBuilder::new(dbs.primary.clone())
+        .push(dbs.replica.clone())
+        .compose_cron_job(|s| DeactivateDormantUsers {
+            replica: s.provide::<Db<PgSource, ReadOnly>, _>().clone(),
+            primary: s.provide::<Db<PgSource, ReadWrite>, _>().clone(),
+        })
         .start();
 
     // ほかのコンポーネントもビルダーからハンドルを受け取る
-    let dbs: &Databases = services.provide::<Databases, _>();
-    handle_requests(dbs).await?;
+    let replica: &Db<PgSource, ReadOnly> = services.provide::<Db<PgSource, ReadOnly>, _>();
+    let _profile = load_profile(replica, 7).await?;
+    handle_requests(&dbs).await?;
 
     cron.shutdown().await;
     Ok(())
 }
 ```
 
-`ServiceBuilder::cron_job` はビルダーから `Databases` を clone し、`create_service` を呼びます。gRPC サービスも `grpc_service` で同じように組み立てます（[gRPC サービス](/ja/docs/services/grpc)を参照）。`Db<PgSource, ReadOnly>` と `Db<PgSource, ReadWrite>` は別の型なので、2 つを別々に登録し、それぞれ型で取り出すこともできます。
+`compose_cron_job` はクロージャにビルダーを貸すので、コンポーネントは登録済みのハンドルをいくつでも受け取れます。`ServiceCreation` の実装は不要です。ハンドルを 1 つだけ必要とするコンポーネントなら、そのハンドルを `Dep` として [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装し、`cron_job` で登録することもできます。gRPC サービスとイベントコンシューマーにも同じ 2 つのメソッドがあります。[ServiceBuilder](/ja/docs/core/service-builder) を参照してください。ハンドルの clone はプールのハンドルを clone するだけなので、各コンポーネントが自分のコピーを持てます。
 
 <Accordions>
   <Accordion title="なぜクエリはリポジトリのメソッドではなく値なのか">
-    値なら実行前に扱えます。型にはコンパイラが検査する `Effect` が乗り、フックはそれを変更として記述でき、トランザクションは次のステップとして保持できます。`D: Processor<FindUser>` を受け取るハンドラは実際に使う操作だけに依存するので、テストではリポジトリ全体をモックせずに、小さなフェイクに差し替えられます。
+    値なら実行前に扱えます。型にはコンパイラが検査する `Effect` が乗り、フックはそれを変更として記述できます。同じ値を `Db` で単独でも[トランザクション](/ja/docs/data/transactions)の中でも実行でき、どちらでも `Output` と `Error` はそのクエリ自身のものです。`D: Processor<FindUser>` を受け取るハンドラは実際に使う操作だけに依存するので、テストではリポジトリ全体をモックせずに、小さなフェイクに差し替えられます。
   </Accordion>
   <Accordion title="なぜケイパビリティは実行時のフラグではなく型パラメータなのか">
     実行時のフラグは、書き込みが振り分けられた後、実行時にしか失敗できません。型パラメータなら、誤ったハンドルを渡したまさにその呼び出しがコンパイルエラーになります。実行時のコストもありません。`Db<S, C>` が保持するのは `S` だけです。

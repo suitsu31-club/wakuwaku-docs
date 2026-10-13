@@ -6,7 +6,7 @@ icon: Boxes
 
 Every wakuwaku service starts with a [`ServiceBuilder`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html): a registry of the dependencies your components share, such as database handles, clients, and configuration. Cron jobs, event handlers, and gRPC services are then built from it.
 
-If you know Spring, the builder plays the role of the application context, with two differences. Dependencies are looked up by type **while compiling**, not when the application starts. And there is no scanning, no annotations, and no proxies: you register values explicitly, and each component says which one it is built from.
+If you know Spring, the builder plays the role of the application context, with two differences. Dependencies are looked up by type **while compiling**, not when the application starts. And there is no scanning, no annotations, and no proxies: you register values explicitly, and each component names the values it is built from.
 
 <ServiceBuilderDiagram lang="en" />
 
@@ -47,9 +47,22 @@ The registry is a linked list at the type level. Positions are counted from the 
 
 The consequence is the important part: asking for a type that was never registered **does not compile** (see [below](#reading-the-compile-errors)).
 
+## Two ways to build a component
+
+Every kind of component can be built from the builder in two ways: from **one registered dependency**, through a trait the component implements, or by a **closure that borrows the builder** and returns the finished component.
+
+| Component | From one registered dependency | By a closure |
+|---|---|---|
+| Cron job | `.cron_job::<Job, _>()` | `.compose_cron_job(\|s\| job)` |
+| Event handler | `.iggy_consumer::<Handler, _, _>()` | `.compose_iggy_consumer(\|s\| Arc::new(handler))` |
+| gRPC server | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)` | `.compose_grpc_service(\|s\| XxxServer::new(implementation))` |
+| Registered service | `.construct_subservice::<Service, _>()` | `.compose_subservice(\|s\| service)` |
+
+The left column needs the component to implement `ServiceCreation`; the right column needs nothing but the value. The last row registers the result as a new service instead of a component; see [Services built from other services](#services-built-from-other-services).
+
 ## Building components: `ServiceCreation`
 
-A component does not look its dependencies up itself. It declares the one registered type it is built from by implementing [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html):
+A component built the first way does not look its dependencies up itself. It declares the one registered type it is built from by implementing [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html):
 
 ```rust
 pub trait ServiceCreation {
@@ -90,59 +103,136 @@ pub struct SessionStore {
 Every component built from the same `Dep` receives a separate clone, taken once, when the component is registered. Shared state must therefore live behind the handle (an `Arc`, a pool), so that all clones see it.
 </Callout>
 
-### Several dependencies in one struct
+## Composing components with a closure
 
-`Dep` is a single type. When a component needs more than one dependency, register a struct (or a tuple) that groups them and use it as `Dep`:
+The `compose_*` methods take a closure instead of a type parameter. The closure receives the builder by reference, takes what it needs with `provide`, and returns the finished component. `SendInvoices` needs both the accounts and the mailer:
 
 ```rust title="src/billing.rs"
-/// Everything the billing components need, registered as one value.
-#[derive(Clone)]
-pub struct BillingDeps {
+use std::time::Duration;
+
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::{CronJob, CronJobInterval, CronTick};
+
+/// Built from two registered values, so it implements no `ServiceCreation`.
+pub struct SendInvoices {
     pub accounts: AccountStore,
     pub mailer: Mailer,
 }
 
-pub struct SendInvoices {
-    deps: BillingDeps,
+impl Processor<CronTick> for SendInvoices {
+    type Output = ();
+    type Error = MailError;
+
+    async fn process(&self, _tick: CronTick) -> Result<(), MailError> {
+        for account in self.accounts.with_open_invoices() {
+            self.mailer.send_invoice(&account).await?;
+        }
+        Ok(())
+    }
 }
 
-impl ServiceCreation for SendInvoices {
-    type Dep = BillingDeps;
-    fn create_service(deps: BillingDeps) -> Self {
-        Self { deps }
-    }
+impl CronJob for SendInvoices {
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(60 * 60));
 }
 ```
 
 ```rust title="src/main.rs"
-let accounts = AccountStore::default();
-let mailer = Mailer::default();
-
-let (_services, cron) = ServiceBuilder::new(accounts.clone())
-    .push(mailer.clone())
-    .push(BillingDeps { accounts, mailer })
-    .cron_job::<SendInvoices, _>()
+let (_services, cron) = ServiceBuilder::new(AccountStore::default())
+    .push(SessionStore::default())
+    .push(Mailer::default())
+    .cron_job::<ExpireSessions, _>()
+    .compose_cron_job(|s| SendInvoices {
+        accounts: s.provide::<AccountStore, _>().clone(),
+        mailer: s.provide::<Mailer, _>().clone(),
+    })
     .start();
 ```
 
-The parts are still registered on their own here, so other components can be built from just an `AccountStore` or just a `Mailer`. Because the parts are handles, `BillingDeps` shares their state.
+What changes compared with `ServiceCreation`:
+
+- **There is no trait to implement.** The closure is the constructor. It can take any number of registered values, do extra work on the way, or ignore its argument and move in a value built beforehand from things that are not registered, as in `.compose_cron_job(|_| job)`.
+- **Lookups are still checked by the compiler.** Each `provide` in the closure is an ordinary `ProvideAt` bound, so asking for a type that was never registered does not compile.
+- **Nothing is cloned for you.** `provide` lends a reference; the closure clones the handles it keeps. The returned component is moved into the register center and never cloned afterwards.
+- **The component is not registered as a service.** It goes into the register center only, so `provide` cannot find it and no other component can be built from it. To share a value between components, register it with [`compose_subservice`](#services-built-from-other-services) instead.
+- **The closure runs right away**, at the registration call, just as `create_service` does.
+
+Both forms chain freely and in any order on the same register center, as `cron_job` and `compose_cron_job` do above.
+
+### Which one to use
+
+Prefer `ServiceCreation` when a component is naturally built from one handle. The impl records the dependency next to the type, registration is a single type parameter, and every service and every test builds the component the same way, with `create_service`.
+
+Use a `compose_*` method when the component needs several registered values, a value that is not registered (a setting read in `main`, a client built beforehand), or extra work on the way (such as a gRPC server configured with message size limits). The wiring then sits at the registration call in `main`, next to the rest of it.
+
+Do not register a struct that only bundles other registered values to make a component fit `ServiceCreation`; compose the component instead. A struct belongs in the builder when it is a service of its own, with behavior that several components share. That is the next section.
+
+## Services built from other services
+
+`construct_subservice` and `compose_subservice` build a value in the same two ways, then **push** it onto the builder. The result is an ordinary registered service: it is found at `Here`, `provide` returns it, and it can be the `Dep` of every component registered after it.
+
+```rust title="src/billing.rs"
+/// Account queries on top of the store.
+#[derive(Clone)]
+pub struct AccountRepo {
+    store: AccountStore,
+}
+
+impl ServiceCreation for AccountRepo {
+    type Dep = AccountStore;
+    fn create_service(store: AccountStore) -> Self {
+        Self { store }
+    }
+}
+
+/// Billing logic shared by several components. Cheap to clone: it holds handles.
+#[derive(Clone)]
+pub struct Billing {
+    accounts: AccountRepo,
+    mailer: Mailer,
+}
+```
+
+```rust title="src/main.rs"
+let services = ServiceBuilder::new(AccountStore::default())
+    .push(Mailer::default())
+    // From one registered dependency, through `ServiceCreation`.
+    .construct_subservice::<AccountRepo, _>()
+    // From several, through a closure.
+    .compose_subservice(|s| Billing {
+        accounts: s.provide::<AccountRepo, _>().clone(),
+        mailer: s.provide::<Mailer, _>().clone(),
+    });
+
+// Both jobs implement `ServiceCreation` with `type Dep = Billing`.
+let (_services, cron) = services
+    .cron_job::<CloseBillingPeriod, _>()
+    .cron_job::<RemindOverdue, _>()
+    .start();
+```
+
+Some details:
+
+- These are methods of `ServiceBuilder` itself, and each one adds a node like `push` does. Register services before entering a register center, or on the builder that a finishing method gives back.
+- A registered service is cloned for every component built from it, like any `Dep`, so it should hold handles (`Arc`s, pools, clients) rather than the resources themselves.
+- The difference from `compose_*` is only where the result goes: `compose_subservice` registers it in the builder, `compose_cron_job` and its siblings put it in a register center.
 
 ## Register centers take the builder and give it back
 
-Each kind of component has a *register center*: a type-level list of components, filled from the builder. You enter one with a method on `ServiceBuilder`, chain more registrations, and finish with a method that hands the builder back:
+Each kind of component has a *register center*: a type-level list of components, filled from the builder. The first registration enters it from `ServiceBuilder`; further registrations, in either form, chain onto it; a finishing method hands the builder back:
 
-| Component | Start with | Chain | Finish with | You get back |
-|---|---|---|---|---|
-| Cron job | `.cron_job::<Job, _>()` | `.cron_job::<Job, _>()` | `.start()` | `(ServiceBuilder, CronRuntime)` |
-| Event handler | `.iggy_consumer::<Handler, _, _>()` | `.iggy_consumer::<Handler, _, _>()` | `.start(client, config).await?` | `(ServiceBuilder, ConsumerRuntime)` |
-| gRPC service | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)` | same | `.into_router_fn()` | `(ServiceBuilder, impl FnOnce(Router<L>) -> Router<L>)` |
-| any of them | | | `.into_parts()` | `(ServiceBuilder, the unstarted register center)` |
+| Component | Register with | Finish with | You get back |
+|---|---|---|---|
+| Cron job | `.cron_job::<Job, _>()`, `.compose_cron_job(\|s\| …)` | `.start()` | `(ServiceBuilder, CronRuntime)` |
+| Event handler | `.iggy_consumer::<Handler, _, _>()`, `.compose_iggy_consumer(\|s\| …)` | `.start(client, config).await?` | `(ServiceBuilder, ConsumerRuntime)` |
+| gRPC service | `.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)`, `.compose_grpc_service(\|s\| …)` | `.into_router_fn()` | `(ServiceBuilder, impl FnOnce(Router<L>) -> Router<L>)` |
+| any of them | | `.into_parts()` | `(ServiceBuilder, the unstarted register center)` |
 
-Every registration method takes the builder **by value** and stores it in the returned register-center builder (as its public `builder` field), so the next registration can look up its dependency too. The finishing method returns it, and you pass it on to the next kind of component:
+Every registration method takes the builder **by value** and stores it in the returned register-center builder (as its public `builder` field), so the next registration can look up its dependencies too. The finishing method returns it, and you pass it on to the next kind of component:
 
 ```rust title="src/main.rs"
 let services = ServiceBuilder::new(AccountStore::default())
     .push(SessionStore::default())
+    .push(AuditLog::default())
     .push(Mailer::default());
 
 let (services, consumers) = services
@@ -152,14 +242,20 @@ let (services, consumers) = services
 
 let (services, add_grpc) = services
     .grpc_service::<AccountsServer<_>, AccountsService, _>(AccountsServer::new)
+    .compose_grpc_service(|s| {
+        AdminServer::new(AdminService {
+            store: s.provide::<AccountStore, _>().clone(),
+            audit: s.provide::<AuditLog, _>().clone(),
+        })
+    })
     .into_router_fn();
 
 let (_services, cron) = services.cron_job::<ExpireSessions, _>().start();
 ```
 
-Components are created **eagerly**, at the registration call: that is when `Dep` is cloned and `create_service` runs. The complete program, including the order in which these steps should run and how to stop everything, is on the [Lifecycle](/en/docs/core/lifecycle) page. Details of each register center are on [Cron jobs](/en/docs/services/cron-jobs), [gRPC](/en/docs/services/grpc), and [Consuming events](/en/docs/events/consuming).
+Components are created **eagerly**, at the registration call: that is when `Dep` is cloned and `create_service` runs, or when the closure runs. The complete program, including the order in which these steps should run and how to stop everything, is on the [Lifecycle](/en/docs/core/lifecycle) page. Details of each register center are on [Cron jobs](/en/docs/services/cron-jobs), [gRPC](/en/docs/services/grpc), and [Consuming events](/en/docs/events/consuming).
 
-`into_parts` is the escape hatch: it returns the builder and the register center separately, so you can `push` a component you built by hand onto the list before starting it.
+`into_parts` returns the builder and the unstarted register center separately, for code that starts the list later or extends it with `push` outside the chain. A component built by hand needs no `into_parts`: register it with the matching `compose_*` method.
 
 ## Duplicate types
 

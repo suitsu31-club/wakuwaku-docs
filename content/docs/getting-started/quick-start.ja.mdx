@@ -53,7 +53,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wakuwaku = "1.0.0-rc1"
+wakuwaku = "1.0.0-rc2"
 tokio = { version = "1.53", features = ["full"] }
 # Required by the code that tonic-prost-build generates.
 tonic = "0.14"
@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 共有依存を定義する
 
-wakuwaku のコンポーネントは、`ServiceBuilder` に登録された依存から組み立てられます。各コンポーネントが受け取る依存はちょうど 1 つなので、複数のものが必要な場合は構造体にまとめます。このサービスでは 2 つのコンポーネントがどちらもストアを必要とし、cron ジョブはさらに保持期間も必要とするため、両者で `AppState` を共有します。
+wakuwaku のコンポーネントは、`ServiceBuilder` に登録された依存から組み立てられます。`ServiceCreation` を実装するコンポーネントは、登録済みの依存を 1 つ `Dep` として指定します。複数の依存が必要なコンポーネントは、代わりに[クロージャで組み立てる](/ja/docs/core/service-builder#composing-components-with-a-closure)こともできます (`compose_cron_job`、`compose_grpc_service`)。このサービスでは 2 つのコンポーネントがどちらもストアを必要とし、cron ジョブはさらに保持期間も必要とするため、両者で `AppState` を共有します。
 
 ```rust title="src/state.rs"
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -196,7 +196,7 @@ cron ジョブは、定数 `INTERVAL` を持つ `CronTick` の [`Processor`](htt
 use std::convert::Infallible;
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 use crate::state::AppState;
 
@@ -231,11 +231,11 @@ impl Processor<CronTick> for PruneGuestbook {
 }
 
 impl CronJob for PruneGuestbook {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 ```
 
-このジョブは `SystemTime::now()` を呼ばずに `tick.fired_at` から現在時刻を読みます。こうすると「現在」をテスト側が決められるので、ジョブの結果が決定的になります。最初の実行はジョブの開始直後で、その後は `INTERVAL` ごとに 1 回実行されます。スケジュール、エラー、複数レプリカでの実行については [cron ジョブ](/ja/docs/services/cron-jobs) で説明しています。
+このジョブは `SystemTime::now()` を呼ばずに `tick.fired_at` から現在時刻を読みます。こうすると「現在」をテスト側が決められるので、ジョブの結果が決定的になります。最初の実行はジョブの開始直後です。その後 `CronJobInterval::AtLeast` は、実行の開始を少なくとも `INTERVAL` だけ空け、2 つの実行を重ねません。ほかのモードとして `AfterFinish` と `AfterStart` があります。スケジュール、エラー、複数レプリカでの実行については [cron ジョブ](/ja/docs/services/cron-jobs) で説明しています。
 
 </Step>
 <Step>
@@ -352,7 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `ServiceBuilder::new(state)` が `AppState` を登録します。依存を追加するには `.push(value)` を使います。
 - `.cron_job::<PruneGuestbook, _>()` は `PruneGuestbook::Dep` (`AppState`) を探し、クローンして `create_service` を呼び出します。`_` はビルダー内での依存の位置で、コンパイラが推論します。`.start()` はジョブを起動し、ビルダーと `CronRuntime` を返します。
 - `.grpc_service::<GuestbookServer<_>, GuestbookService, _>(GuestbookServer::new)` は gRPC の実装について同じことを行い、生成されたサーバーで包みます。`.into_router_fn()` は、登録済みのすべてのサーバーを tonic のルーターに追加する関数を返します。
-- Ctrl-C を受けると、`serve_with_shutdown` は新しい接続の受け付けをやめ、処理中のリクエストを完了させます。続いて `cron.shutdown().await` が実行中のジョブを最後まで走らせてから停止します。`shutdown` を呼ばずに `CronRuntime` を drop すると、ジョブは中断されます。
+- Ctrl-C を受けると、`serve_with_shutdown` は新しい接続の受け付けをやめ、処理中のリクエストを完了させます。続いて `cron.shutdown().await` がスケジュールを止め、実行中のジョブが終わるのを待ちます。実行が長引きうるなら `tokio::time::timeout` で上限を設けてください。`cron.abort().await` なら実行中のジョブをキャンセルし、`CronRuntime` を drop すると待たずに中断します。
 
 `AppState` の登録を消したり別の型を登録したりすると、プログラムはコンパイルできなくなります。エラーメッセージは、ビルダーが `ProvideAt<AppState, _>` を実装していない、つまりビルダーが `AppState` を保持していないことを示します。依存解決の仕組みは [サービスビルダー](/ja/docs/core/service-builder) で説明しています。
 

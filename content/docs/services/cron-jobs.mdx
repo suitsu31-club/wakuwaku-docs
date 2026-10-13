@@ -1,12 +1,12 @@
 ---
 title: Cron jobs
-description: Run local jobs at a fixed interval, built from the ServiceBuilder, on a schedule that never overlaps and keeps going through errors and panics.
+description: Run local jobs on an interval, built from the ServiceBuilder, with three ways to space the runs and a schedule that keeps going through errors and panics.
 icon: Clock
 ---
 
-Most "cron" work in a microservice is a scan: expire stale sessions, retry stuck work, reconcile a search index. A [`CronJob`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/trait.CronJob.html) is exactly that: a [`Processor`](https://docs.rs/kanau/0.6/kanau/processor/trait.Processor.html) of [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html)s with a fixed `INTERVAL`. The interval is a constant of the job type, not a calendar expression: there is no "every day at 03:00" syntax.
+Most "cron" work in a microservice is a scan: expire stale sessions, retry stuck work, reconcile a search index. A [`CronJob`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/trait.CronJob.html) is exactly that: a [`Processor`](https://docs.rs/kanau/0.6/kanau/processor/trait.Processor.html) of [`CronTick`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronTick.html)s with a constant `INTERVAL`, a [`CronJobInterval`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/enum.CronJobInterval.html) that says how its runs are spaced. The interval is a constant of the job type, not a calendar expression: there is no "every day at 03:00" syntax.
 
-If you come from Spring, the closest thing is `@Scheduled(fixedRate = ...)` on a bean method. The differences are covered below: a run that takes too long skips the runs it covered instead of queueing them, and every replica of the service runs every job.
+If you come from Spring, the closest thing is `@Scheduled` on a bean method, and the three kinds of interval map onto its options: `AfterFinish` is `fixedDelay`, `AtLeast` is `fixedRate` without overlapping runs, and `AfterStart` is `fixedRate` with `@Async`. One difference is covered [below](#running-on-several-replicas): every replica of the service runs every job.
 
 ## Defining a job
 
@@ -22,7 +22,7 @@ The job must also be `Send + Sync + 'static`, because it runs on its own Tokio t
 use std::time::Duration;
 
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 pub struct ExpireSessions {
     store: SessionStore,
@@ -48,7 +48,7 @@ impl Processor<CronTick> for ExpireSessions {
 }
 
 impl CronJob for ExpireSessions {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 ```
 
@@ -89,7 +89,7 @@ Each run receives a `CronTick`:
 | `run` | `u64` | Number of earlier runs of this job since its runtime started: `0` for the first run. |
 | `fired_at` | `SystemTime` | Wall-clock time when the run started. |
 
-`run` counts runs that actually happened. Grid points skipped because of an overrun (see [The schedule](#the-schedule)) are not counted, so `run` is not "time since start divided by the interval". It is good for things like "do a full pass every Nth run":
+`run` counts runs that actually happened. How far apart they are depends on the [interval kind](#the-schedule) and on how long runs take, and `AfterStart` does not count grid points it had to skip, so `run` is not "time since start divided by the interval". It is good for things like "do a full pass every Nth run":
 
 ```rust
 impl Processor<CronTick> for ReindexSearch {
@@ -110,7 +110,7 @@ impl Processor<CronTick> for ReindexSearch {
 }
 
 impl CronJob for ReindexSearch {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(60 * 60));
 }
 ```
 
@@ -134,6 +134,7 @@ cron.shutdown().await;
 ```
 
 - `Position` is `_` unless the `Dep` type is registered more than once (then use `Here` / `There`, see [The service builder](/en/docs/core/service-builder)). A `Dep` that was never registered is a compile error.
+- A job that needs several registered values is registered with `compose_cron_job` instead; see [Jobs built from several services](#jobs-built-from-several-services).
 - `start` spawns **one Tokio task per job** and returns the service builder together with a [`CronRuntime`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html). It must be called inside a Tokio runtime; outside one it panics.
 - Jobs are stored in a type-level list, like gRPC servers and the service builder itself: no boxing, no dynamic dispatch.
 
@@ -141,19 +142,40 @@ cron.shutdown().await;
 
 <CronScheduleDiagram lang="en" />
 
-Each job runs on its own grid, `start + k × INTERVAL`, where `start` is the moment `start` was called.
+**Every job's first run is at `start`**, the moment `start` was called, not one interval later. After that, the variant of `INTERVAL` decides when the next run starts, for its duration `d`:
 
-- **The first run is at `start`**, not one interval later.
-- **Runs of one job never overlap.** A run that takes longer than `INTERVAL` skips the grid points it covered; the next run is at the first grid point that is not before the run ended. If a run ends exactly on a grid point, the next run starts right away.
-- So two consecutive runs always start a whole, non-zero number of intervals apart, and the schedule never drifts.
+| `INTERVAL` | The next run starts | Runs of the job overlap | Spring |
+| --- | --- | --- | --- |
+| `AfterFinish(d)` | `d` after the previous run **finished** | never | `fixedDelay` |
+| `AtLeast(d)` | `d` after the previous run **started**, or as soon as it finished if that is later | never | `fixedRate`, without overlap |
+| `AfterStart(d)` | on the grid `start + k × d`, whatever the previous run is doing | yes | `fixedRate` with `@Async` |
 
-For example, with a 10-second interval and a first run that takes 25 seconds, runs start at 0 s, 30 s, 40 s, 50 s, … The points at 10 s and 20 s are skipped, not queued.
+The three only differ once a run takes a while. In the diagram, the first run takes `2.5·d` and every later run `0.25·d`:
+
+| `INTERVAL` | Runs start at | |
+| --- | --- | --- |
+| `AfterFinish(d)` | 0, 3.5·d, 4.75·d, 6·d, … | Always a pause of `d` between runs, so starts are `d` + run time apart. |
+| `AtLeast(d)` | 0, 2.5·d, 3.5·d, 4.5·d, … | The overrun is followed at once, then the job is back to one run per `d`. |
+| `AfterStart(d)` | 0, d, 2·d, 3·d, … | The runs at `d` and `2·d` start while the first is still going. |
 
 Different jobs are independent: a slow `ReindexSearch` never delays `ExpireSessions`.
 
+### Choosing an interval
+
+**`AtLeast(d)`: at most one run per `d`, never two at once.** This is the usual choice for a scan that should run "about every `d`". A run that overruns delays the next one instead of piling up a backlog: the next run starts as soon as it finished, then the job is back on its pace. Consecutive starts are at least `d` apart on the monotonic clock, so their `fired_at` are too, unless the wall clock is adjusted in between.
+
+**`AfterFinish(d)`: a guaranteed pause between runs.** The time between two starts is `d` plus the run time, so the schedule drifts by every run's duration. What you get in exchange is rest for whatever the job puts load on: a database or a rate-limited API always gets `d` of quiet after a run, however long that run was. Choose it for work that drains a backlog in batches, or whose run time grows with load.
+
+**`AfterStart(d)`: a fixed grid, runs may overlap.** Every grid point starts a run in its own task, whether the previous run has finished or not. Choose it when timing matters more than exclusivity, such as sampling or a heartbeat that must not slip because one run was slow. Keep in mind:
+
+- The job runs concurrently with itself. `process` takes `&self`, so any state it shares between runs needs synchronization, and the work itself must tolerate two runs at once.
+- If runs keep taking longer than `d`, they keep accumulating: nothing bounds how many run at once.
+- Grid points missed because the runtime was blocked (for example by blocking code on a worker thread) are skipped, not run in a burst, and `run` does not count them.
+- `fired_at` includes the wake-up delay, so two consecutive `fired_at` can be slightly **less** than `d` apart. That matters for [fences across replicas](#once-per-interval-across-replicas).
+
 ### Errors and panics
 
-A run that returns `Err` is logged with [`tracing`](https://docs.rs/tracing) at error level (`cron job failed`, with the error's `Display` output). A run that **panics** is caught and logged as well (`cron job panicked`, with the panic message). In both cases the job keeps its schedule: the next run happens at the next grid point as usual.
+A run that returns `Err` is logged with [`tracing`](https://docs.rs/tracing) at error level (`cron job failed`, with the error's `Display` output). A run that **panics** is caught and logged as well (`cron job panicked`, with the panic message). In both cases the job keeps its schedule: the next run starts when its interval says, as if the run had succeeded.
 
 Every run executes inside a `cron_job` tracing span with the fields `job` (the job's type name) and `run`, so everything your job logs can be traced back to the run. Install a `tracing` subscriber in `main` to see these logs.
 
@@ -163,11 +185,11 @@ Catching a panic relies on unwinding. If your release profile sets `panic = "abo
 
 ## A zero interval does not build
 
-An `INTERVAL` of zero has no schedule, so registering such a job is rejected at compile time. Here `Busy` implements `ServiceCreation` and `Processor<CronTick>` as usual:
+A duration of zero, in any of the three variants, has no schedule, so registering such a job is rejected at compile time. Here `Busy` implements `ServiceCreation` and `Processor<CronTick>` as usual:
 
 ```rust
 impl CronJob for Busy {
-    const INTERVAL: Duration = Duration::ZERO; // no schedule
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::ZERO); // no schedule
 }
 
 #[tokio::main]
@@ -183,9 +205,9 @@ async fn main() {
 
 ```text
 error[E0080]: evaluation panicked: CronJob::INTERVAL must not be zero
-   --> wakuwaku/src/services/cron_job.rs:250:17
+   --> wakuwaku/src/services/cron_job.rs:300:17
     |
-250 |         const { assert_interval::<Job>() };
+300 |         const { assert_interval::<Job>() };
     |                 ^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `wakuwaku::services::cron_job::CronRegisterCenter::<Busy>::new::{constant#0}` failed inside this call
 ...
 note: the above error was encountered while instantiating `fn CronRegisterCenter::<Busy>::new`
@@ -199,7 +221,7 @@ The check is a `const` assertion that is evaluated when the registration is inst
 
 ## Running on several replicas
 
-Jobs run **locally**: every process that starts a job runs it. With three replicas of a service, each run happens three times, and because each replica's grid starts when that replica started, the three runs are not aligned in time.
+Jobs run **locally**: every process that starts a job runs it. With three replicas of a service, each run happens three times, and because each replica's schedule starts when that replica started, the three runs are not aligned in time.
 
 Design each job for that. In order of preference:
 
@@ -217,7 +239,7 @@ use wakuwaku::deps::redis::RedisError;
 use wakuwaku::entity::redis::RedisSource;
 use wakuwaku::entity::redis::collection::lock::Lock;
 use wakuwaku::entity::{Db, ReadWrite};
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 /// One lock per job name. The lease must outlast a run.
 const CRON_LOCKS: Lock<str> = Lock::new("cron", Duration::from_secs(5 * 60));
@@ -252,22 +274,40 @@ impl Processor<CronTick> for SendDailyDigest {
 }
 
 impl CronJob for SendDailyDigest {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60 * 60));
 }
 ```
 
 Acquiring never waits: `try_lock` outputs `Some(token)` if the lock was free and `None` otherwise. The lease (the lock's TTL) is what frees the lock if the holder crashes, so work that may outlive it must call `token.extend()`.
 
 <Callout type="warn" title="A lock prevents overlap, not repetition">
-Releasing the lock at the end of the run only guarantees that two replicas never run the job **at the same time**. Because the replicas' grids are offset, another replica may take the free lock a few seconds later and run the job again in the same interval. If the job must run about once per interval across all replicas, do not release the lock: set the lease a little shorter than `INTERVAL` and let it run out, so the lock itself records "someone ran this recently". The work must then finish well within the lease.
+Releasing the lock at the end of the run only guarantees that two replicas never run the job **at the same time**. Because the replicas' schedules are offset, another replica may take the free lock a few seconds later and run the job again in the same interval.
 </Callout>
 
-## Jobs that need several dependencies
+### Once per interval across replicas
 
-As with gRPC servers, a job built by `cron_job` gets **one** registered value. Either register a struct that bundles what the job needs and use it as `Dep`, or build the job by hand: end the chain with `into_parts`, which returns the service builder and the unstarted [`CronRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRegisterCenter.html), then `push` the job and `start`:
+To run each pass about once per `d` across all replicas, let a run **claim** the pass in shared storage with a fence on `fired_at`: the run goes ahead only if it can atomically record its own `fired_at` and the last recorded one is at least `d` earlier. In SQL, with one row per job:
+
+```sql
+-- $1 = job name, $2 = the tick's fired_at.
+-- The run goes ahead only if this changes a row
+-- (seed each job's row with an old last_fired_at).
+UPDATE cron_claims
+SET    last_fired_at = $2
+WHERE  job = $1
+  AND  last_fired_at <= $2 - INTERVAL '1 hour';
+```
+
+The Redis lock can play the same role: do not release it, and set its lease a little shorter than `d`, so the lock itself records "someone ran this recently". The work must then finish well within the lease.
+
+Use `AfterFinish` or `AtLeast` for a fenced job. Their consecutive `fired_at` on one replica are at least `d` apart, so a replica never fences out its own next run. `AfterStart` runs can fire slightly less than `d` apart, and the fence would then reject a run that should have gone ahead, skipping a whole pass.
+
+## Jobs built from several services
+
+`cron_job` builds a job from **one** registered value, its `Dep`. A job that needs several registered values, or that you build by hand, is registered with `compose_cron_job`: the closure borrows the service builder, `provide`s whatever it needs, and returns the job (see [Composing components with a closure](/en/docs/core/service-builder#composing-components-with-a-closure)). The job needs no `ServiceCreation` impl and is not registered as a service. `cron_job` and `compose_cron_job` chain freely:
 
 ```rust
-/// Needs two registered values, so it is built by hand.
+/// Needs two registered values, so it is composed.
 pub struct ReconcileIndex {
     store: SessionStore,
     index: SearchIndex,
@@ -275,19 +315,17 @@ pub struct ReconcileIndex {
 ```
 
 ```rust title="src/main.rs"
-let (services, jobs) = ServiceBuilder::new(SessionStore::default())
+let (services, cron) = ServiceBuilder::new(SessionStore::default())
     .push(SearchIndex::default())
     .cron_job::<ExpireSessions, _>()
-    .into_parts();
-
-let reconcile = ReconcileIndex {
-    store: services.provide::<SessionStore, _>().clone(),
-    index: services.provide::<SearchIndex, _>().clone(),
-};
-let cron = jobs.push(reconcile).start();
+    .compose_cron_job(|s| ReconcileIndex {
+        store: s.provide::<SessionStore, _>().clone(),
+        index: s.provide::<SearchIndex, _>().clone(),
+    })
+    .start();
 ```
 
-A hand-built job still implements `Processor<CronTick>` and `CronJob`; it only skips `ServiceCreation`. `CronRegisterCenter` also works without a service builder at all:
+A composed job still implements `Processor<CronTick>` and `CronJob`; it only skips `ServiceCreation`. To start the jobs later, end the chain with `into_parts` instead of `start`: it returns the service builder and the unstarted [`CronRegisterCenter`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRegisterCenter.html). `CronRegisterCenter` also works without a service builder at all:
 
 ```rust
 use wakuwaku::services::cron_job::CronRegisterCenter;
@@ -303,14 +341,15 @@ cron.shutdown().await;
 
 ## Shutting down
 
-`CronRuntime` gives you two ways to stop the jobs:
+`CronRuntime` gives you three ways to stop the jobs:
 
 | | What happens |
 | --- | --- |
-| `cron.shutdown().await` | No new runs are scheduled. Jobs waiting for their next grid point stop at once; a run in progress is allowed to **finish**. Returns when every job has stopped. |
-| dropping `cron` | Every job is **aborted**, including runs in progress, at their next `.await`. |
+| `cron.shutdown().await` | **Graceful.** No new runs start, and jobs waiting for their next run stop at once. Runs in progress, including every overlapping `AfterStart` run, are allowed to **finish**. Returns when every job has stopped. |
+| `cron.abort().await` | Runs in progress are **cancelled** at their next `.await`, possibly midway through their side effects. Returns when every job has stopped. |
+| dropping `cron` | Like `abort`, without waiting. |
 
-Prefer `shutdown`, so a job is never cut off in the middle of a batch. Since `shutdown` waits for the run in progress, a run that hangs would block it forever; bound it with a timeout if that matters:
+Prefer `shutdown`, so a job is never cut off in the middle of a batch. `shutdown` waits as long as the runs take, so a run that hangs would block it forever; bound it with a timeout if that matters:
 
 ```rust
 if tokio::time::timeout(Duration::from_secs(30), cron.shutdown()).await.is_err() {
@@ -378,7 +417,8 @@ async fn the_first_run_happens_at_start() {
         .cron_job::<ExpireSessions, _>()
         .start();
 
-    tokio::time::sleep(ExpireSessions::INTERVAL / 2).await;
+    // Half of the 60-second interval: only the first run has happened.
+    tokio::time::sleep(Duration::from_secs(30)).await;
     cron.shutdown().await;
 
     assert_eq!(store.expired.load(Ordering::Relaxed), 1);

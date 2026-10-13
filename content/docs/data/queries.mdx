@@ -9,7 +9,7 @@ This page builds the data access of a small user service on PostgreSQL. It defin
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -34,7 +34,7 @@ impl Entity for Post {}
 A query implements two traits:
 
 - [`Query`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Query.html) says **what it touches**: its `Effect`. This part doesn't depend on where the query runs, so capability checks and [hooks](/en/docs/data/hooks) work the same for every data source.
-- [`Execute<S>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html) says **how it runs** on the data source `S`: its `Output`, and the code that runs on a connection. A query written in portable SQL may implement it for several sources.
+- [`Execute<S>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html) says **how it runs** on the data source `S`: its `Output`, its `Error`, and the code that runs on a connection. A query written in portable SQL may implement it for several sources.
 
 ```rust title="src/queries.rs"
 use crate::entities::{Post, User};
@@ -59,6 +59,7 @@ impl Query for FindUser {
 
 impl Execute<PgSource> for FindUser {
     type Output = Option<UserRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
         let row: Option<(i64, String)> = sqlx::query_as("SELECT id, name FROM users WHERE id = $1")
@@ -70,7 +71,7 @@ impl Execute<PgSource> for FindUser {
 }
 ```
 
-`execute` receives a plain `&mut PgConnection` and returns the data source's error type, `sqlx::Error` for sqlx sources. When the query runs on its own, the connection comes from the pool in autocommit mode. Inside a [transaction](/en/docs/data/transactions), it is the transaction's connection. The same query works in both places.
+`execute` receives a plain `&mut PgConnection` and returns the query's `Error`. A query that can only fail the way the database fails uses the data source's error, `sqlx::Error` for sqlx sources; a query that can also refuse on its own declares [its own error type](#own-error-type). When the query runs on its own, the connection comes from the pool in autocommit mode. Inside a [transaction](/en/docs/data/transactions), it is the transaction's connection. The same query works in both places.
 
 A query that touches several entities lists them all. A tuple is the union of its effects:
 
@@ -87,6 +88,7 @@ impl Query for PostsByAuthor {
 
 impl Execute<PgSource> for PostsByAuthor {
     type Output = Vec<String>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar(
@@ -116,6 +118,7 @@ impl Query for RenameUser {
 impl Execute<PgSource> for RenameUser {
     /// Rows affected.
     type Output = u64;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
         let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
@@ -134,7 +137,7 @@ The compiler checks the effect you declare, not the SQL you write. A query decla
 
 ## Data sources
 
-A [`DataSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.DataSource.html) is anything that can run queries: a connection pool, a multiplexed client. It fixes the connection type that queries receive and the error they return:
+A [`DataSource`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.DataSource.html) is anything that can run queries: a connection pool, a multiplexed client. It fixes the connection type that queries receive and its own error type, which every query's `Error` must be convertible from:
 
 ```rust
 pub trait DataSource: Send + Sync + Sized {
@@ -144,18 +147,20 @@ pub trait DataSource: Send + Sync + Sized {
     fn run<Q: Execute<Self>>(
         &self,
         query: Q,
-    ) -> impl Future<Output = Result<Q::Output, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Q::Output, Q::Error>> + Send;
 }
 ```
 
+`run` returns the query's own result. If the source fails before the query starts, for example because no connection could be acquired, that error is converted into `Q::Error` through `From<Self::Error>`.
+
 You rarely implement it yourself. wakuwaku provides one per backend:
 
-| Source | Feature | Connection | Error |
+| Source | Feature | Connection | Source error |
 |---|---|---|---|
 | `entity::sqlx::backend::PgSource` | `sqlx-pg` | `PgConnection` | `sqlx::Error` |
 | `entity::sqlx::backend::MySqlSource` | `sqlx-mysql` | `MySqlConnection` | `sqlx::Error` |
-| `entity::redis::RedisSource` | `redis` | see [Redis](/en/docs/data/redis) | |
-| `entity::meilisearch::MeiliSource` | `meilisearch` | see [Meilisearch](/en/docs/data/meilisearch) | |
+| `entity::redis::RedisSource` | `redis` | see [Redis](/en/docs/data/redis) | `redis::RedisError` |
+| `entity::meilisearch::MeiliSource` | `meilisearch` | see [Meilisearch](/en/docs/data/meilisearch) | `meilisearch_sdk::errors::Error` |
 
 `PgSource` is an alias for `SqlxSource<Postgres>`. Each query run on its own acquires a connection from the pool.
 
@@ -164,13 +169,15 @@ You rarely implement it yourself. wakuwaku provides one per backend:
 A `Db<S, C>` owns a data source `S` and has a capability `C`. The capability is only a type parameter, so you choose it when you build the handle. A service with a primary and a read replica builds two handles:
 
 ```rust title="src/wiring.rs"
-use crate::queries::{DeactivateUsers, DormantUsers, FindUser, PostsByAuthor, RenameUser, UserRow};
+use crate::queries::{
+    DeactivateUsers, DormantUsers, EditPostError, EditPostTitle, FindUser, PostsByAuthor, RenameUser, UserRow,
+};
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
 use wakuwaku::deps::sqlx::{self, postgres::PgPoolOptions};
 use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
 use wakuwaku::entity::{Db, ReadOnly, ReadWrite};
-use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceBuilder};
 
 /// The two handles of the service: writes go to the primary,
 /// reads that tolerate replication lag go to the replica.
@@ -211,7 +218,7 @@ pub async fn run_one(dbs: &Databases) -> Result<(), sqlx::Error> {
 }
 ```
 
-`process` returns the query's `Output`, or the data source's `Error`.
+`process` returns the query's `Output`, or the query's `Error`.
 
 ## Keep handlers generic over the handle
 
@@ -248,6 +255,95 @@ The capability is then checked once, where the handle is passed in. This also me
 
 - A handler accepts any processor of its queries: a `Db`, a `Db` wrapped in [write hooks](/en/docs/data/hooks), or a fake in a [unit test](/en/docs/core/testing).
 - With several `Processor` bounds, pin `Output` and `Error` in each bound as above, so that `db.process(...)` has an unambiguous result type.
+
+## A query's own error type [#own-error-type]
+
+Some queries can fail for reasons of their own, not only because the database failed. An update guarded by an optimistic lock finds that someone else changed the row first; a withdrawal would overdraw the account. Such a refusal is a failure of the operation, so it belongs in the query's `Error`, not in its `Output`.
+
+Putting it in the `Output` (`Output = bool`, or `Output = Result<Post, Conflict>`) works, but every caller then has to check the result a second time after the `?`, and a caller that forgets compiles fine and treats the refusal as success. With its own error type, the refusal travels like any other error: `?` propagates it and a `match` handles it.
+
+The only requirement is `type Error: From<S::Error>`, so that the data source's errors fit into it. Here a `posts` row carries a `version` column, and an edit applies only to the version the client last read:
+
+```rust title="src/queries.rs"
+/// Why an edit of a post failed.
+#[derive(Debug)]
+pub enum EditPostError {
+    /// The post changed, or was deleted, since `version` was read.
+    Stale,
+    /// The database failed.
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for EditPostError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+/// Change a post's title, if nobody changed the post since `version` was read.
+pub struct EditPostTitle {
+    pub id: i64,
+    pub version: i64,
+    pub title: String,
+}
+
+impl Query for EditPostTitle {
+    type Effect = Write<Post>;
+}
+
+impl Execute<PgSource> for EditPostTitle {
+    /// The new version of the post.
+    type Output = i64;
+    type Error = EditPostError;
+
+    async fn execute(self, conn: &mut PgConnection) -> Result<i64, EditPostError> {
+        let version: Option<i64> = sqlx::query_scalar(
+            "UPDATE posts SET title = $3, version = version + 1 \
+             WHERE id = $1 AND version = $2 RETURNING version",
+        )
+        .bind(self.id)
+        .bind(self.version)
+        .bind(self.title)
+        .fetch_optional(conn)
+        .await?; // sqlx::Error -> EditPostError::Database
+        version.ok_or(EditPostError::Stale)
+    }
+}
+```
+
+`Db::process` returns `Result<i64, EditPostError>`, so the caller decides what each failure means in one place:
+
+```rust title="src/wiring.rs"
+pub async fn save_title(dbs: &Databases, id: i64, version: i64, title: String) -> Result<Option<i64>, sqlx::Error> {
+    match dbs.primary.process(EditPostTitle { id, version, title }).await {
+        Ok(new_version) => Ok(Some(new_version)),
+        // Someone else won: tell the client to reload and retry.
+        Err(EditPostError::Stale) => Ok(None),
+        Err(EditPostError::Database(error)) => Err(error),
+    }
+}
+```
+
+A function that returns `EditPostError` can also `?` queries whose error is `sqlx::Error`, through the same `From` impl. Hooks don't change any of this: a [hooked handle](/en/docs/data/hooks) returns the query's error unchanged.
+
+<Callout type="info" title="Inside a transaction">
+A query run inside a [transaction](/en/docs/data/transactions) must have an error that implements [`AsSqlxError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.AsSqlxError.html). It tells the transaction whether the error came from the database, which may have aborted the transaction, or is the query's own, which never does. `sqlx::Error` implements it; for your own error type, return the wrapped `sqlx::Error`:
+
+```rust title="src/queries.rs"
+use wakuwaku::entity::sqlx::transaction::AsSqlxError;
+
+impl AsSqlxError for EditPostError {
+    fn as_sqlx_error(&self) -> Option<&sqlx::Error> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::Stale => None,
+        }
+    }
+}
+```
+
+See [errors inside a transaction](/en/docs/data/transactions#errors-inside-a-transaction).
+</Callout>
 
 ## Route reads to the replica and writes to the primary
 
@@ -301,22 +397,15 @@ If a component should write only some entities, give it a [custom capability](/e
 
 ## Inject the handles into components
 
-Handles are ordinary values, so they go into the [`ServiceBuilder`](/en/docs/core/service-builder) like any other shared dependency. A component implements [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) with one `Dep` type. A component that needs both handles therefore uses the `Databases` struct as its dependency (it derives `Clone`, which `Dep` requires).
+Handles are ordinary values, so they go into the [`ServiceBuilder`](/en/docs/core/service-builder) like any other shared dependency. `Db<PgSource, ReadOnly>` and `Db<PgSource, ReadWrite>` are different types, so register both and let each component take the ones it needs.
 
 This [cron job](/en/docs/services/cron-jobs) finds dormant users on the replica and deactivates them on the primary:
 
 ```rust title="src/wiring.rs"
 /// Deactivate users that haven't signed in for a year.
 pub struct DeactivateDormantUsers {
-    dbs: Databases,
-}
-
-impl ServiceCreation for DeactivateDormantUsers {
-    type Dep = Databases;
-
-    fn create_service(dbs: Databases) -> Self {
-        Self { dbs }
-    }
+    replica: Db<PgSource, ReadOnly>,
+    primary: Db<PgSource, ReadWrite>,
 }
 
 impl Processor<CronTick> for DeactivateDormantUsers {
@@ -324,20 +413,20 @@ impl Processor<CronTick> for DeactivateDormantUsers {
     type Error = sqlx::Error;
 
     async fn process(&self, _tick: CronTick) -> Result<(), sqlx::Error> {
-        let ids = self.dbs.replica.process(DormantUsers { days: 365 }).await?;
+        let ids = self.replica.process(DormantUsers { days: 365 }).await?;
         if !ids.is_empty() {
-            self.dbs.primary.process(DeactivateUsers { ids }).await?;
+            self.primary.process(DeactivateUsers { ids }).await?;
         }
         Ok(())
     }
 }
 
 impl CronJob for DeactivateDormantUsers {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AfterFinish(Duration::from_secs(60 * 60));
 }
 ```
 
-`DormantUsers` (`Read<User>`) and `DeactivateUsers` (`Write<User>`) are defined like the queries above. Register the handles and the job:
+`DormantUsers` (`Read<User>`) and `DeactivateUsers` (`Write<User>`) are defined like the queries above. Register the handles, then build the job from both of them:
 
 ```rust title="src/wiring.rs"
 pub async fn start() -> Result<(), sqlx::Error> {
@@ -347,24 +436,29 @@ pub async fn start() -> Result<(), sqlx::Error> {
     )
     .await?;
 
-    let (services, cron) = ServiceBuilder::new(dbs)
-        .cron_job::<DeactivateDormantUsers, _>()
+    let (services, cron) = ServiceBuilder::new(dbs.primary.clone())
+        .push(dbs.replica.clone())
+        .compose_cron_job(|s| DeactivateDormantUsers {
+            replica: s.provide::<Db<PgSource, ReadOnly>, _>().clone(),
+            primary: s.provide::<Db<PgSource, ReadWrite>, _>().clone(),
+        })
         .start();
 
     // Everything else gets the handles from the builder too.
-    let dbs: &Databases = services.provide::<Databases, _>();
-    handle_requests(dbs).await?;
+    let replica: &Db<PgSource, ReadOnly> = services.provide::<Db<PgSource, ReadOnly>, _>();
+    let _profile = load_profile(replica, 7).await?;
+    handle_requests(&dbs).await?;
 
     cron.shutdown().await;
     Ok(())
 }
 ```
 
-`ServiceBuilder::cron_job` clones the `Databases` out of the builder and calls `create_service`. gRPC services are built the same way with `grpc_service` (see [gRPC services](/en/docs/services/grpc)). `Db<PgSource, ReadOnly>` and `Db<PgSource, ReadWrite>` are different types, so you could also register them separately and look each one up by its type.
+`compose_cron_job` lends the closure the builder, so a component can take any number of registered handles; it needs no `ServiceCreation` impl. A component that needs a single handle can implement [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) with that handle as its `Dep` and be registered with `cron_job`. gRPC services and event consumers have the same pair of methods; see [ServiceBuilder](/en/docs/core/service-builder). Cloning a handle only clones the pool handle, so every component can hold its own copy.
 
 <Accordions>
   <Accordion title="Why are queries values instead of repository methods?">
-    A value can be inspected before it runs. Its type carries the `Effect` the compiler checks, a hook can describe it as a change, and a transaction can hold it as its next step. A handler that takes `D: Processor<FindUser>` depends on exactly the operations it uses, so you can replace the handle with a small fake in tests without mocking a whole repository.
+    A value can be inspected before it runs. Its type carries the `Effect` the compiler checks, and a hook can describe it as a change. The same value runs on its own through a `Db` or inside a [transaction](/en/docs/data/transactions), and its `Output` and `Error` stay its own in both places. A handler that takes `D: Processor<FindUser>` depends on exactly the operations it uses, so you can replace the handle with a small fake in tests without mocking a whole repository.
   </Accordion>
   <Accordion title="Why is the capability a type parameter and not a runtime flag?">
     A runtime flag can only fail at runtime, after the write has been routed. A type parameter makes a misrouted write a compile error at the exact call that passes the wrong handle, and it costs nothing at runtime: `Db<S, C>` stores only `S`.

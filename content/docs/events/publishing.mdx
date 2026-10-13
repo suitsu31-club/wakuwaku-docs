@@ -4,7 +4,7 @@ description: Send typed events to Iggy with Publisher, understand the headers it
 icon: Send
 ---
 
-Publishing is one type and one method: [`Publisher`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/publisher/struct.Publisher.html) and `publish`. Everything else (topic, partition, headers, encoding) comes from the event type you defined in [Defining events](/en/docs/events/defining-events).
+Publishing is one type and two methods: [`Publisher`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/events/publisher/struct.Publisher.html), with `publish` for one event and `publish_batch` for many events of one type. Everything else (topic, partition, headers, encoding) comes from the event type you defined in [Defining events](/en/docs/events/defining-events).
 
 ## Create a publisher and publish
 
@@ -49,26 +49,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 3. builds one Iggy message with the body as payload and the [wakuwaku headers](#headers-on-the-wire);
 4. sends it to the stream, to the topic named by the key type's `SUPER_PARTITION_NAME`, partitioned by the key hash as Iggy message key.
 
-Every event of one key therefore lands in the same partition, in publish order. Each `publish` call sends exactly one message; there is no client-side batching.
+Every event of one key therefore lands in the same partition, in publish order. Each `publish` call sends exactly one message; to send many events in fewer requests, use [`publish_batch`](#publishing-many-events-at-once).
+
+## Publishing many events at once
+
+`publish_batch(events)` publishes any number of events of **one** event type in as few requests as their keys allow:
+
+```rust title="src/settlement.rs"
+use wakuwaku::iggy::Publisher;
+use wakuwaku::iggy::error::Error;
+
+/// Record the payments of a settlement file.
+pub async fn import_settlement(publisher: &Publisher) -> Result<(), Error> {
+    publisher
+        .publish_batch([
+            PaymentReceived { order_id: 42, amount_cents: 5_000 },
+            PaymentReceived { order_id: 43, amount_cents: 1_000 },
+            PaymentReceived { order_id: 42, amount_cents: 7_000 },
+        ])
+        .await
+}
+```
+
+The events are grouped by key hash, and each group is sent in one request. Here that is two requests: order 42's two payments (5 000, then 7 000), then order 43's payment. The rules:
+
+- **Order per key is kept.** Within a group, events keep their order in `events`, so a key's events land in its partition in that order. Groups are sent one after another, in the order their key first appears. Events of different keys were never ordered against each other, so nothing else is promised.
+- **Serialization is all or nothing.** Every event is serialized and built into a message before anything is sent. If one fails, the call returns the error and nothing is published.
+- **A send error stops the batch partway.** The groups before the failing one are already published; the failing group and the ones after it are not. The error doesn't tell you where it stopped.
+- **Nothing is retried**, as with `publish`.
+
+Use it when one operation produces many events of a type: an import, a backfill, a command that touches many keys. It saves a round trip per event, and a key's events still arrive in order. Retrying the whole call after a send error publishes the earlier groups a second time, which is harmless when handlers are idempotent (as `NoEventLose` already requires, see [Delivery modes](/en/docs/events/consuming#delivery-modes)). For events of different types, make one call per type, awaiting each before the next if their order within a key matters.
 
 ## Sharing a publisher
 
-`Publisher` is `Send + Sync` but not `Clone`. Create it once at startup, wrap it in an `Arc`, and register it in the [`ServiceBuilder`](/en/docs/core/service-builder) so components can take it as their dependency:
+`Publisher` is `Clone`, and clones are cheap: they share the same `IggyClient`. Create it once at startup and register it in the [`ServiceBuilder`](/en/docs/core/service-builder) so components can take it as their dependency:
 
 ```rust title="src/checkout.rs"
-use std::sync::Arc;
 use wakuwaku::ServiceCreation;
 use wakuwaku::iggy::Publisher;
 use wakuwaku::iggy::error::Error;
 
-/// A component that publishes events. `Arc<Publisher>` is its dependency.
+/// A component that publishes events. `Publisher` is its dependency.
 pub struct Checkout {
-    publisher: Arc<Publisher>,
+    publisher: Publisher,
 }
 
 impl ServiceCreation for Checkout {
-    type Dep = Arc<Publisher>;
-    fn create_service(publisher: Arc<Publisher>) -> Self {
+    type Dep = Publisher;
+    fn create_service(publisher: Publisher) -> Self {
         Self { publisher }
     }
 }
@@ -88,7 +116,7 @@ impl Checkout {
 ```
 
 ```rust title="src/main.rs"
-let publisher = Arc::new(Publisher::new(client.clone(), "shop")?);
+let publisher = Publisher::new(client.clone(), "shop")?;
 let services = ServiceBuilder::new(client).push(publisher);
 ```
 
@@ -164,14 +192,14 @@ Reading the topic name from `SUPER_PARTITION_NAME` keeps the setup and the event
 
 ## Errors
 
-`Publisher::new` and `publish` return [`wakuwaku::iggy::error::Error`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.Error.html). The variants you can get from publishing are:
+`Publisher::new`, `publish` and `publish_batch` return [`wakuwaku::iggy::error::Error`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/error/enum.Error.html). The variants you can get from publishing are:
 
 | Variant | Cause |
 |---|---|
 | `Error::Iggy` | the stream or topic name is not a valid identifier, the message cannot be built, or the send fails (server unreachable, topic missing, permission denied, …) |
 | `Error::Serialize` | the body's `MessageSer::to_bytes` failed |
 
-The send is **not retried**. When `publish` returns an error, the event was not written as far as wakuwaku knows, and it is up to you whether to retry, fail the request, or surface the error. `publish` writes one message to Iggy and nothing else; if the event must be published exactly when a database transaction commits, that coordination is your code's responsibility.
+Sends are **not retried**. When `publish` returns an error, the event was not written as far as wakuwaku knows, and it is up to you whether to retry, fail the request, or surface the error (for `publish_batch`, see [what a send error leaves behind](#publishing-many-events-at-once)). Publishing writes to Iggy and nothing else; if the event must be published exactly when a database transaction commits, that coordination is your code's responsibility.
 
 ## Next steps
 

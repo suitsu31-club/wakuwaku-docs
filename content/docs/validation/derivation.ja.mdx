@@ -141,7 +141,7 @@ let twice: Proven<String, And<NonEmpty, NonEmpty>> = name.derive();
 
 ## 独自の法則を書く [#writing-your-own-laws]
 
-`R` に独自の規則型を使って `TermDerive` を実装すれば、法則を追加できます。実装は `Proven<T, P>` を返さなければならず、クレートの外で `Proven` を得るには `prove` か既存の証明の変換しかありません。そのため独自の法則が証拠をでっち上げることはできず、実際には既存のステップの連鎖に名前を付けたものになります。
+`R` に独自の規則型を使って `TermDerive` を実装すれば、法則を追加できます。実装は `Proven<T, P>` を返さなければならず、クレートの外で `Proven` を得るには `prove`、`PureVerifier` (`P` を構築できるコードしか書けません)、既存の証明の変換のいずれかしかありません。そのため独自の法則が証拠をでっち上げることはできず、実際には既存のステップの連鎖に名前を付けたものになります。
 
 ```rust title="src/derivation.rs"
 use wakuwaku::proof::boolean_algebra::{Associate, Commute};

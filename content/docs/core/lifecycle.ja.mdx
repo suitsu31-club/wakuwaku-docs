@@ -27,7 +27,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["iggy"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["iggy"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -95,7 +95,7 @@ use wakuwaku::iggy::{
     Event, EventAtomicOrdering, EventBody, EventHandler, EventTypeTag, IggySuperPartitionName,
     NonAssociative, PartitionKey,
 };
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 use crate::proto::accounts_server::Accounts;
 use crate::proto::{Balance, GetBalanceRequest};
@@ -182,7 +182,7 @@ impl Processor<CronTick> for ExpireSessions {
 }
 
 impl CronJob for ExpireSessions {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 
 // ---- Event handler: welcome mail for every new user.
@@ -410,8 +410,18 @@ async fn shutdown_signal() {
 ステップ 6 は停止シグナルまで続きます。`shutdown_signal` は Ctrl-C と、Unix ではコンテナオーケストレーターが送る `SIGTERM` で完了します。その後は、まず入口で新しい仕事の受け付けを止め、次にバックグラウンドの仕事を止めます。
 
 1. **gRPC。** シグナルが完了すると、[`serve_with_incoming_shutdown`](https://docs.rs/tonic/0.14/tonic/transport/server/struct.Router.html#method.serve_with_incoming_shutdown) は新しい接続の受け付けを止め、開いている接続にグレースフルな終了を求め、すべての接続が閉じたら戻ります。処理中のリクエストは完了します。長時間続くストリーミング RPC は終わるまで接続を開いたままにするので、そうした RPC がある場合は `tokio::time::timeout` などで待ち時間に上限を設けてください。ポートを自分でバインドしない場合は、代わりに `serve_with_shutdown(addr, signal)` を使います。
-2. **コンシューマー。** [`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) はすべてのパーティションタスクを中断し、停止するまで待ちます。処理中のハンドラ呼び出しはキャンセルされます。その影響は [`DeliveryMode`](/ja/docs/events/consuming) によって異なります。デフォルトの `NoEventLose` では、まだコミットされていないものはすべて同じ名前の次のコンシューマーが読み直すため、ハンドラは同じイベントを二度受け取っても問題ないようにしておく必要があります。`NoDoubleConsume` では、ポーリング済みで未処理のイベントは失われます。
-3. **cron ジョブ。** [`CronRuntime::shutdown`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html) は新しい実行のスケジュールを止め、実行中のものが終わるのを **待ちます**。`CronRuntime` を drop した場合は中断されます。
+2. **コンシューマー。** [`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) はグレースフルに後片付けします。ポーリングを止め、すでに始まったハンドラ呼び出しを完了させ、その失敗をリトライパーティションへ書き込み、オフセットを保存します。新しい仕事の待機 (ポーリング、アイドル) はキャンセルされます。まだ実行していないリトライはクラッシュ時と同じ扱いです。デフォルトの [`DeliveryMode`](/ja/docs/events/consuming) である `NoEventLose` では、同じ名前の次のコンシューマーがそれらを読み直すため、ハンドラは同じイベントを二度受け取っても問題ないようにしておく必要があります。`NoDoubleConsume` では、リトライパーティションから読み出し済みのものは失われます。[`ConsumerRuntime::abort`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) は代わりにすべてのパーティションタスクを即座にキャンセルし、ハンドラは次の `.await` で打ち切られます。
+3. **cron ジョブ。** [`CronRuntime::shutdown`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html) は新しい実行のスケジュールを止め、実行中のものが終わるのを **待ちます**。`AfterStart` のジョブで重なって実行中のものもすべて待ちます。`CronRuntime::abort` は実行中のものを次の `.await` でキャンセルし、停止するまで待ちます。
+
+どちらのランタイムも、drop すると待たずに中断します。`shutdown` は仕事が終わるまで待ち続けます (Iggy に届かない間、コンシューマーがリクエストをリトライし続ける場合も含みます)。そのため `tokio::time::timeout` で上限を設けてください。タイムアウトすると `shutdown` の Future がそれが所有するランタイムごと drop され、残りの仕事は中断されます。
+
+```rust
+// Give the background work at most 20 seconds; past that, cancel it.
+if tokio::time::timeout(Duration::from_secs(20), consumers.shutdown()).await.is_err() {
+    tracing::warn!("consumers did not drain in time");
+}
+```
+
 
 `main` はサーブの結果を `served` に保持し、後片付けが終わってから `?` を適用します。そのため、gRPC サーバーが失敗した場合でもコンシューマーと cron ジョブはきれいに停止します。
 

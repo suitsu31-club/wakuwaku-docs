@@ -141,7 +141,7 @@ Deriving `Clone` on a predicate is harmless: a cloned predicate value proves not
 
 ## Writing your own laws
 
-You can add laws by implementing `TermDerive` with your own rule type for `R`. The implementation must return a `Proven<T, P>`, and outside the crate a `Proven` can only come from `prove` or from transforming existing proofs. So a custom law cannot fabricate evidence; in practice it is a named chain of existing steps:
+You can add laws by implementing `TermDerive` with your own rule type for `R`. The implementation must return a `Proven<T, P>`, and outside the crate a `Proven` can only come from `prove`, from a `PureVerifier` (which only code able to construct `P` can write), or from transforming existing proofs. So a custom law cannot fabricate evidence; in practice it is a named chain of existing steps:
 
 ```rust title="src/derivation.rs"
 use wakuwaku::proof::boolean_algebra::{Associate, Commute};

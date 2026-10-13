@@ -35,13 +35,13 @@ Spring に慣れている方は、アプリケーションコンテキストと�
 
 型は、あるジョブが `SessionStore` を *持っている* ことは示せますが、正しいセッションを削除することまでは示せません。そこはテストの役割であり、wakuwaku はそのテストを安く書けるように設計されています。
 
-すべてのコンポーネントは普通の Rust の値です。[`ServiceCreation::create_service`](/ja/docs/core/service-builder#building-components-servicecreation) で依存から作られ、振る舞いは一つの async メソッドにまとまっています。
+すべてのコンポーネントは普通の Rust の値です。[`ServiceCreation::create_service`](/ja/docs/core/service-builder#building-components-servicecreation) で依存から作られるか、`compose_*` メソッドで複数のサービスから組み立てられ、振る舞いは一つの async メソッドにまとまっています。
 
 - cron ジョブは `CronTick` の [`Processor`](https://docs.rs/kanau/latest/kanau/processor/trait.Processor.html) です。
 - イベントハンドラは同じ形をした `EventHandler::handle` を実装します。
 - gRPC サービスは tonic が生成したトレイトを実装します。
 - データアクセスハンドル (`Db`) はクエリの `Processor` です。
-- 述語は `prove` で検査します。
+- 述語は `prove` で、純粋なチェックは `PureVerifier` で検査します。
 
 テストは値を作り、メソッドを呼ぶだけです。Iggy サーバーも、開いたポートも、スケジューラも要りません。種類ごとのテスト例は [テスト](/ja/docs/core/testing) のページにあります。
 
@@ -93,12 +93,12 @@ impl Processor<CronTick> for ExpireSessions {
 |---|---|---|
 | `Dep` が登録されていないコンポーネントを作る | `E0277`: `(): ProvideAt<SessionStore, _>` is not satisfied | [サービスビルダー](/ja/docs/core/service-builder#reading-the-compile-errors) |
 | 2 回登録された型を、どちらか指定せずに要求する | `E0283`: type annotations needed | [サービスビルダー](/ja/docs/core/service-builder#duplicate-types) |
-| `INTERVAL = Duration::ZERO` の cron ジョブ | `E0080`: evaluation panicked: CronJob::INTERVAL must not be zero (`cargo build` のみ) | [cron ジョブ](/ja/docs/services/cron-jobs) |
+| 長さゼロの `CronJobInterval` を持つ cron ジョブ | `E0080`: evaluation panicked: CronJob::INTERVAL must not be zero (`cargo build` のみ) | [cron ジョブ](/ja/docs/services/cron-jobs) |
 | 読み取り専用ハンドルで書き込みクエリを実行する | `E0277`: `ReadOnly: CanWrite<Post>` is not satisfied | [クエリ](/ja/docs/data/queries) |
 | 自身が失敗しうるフックのエラーハンドラ | `E0271`: type mismatch resolving `<LogError as Processor<String>>::Error == Infallible` | [フック](/ja/docs/data/hooks) |
 | `EventSemigroup` を実装しない `Associative` なイベント (`Eq` のない `Idempotent`、`Ord` のない `IdempotentCommutative` も同様) | `E0277`: `PointsGranted: EventSemigroup` is not satisfied | [イベントの代数](/ja/docs/events/algebra) |
 | `Proven<T, P>` が必要な場所に未検証の値を渡す | `E0308`: mismatched types | [バリデーション](/ja/docs/validation) |
-| `Proven` を手で組み立てる | フィールドが非公開。作れるのは `prove` と推論規則だけ | [バリデーション](/ja/docs/validation) |
+| `Proven` を手で組み立てる | フィールドが非公開。作れるのは `prove`、`PureVerifier`、推論規則だけ | [バリデーション](/ja/docs/validation) |
 
 このうち四つについて、実際のコンパイラ出力を示します (パスと help の注記は省略しています)。
 
@@ -164,7 +164,7 @@ error[E0308]: mismatched types
 
 ```rust
 impl CronJob for Busy {
-    const INTERVAL: Duration = Duration::ZERO;
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::ZERO);
 }
 
 let (_services, cron) = ServiceBuilder::new(SessionStore).cron_job::<Busy, _>().start();

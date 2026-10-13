@@ -6,7 +6,7 @@ icon: Database
 
 wakuwaku のデータ層は `wakuwaku::entity`（`wakuwaku-entity` クレート）にあります。sqlx 経由の PostgreSQL / MySQL、Redis、Meilisearch を扱えますが、どのデータソースでも考え方は次の 3 つで共通です。
 
-1. **クエリは値です。** クエリは `FindUser { id: 7 }` のような 1 つの操作を表す普通の構造体です。リポジトリオブジェクトのメソッドではありません。
+1. **クエリは値です。** クエリは `FindUser { id: 7 }` のような 1 つの操作を表す普通の構造体で、自分の `Output` と自分の `Error` を持ちます。リポジトリオブジェクトのメソッドではありません。
 2. **ハンドルはプロセッサです。** [`Db<S, C>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html) ハンドルは、実行してよいすべてのクエリ `Q` について kanau の `Processor<Q>` を実装します。クエリの実行は `db.process(query).await` です。cron ジョブやイベントハンドラも同じトレイトを使い、フック・トランザクション・テストダブルもこの上に組み立てられています。
 3. **ケイパビリティ型がエフェクトを網羅しなければなりません。** 各クエリは読み書きするエンティティを `Effect` として宣言し、各ハンドルはケイパビリティ型 `C` を持ちます。`Db<S, C>` が `Processor<Q>` を実装するのは `C: Covers<Q::Effect>` が成り立つときだけです。書き込みクエリを読み取り専用ハンドルに渡すと、プログラムはコンパイルできません。
 
@@ -121,7 +121,7 @@ ALTER ROLE app_reader SET default_transaction_read_only = on;
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 ```
 
 | フィーチャー | データソース | サードパーティクレート | ガイド |
@@ -140,7 +140,7 @@ wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
   <Card title="クエリとハンドル" href="/ja/docs/data/queries" description="クエリを定義し、Db ハンドルを作り、読み取りをレプリカへ振り分け、コンポーネントに注入します。" />
   <Card title="書き込みフック" href="/ja/docs/data/hooks" description="すべての書き込みの前後で、監査・キャッシュ無効化・検索インデックス同期を行います。" />
   <Card title="sqlx" href="/ja/docs/data/sqlx" description="PostgreSQL と MySQL のデータソース。" />
-  <Card title="トランザクション" href="/ja/docs/data/transactions" description="純粋な状態機械として書くトランザクション。" />
+  <Card title="トランザクション" href="/ja/docs/data/transactions" description="複数のクエリをアトミックに。ステップがクエリを実行する状態機械として書きます。" />
   <Card title="Redis" href="/ja/docs/data/redis" description="キャッシュ、ロック、レートリミッター、変化を追える構造。" />
   <Card title="Meilisearch" href="/ja/docs/data/meilisearch" description="検索インデックスをエンティティとして扱い、元データと同期させます。" />
 </Cards>

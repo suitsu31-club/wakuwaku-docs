@@ -27,7 +27,7 @@ Spring から来た方向けに言えば、このページは Spring Data Redis 
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["redis"] }
 kanau = { version = "0.6", features = ["serde_json"] }  # JsonMessageSer / JsonMessageDe
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -111,6 +111,7 @@ impl Query for StoreSession {
 
 impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for StoreSession {
     type Output = ();
+    type Error = redis::RedisError;
 
     async fn execute(self, conn: &mut C) -> redis::RedisResult<()> {
         conn.set_ex(format!("session:{}", self.token), self.user, 3600).await
@@ -118,7 +119,55 @@ impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for StoreS
 }
 ```
 
-Redis のクエリのエラー型はすべて `RedisError` です。組み込みの構造は、本体の（デ）シリアライズの失敗や、構造が書き込んだ内容と一致しないキー（`"corrupted item"`）も `RedisError` として報告します。
+クエリはそれぞれ自分のエラー型を宣言します。エラー型は `RedisSource` のエラーである `RedisError` から変換できなければならないので、Redis との通信の失敗はいつでも報告できます。組み込みの構造は `RedisError` そのものを使い、本体の（デ）シリアライズの失敗や、構造が書き込んだ内容と一致しないキー（`"corrupted item"`）も `RedisError` として報告します。
+
+### 拒否できるクエリ [#queries-that-can-refuse]
+
+席がすでに埋まっている、業務ルールが許さない、といった理由でクエリ自身が拒否できる場合は、独自のエラー型を宣言します。拒否は Redis の失敗と並んで `Err` として呼び出し側に届き、`?` ひとつで両方を扱えます。
+
+```rust title="src/seat.rs"
+use wakuwaku::deps::redis::aio::ConnectionLike;
+use wakuwaku::deps::redis::{self, AsyncCommands};
+use wakuwaku::entity::redis::RedisSource;
+use wakuwaku::entity::{Entity, Execute, Query, Write};
+
+pub struct Seat;
+impl Entity for Seat {}
+
+#[derive(Debug)]
+pub enum ClaimError {
+    /// ほかの誰かが席を持っている。
+    Taken,
+    Redis(redis::RedisError),
+}
+
+impl From<redis::RedisError> for ClaimError {
+    fn from(error: redis::RedisError) -> Self {
+        Self::Redis(error)
+    }
+}
+
+pub struct ClaimSeat {
+    pub seat: u32,
+    pub user: u64,
+}
+
+impl Query for ClaimSeat {
+    type Effect = Write<Seat>;
+}
+
+impl<C: ConnectionLike + Clone + Send + Sync> Execute<RedisSource<C>> for ClaimSeat {
+    type Output = ();
+    type Error = ClaimError;
+
+    async fn execute(self, conn: &mut C) -> Result<(), ClaimError> {
+        let claimed: bool = conn.set_nx(format!("seat:{}", self.seat), self.user).await?;
+        if claimed { Ok(()) } else { Err(ClaimError::Taken) }
+    }
+}
+```
+
+これで `redis.process(ClaimSeat { seat, user }).await` は `Result<(), ClaimError>` を出力します。出力の中に `Result` が入れ子になることも、クエリの後に別途チェックすることもありません。
 
 ## 名前とキー
 

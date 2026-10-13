@@ -19,12 +19,12 @@ import { i18n } from "@/lib/i18n";
 const apiReference = "https://docs.rs/wakuwaku/latest/wakuwaku/";
 
 const installCode = `[dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["iggy", "sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["iggy", "sqlx-pg", "redis"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }`;
 
 const exampleCode = `use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceBuilder, ServiceCreation};
 
 #[derive(Clone)]
 struct SessionStore;
@@ -46,7 +46,7 @@ impl Processor<CronTick> for ExpireSessions {
 }
 
 impl CronJob for ExpireSessions {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 
 #[tokio::main]
@@ -57,7 +57,8 @@ async fn main() {
 
     // Build gRPC servers and Iggy handlers from \`services\` the same way:
     // \`services.grpc_service::<XxxServer<_>, Impl, _>(XxxServer::new)\`,
-    // \`services.iggy_consumer::<Handler, _, _>()\`.
+    // \`services.iggy_consumer::<Handler, _, _>()\`, or from several
+    // services at once with \`.compose_grpc_service(|s| ...)\`.
     let _ = services;
 
     tokio::signal::ctrl_c().await.ok();
@@ -118,7 +119,12 @@ const features = [
   },
 ] as const;
 
-const roadmapAccents = [accents.teal, accents.indigo, accents.pink];
+const roadmapAccents = [
+  accents.teal,
+  accents.blue,
+  accents.indigo,
+  accents.pink,
+];
 
 type FeatureKey = (typeof features)[number]["key"];
 
@@ -194,7 +200,7 @@ const text: Record<"en" | "ja", Text> = {
       registry: {
         title: "Type-level dependency registry",
         tag: "ServiceBuilder",
-        body: "Shared dependencies live in a type-indexed registry, and every component is built from one of them through ServiceCreation. Lookup is resolved by the trait solver: no Any, no downcasting, no runtime map.",
+        body: "Shared dependencies live in a type-indexed registry. A component is built from one of them through ServiceCreation, or from several by a compose_* closure. Lookup is resolved by the trait solver: no Any, no downcasting, no runtime map.",
       },
       grpc: {
         title: "gRPC registration",
@@ -204,7 +210,7 @@ const text: Record<"en" | "ja", Text> = {
       cron: {
         title: "Cron jobs",
         tag: "CronJob",
-        body: "A job is a processor of CronTick with a constant INTERVAL. Each job runs on its own fixed grid; runs never overlap, and a run that overruns skips the ticks it covered.",
+        body: "A job is a processor of CronTick with a constant CronJobInterval: a pause after each run, a minimum spacing between starts, or a fixed grid whose runs may overlap. Errors and panics are logged and the schedule is kept.",
       },
       events: {
         title: "Typed events on Apache Iggy",
@@ -238,6 +244,11 @@ const text: Record<"en" | "ja", Text> = {
     roadmap: [
       {
         version: "1.0.0-rc1",
+        label: "Start",
+        body: "The first release candidate.",
+      },
+      {
+        version: "1.0.0-rc2",
         label: "Now",
         body: "The release candidate these docs describe.",
       },
@@ -292,7 +303,7 @@ const text: Record<"en" | "ja", Text> = {
       registry: {
         title: "型レベルの依存レジストリ",
         tag: "ServiceBuilder",
-        body: "共有依存は型でインデックスされたレジストリに置かれ、各コンポーネントは ServiceCreation を通じてそのいずれかから構築されます。参照はトレイトソルバーが解決するため、Any もダウンキャストも実行時のマップもありません。",
+        body: "共有依存は型でインデックスされたレジストリに置かれます。コンポーネントは ServiceCreation を通じてそのひとつから、または compose_* のクロージャで複数の依存から構築されます。参照はトレイトソルバーが解決するため、Any もダウンキャストも実行時のマップもありません。",
       },
       grpc: {
         title: "gRPC サーバーの登録",
@@ -302,7 +313,7 @@ const text: Record<"en" | "ja", Text> = {
       cron: {
         title: "cron ジョブ",
         tag: "CronJob",
-        body: "ジョブは定数 INTERVAL を持つ CronTick のプロセッサーです。各ジョブは固定のグリッドで実行され、実行が重なることはありません。間隔を超えた実行は、その間のティックを飛ばします。",
+        body: "ジョブは定数 CronJobInterval を持つ CronTick のプロセッサーです。実行後に間隔を空ける、開始の間隔を最低限空ける、実行が重なりうる固定のグリッド、のいずれかを選べます。エラーやパニックはログに記録され、スケジュールは保たれます。",
       },
       events: {
         title: "Apache Iggy 上の型付きイベント",
@@ -336,6 +347,11 @@ const text: Record<"en" | "ja", Text> = {
     roadmap: [
       {
         version: "1.0.0-rc1",
+        label: "出発点",
+        body: "最初のリリース候補版です。",
+      },
+      {
+        version: "1.0.0-rc2",
         label: "現在",
         body: "このドキュメントが対象とするリリース候補版です。",
       },
@@ -584,9 +600,9 @@ export default async function HomePage(props: PageProps<"/[lang]">) {
         <div className="relative mt-10">
           <div
             aria-hidden
-            className="absolute top-5 right-[16%] left-[16%] hidden h-1 rounded-full bg-linear-to-r from-waku-teal via-waku-indigo to-waku-pink opacity-60 md:block"
+            className="absolute top-5 right-[12%] left-[12%] hidden h-1 rounded-full bg-linear-to-r from-waku-teal via-waku-indigo to-waku-pink opacity-60 md:block"
           />
-          <ol className="relative grid gap-6 md:grid-cols-3 md:gap-4">
+          <ol className="relative grid gap-6 md:grid-cols-4 md:gap-4">
             {t.roadmap.map((step, index) => (
               <li
                 key={step.version}

@@ -17,7 +17,7 @@ sqlx 連携は `wakuwaku::entity::sqlx` にあり、`wakuwaku` クレートの 2
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 ```
 
 </Tab>
@@ -25,7 +25,7 @@ wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-mysql"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-mysql"] }
 ```
 
 </Tab>
@@ -38,7 +38,7 @@ wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-mysql"] }
 | `wakuwaku::entity::sqlx::backend::SqlxSource<DB>` | sqlx の `Pool<DB>` をデータソースにしたもの |
 | `wakuwaku::entity::sqlx::backend::PgSource` | `SqlxSource<Postgres>`（フィーチャー `sqlx-pg`） |
 | `wakuwaku::entity::sqlx::backend::MySqlSource` | `SqlxSource<MySql>`（フィーチャー `sqlx-mysql`） |
-| `wakuwaku::entity::sqlx::transaction` | 純粋なステートマシンとして書くトランザクション。[トランザクション](/ja/docs/data/transactions) を参照 |
+| `wakuwaku::entity::sqlx::transaction` | ステップがクエリを実行する状態機械として書くトランザクション。[トランザクション](/ja/docs/data/transactions) を参照 |
 | `wakuwaku::deps::sqlx` | sqlx クレートそのもの。wakuwaku がビルドに使うものと同じバージョン |
 
 ## 有効になっている sqlx のフィーチャー
@@ -66,7 +66,7 @@ TLS フィーチャーがなくても sqlx は起動を拒否しません。デ�
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "macros", "migrate"] }
 ```
 
@@ -145,7 +145,7 @@ pub async fn connect(url: &str) -> Result<Db<PgSource, ReadWrite>, Box<dyn std::
 sqlx 向けのクエリは 2 つのトレイトを実装します。
 
 - `wakuwaku::entity` の `Query` は **エフェクト**、つまりどのエンティティを読み書きするかを宣言します。
-- `Execute<SqlxSource<DB>>` は実行方法を記述します。`execute` は `&mut DB::Connection`（`&mut PgConnection` または `&mut MySqlConnection`）を受け取ります。これは sqlx の executor なので、本体は普通の sqlx の呼び出しで書けます。
+- `Execute<SqlxSource<DB>>` は実行方法を記述します。`execute` は `&mut DB::Connection`（`&mut PgConnection` または `&mut MySqlConnection`）を受け取ります。これは sqlx の executor なので、本体は普通の sqlx の呼び出しで書けます。`type Error` はたいてい `sqlx::Error` です。自分の判断で拒否することもあるクエリは[独自のエラー型](/ja/docs/data/queries#own-error-type)を使います。
 
 <Tabs items={['PostgreSQL', 'MySQL']}>
 <Tab value="PostgreSQL">
@@ -177,6 +177,7 @@ impl Query for FindUser {
 
 impl Execute<SqlxSource<Postgres>> for FindUser {
     type Output = Option<UserRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Self::Output, sqlx::Error> {
         let row: Option<(i64, String)> =
@@ -200,6 +201,7 @@ impl Query for RenameUser {
 
 impl Execute<SqlxSource<Postgres>> for RenameUser {
     type Output = bool;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
         let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
@@ -242,6 +244,7 @@ impl Query for FindUser {
 
 impl Execute<SqlxSource<MySql>> for FindUser {
     type Output = Option<UserRow>;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut MySqlConnection) -> Result<Self::Output, sqlx::Error> {
         let row: Option<(i64, String)> =
@@ -265,6 +268,7 @@ impl Query for RenameUser {
 
 impl Execute<SqlxSource<MySql>> for RenameUser {
     type Output = bool;
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut MySqlConnection) -> Result<bool, sqlx::Error> {
         let done = sqlx::query("UPDATE users SET name = ? WHERE id = ?")
@@ -284,7 +288,7 @@ impl Execute<SqlxSource<MySql>> for RenameUser {
 
 ここで行をタプルにデコードしているのは、タプルが `derive` フィーチャーなしで sqlx の `FromRow` を実装しているためです。`derive` を有効にすれば `#[derive(sqlx::FromRow)] struct UserRow { … }` と書いて、`sqlx::query_as::<_, UserRow>(…)` を使えます。
 
-`execute` の中の `conn` は、プールのコネクション（クエリを単独で実行する場合）か、開いているトランザクションのコネクション（クエリを [トランザクションのステップ](/ja/docs/data/transactions) として実行する場合）のどちらかです。同じクエリ型をどちらの場所でも使えます。
+`execute` の中の `conn` は、プールのコネクション（クエリを単独で実行する場合）か、開いているトランザクションのコネクション（[トランザクションのステップ](/ja/docs/data/transactions)が `tx.run(query)` で実行する場合）のどちらかです。同じクエリ型をどちらの場所でも使えます。トランザクションの中で実行するには、クエリのエラーが `AsSqlxError` を実装している必要があります。`sqlx::Error` は実装済みです。
 
 <Callout type="info" title="コンパイル時に検査される SQL">
 `sqlx::query!` や `sqlx::query_as!` も `execute` の中で使えます。`macros` フィーチャーと、ビルド時に `DATABASE_URL` か sqlx のオフラインクエリデータが必要です。後述するケイパビリティ検査はこれらとは独立しており、SQL の文面ではなく、*どの* クエリがどこで実行されるかを検査します。
@@ -292,7 +296,7 @@ impl Execute<SqlxSource<MySql>> for RenameUser {
 
 ### クエリを実行する
 
-`Db<S, C>` は、`S` 上で実行でき、かつエフェクトを `C` がカバーするすべてのクエリ `Q` について kanau の `Processor<Q>` を実装します。クエリの実行は `process` の呼び出しで、エラー型は `sqlx::Error` です。
+`Db<S, C>` は、`S` 上で実行でき、かつエフェクトを `C` がカバーするすべてのクエリ `Q` について kanau の `Processor<Q>` を実装します。クエリの実行は `process` の呼び出しで、エラーはクエリの `Error`、ここでは `sqlx::Error` です。
 
 ```rust title="src/rename.rs"
 use crate::queries::{FindUser, RenameUser};
@@ -374,7 +378,7 @@ pub async fn build(primary_url: &str, replica_url: &str) -> Result<(), sqlx::Err
 }
 ```
 
-2 つのハンドルは型が異なるので、`ServiceBuilder` は両方を保持でき、`provide` はそれぞれを型で見つけます。実際のサービスではビルダーを `grpc_service`、`cron_job`、`iggy_consumer` に渡し、それらが `create_service` を呼び出します。[ServiceBuilder](/ja/docs/core/service-builder) を参照してください。単体テストでは、`Profiles` は `Processor<FindUser>` を実装する任意のフェイクを受け取れるので、データベースはまったく不要です。[テスト](/ja/docs/core/testing) を参照してください。
+2 つのハンドルは型が異なるので、`ServiceBuilder` は両方を保持でき、`provide` はそれぞれを型で見つけます。実際のサービスではビルダーを `grpc_service`、`cron_job`、`iggy_consumer` に渡し、それらが `create_service` を呼び出します。複数のハンドルからコンポーネントを組み立てるなら `compose_grpc_service`、`compose_cron_job`、`compose_iggy_consumer` を使います。[ServiceBuilder](/ja/docs/core/service-builder) を参照してください。単体テストでは、`Profiles` は `Processor<FindUser>` を実装する任意のフェイクを受け取れるので、データベースはまったく不要です。[テスト](/ja/docs/core/testing) を参照してください。
 
 <Callout type="warn" title="型が証明すること、しないこと">
 ケイパビリティ検査が証明するのは **ルーティング** です。`Db<_, ReadOnly>` に結び付いたコードは、書き込みとして *宣言された* クエリを決して発行しません。`Read<User>` と宣言したクエリに `UPDATE` が含まれていないことまでは証明できません。レプリカ側でもデータベース自身のガードを維持してください。ホットスタンバイは書き込みを拒否し、プライマリでは `default_transaction_read_only = on`（PostgreSQL）や書き込み権限のないユーザーが同じ役割を果たします。
@@ -389,7 +393,7 @@ pub async fn build(primary_url: &str, replica_url: &str) -> Result<(), sqlx::Err
 - [`wakuwaku::deps`](https://docs.rs/wakuwaku/latest/wakuwaku/deps/index.html)
 
 <Cards>
-  <Card title="トランザクション" href="/ja/docs/data/transactions" description="複数の文をアトミックに。純粋なステートマシンとして書きます。" />
+  <Card title="トランザクション" href="/ja/docs/data/transactions" description="複数のクエリをアトミックに。ステップがクエリを実行する状態機械として書きます。" />
   <Card title="フック" href="/ja/docs/data/hooks" description="書き込みクエリの前後でコードを実行します。" />
   <Card title="クエリとケイパビリティ" href="/ja/docs/data/queries" description="エンティティ、エフェクト、独自のケイパビリティ。" />
 </Cards>

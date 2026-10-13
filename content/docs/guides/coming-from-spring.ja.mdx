@@ -13,15 +13,15 @@ Spring Boot でサービスを作ったことがあれば、wakuwaku の多く�
 | Spring                                                    | wakuwaku                                                                 | 補足 |
 | --------------------------------------------------------- | ------------------------------------------------------------------------ | ---- |
 | `ApplicationContext`、`@Configuration` + `@Bean`          | [`ServiceBuilder::new(..).push(..)`](/ja/docs/core/service-builder)      | レジストリは `main` で自分で組み立てます。型による解決をコンパイラが行います。 |
-| コンストラクタインジェクション                            | [`ServiceCreation::Dep`](/ja/docs/core/service-builder)                  | 1 つのコンポーネントにつき依存はちょうど 1 つです。複数必要なら構造体にまとめて登録します。 |
+| コンストラクタインジェクション                            | [`ServiceCreation::Dep`](/ja/docs/core/service-builder)                  | 登録済みの依存 1 つから作るコンポーネントは、それを `Dep` として指定します。複数必要なコンポーネントはクロージャで組み立てます: `compose_cron_job`、`compose_grpc_service`、`compose_iggy_consumer`。 |
 | `@Component` のスキャン                                   | なし                                                                     | すべてのコンポーネントを明示的に登録します。 |
 | `@Value`、`@ConfigurationProperties`                      | なし                                                                     | 設定用の構造体を自分で作り、他の依存と同じように登録します。 |
-| `@Scheduled(fixedRate = ...)`                             | [`CronJob::INTERVAL`](/ja/docs/services/cron-jobs)                       | 同じジョブの実行は重なりません。間隔を超えた実行は、その間のティックをスキップします。cron 式はありません。 |
+| `@Scheduled`                                              | [`CronJob::INTERVAL`](/ja/docs/services/cron-jobs)                       | `CronJobInterval` で指定します。`AfterFinish` ≈ `fixedDelay`、`AtLeast` ≈ `fixedRate` (実行は重なりません)、`AfterStart` ≈ `fixedRate` + `@Async` (実行が重なりえます)。cron 式はありません。 |
 | `@KafkaListener`                                          | [`EventHandler`](/ja/docs/events/consuming) + `ServiceBuilder::iggy_consumer` | ブローカーは Kafka ではなく Apache Iggy です。ハンドラーは 1 つのキーのイベントをバッチで受け取ります。 |
 | `KafkaTemplate.send`                                      | [`Publisher::publish`](/ja/docs/events/publishing)                       | イベントのキーがトピックとパーティションを決めます。 |
 | Spring Data のリポジトリメソッド                          | `Query` + `Execute` を実装した [クエリの値](/ja/docs/data/queries)       | 各クエリは、読み書きするエンティティを宣言する構造体です。ORM やメソッド名からのクエリ導出はありません。 |
 | `@Transactional(readOnly = true)`                         | [`Db<S, ReadOnly>`](/ja/docs/data/queries)                               | ハンドルが持つケイパビリティで、コンパイル時に検査されます。後述します。 |
-| `@Transactional`                                          | [`Transaction` + `TxFlow`](/ja/docs/data/transactions)                   | トランザクションは値です。メソッドを包むプロキシではなく、ドライバーが実行するステートマシンです。 |
+| `@Transactional`                                          | [`Transaction` + `TxFlow`](/ja/docs/data/transactions)                   | トランザクションは値です。メソッドを包むプロキシではなく、ステップがクエリを実行するフローで、ライブラリが駆動します。 |
 | JPA のエンティティリスナー、`@TransactionalEventListener` | [`BeforeWrite` / `AfterWrite` フック](/ja/docs/data/hooks)              | フックはハンドルを包み、書き込みクエリの前後で動きます。 |
 | Bean Validation (`@Valid`、`@NotBlank`)                   | [`wakuwaku::proof`](/ja/docs/validation)                                 | 検査が成功すると `Proven<T, P>` が返り、正しい入力を必要とする関数はこの型を受け取ります。 |
 | `@Cacheable`                                              | [Redis の `Cache`](/ja/docs/data/redis)                                  | アノテーション駆動ではありません。Spring の `Cache` や `RedisTemplate` を直接使うときのように、`get` と `put` を自分で呼びます。 |
@@ -58,48 +58,36 @@ use std::convert::Infallible;
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
 use wakuwaku::deps::sqlx::PgPool;
-use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceBuilder};
 
 #[derive(Clone)]
 struct Mailer;
 
-/// Everything `DigestJob` needs, registered as one value.
-#[derive(Clone)]
-struct DigestDeps {
+struct DigestJob {
     pool: PgPool,
     mailer: Mailer,
-}
-
-struct DigestJob {
-    deps: DigestDeps,
-}
-
-impl ServiceCreation for DigestJob {
-    type Dep = DigestDeps;
-    fn create_service(deps: DigestDeps) -> Self {
-        Self { deps }
-    }
 }
 
 impl Processor<CronTick> for DigestJob {
     type Output = ();
     type Error = Infallible;
     async fn process(&self, _tick: CronTick) -> Result<(), Infallible> {
-        // Query `self.deps.pool`, send mail with `self.deps.mailer`.
+        // Query `self.pool`, send mail with `self.mailer`.
         Ok(())
     }
 }
 
 impl CronJob for DigestJob {
-    const INTERVAL: Duration = Duration::from_secs(60 * 60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60 * 60));
 }
 
 async fn run(pool: PgPool) {
-    let mailer = Mailer;
-    let (services, cron) = ServiceBuilder::new(pool.clone())
-        .push(mailer.clone())
-        .push(DigestDeps { pool, mailer })
-        .cron_job::<DigestJob, _>()
+    let (_services, cron) = ServiceBuilder::new(pool)
+        .push(Mailer)
+        .compose_cron_job(|s| DigestJob {
+            pool: s.provide::<PgPool, _>().clone(),
+            mailer: s.provide::<Mailer, _>().clone(),
+        })
         .start();
 
     tokio::signal::ctrl_c().await.ok();
@@ -110,9 +98,9 @@ async fn run(pool: PgPool) {
 注目すべき点は次のとおりです。
 
 - **登録は明示的です。** `ServiceBuilder::new(..).push(..)` が `@Bean` メソッドの役割を果たします。クラスパスから自動で見つかるものはありません。
-- **1 つのコンポーネントにつき依存は 1 つです。** 引数が複数あるコンストラクタの代わりに、コンポーネントは `Dep` 型を 1 つ指定します。複数のものが必要なら、`DigestDeps` のようにそれらをまとめた構造体を登録します。依存はコンポーネントへクローンされるので、安価にクローンできるもの (プール、ハンドル、`Arc`) にしてください。
-- **スケジュールは定数です。** `INTERVAL` はジョブの型の一部です。間隔が 0 だとビルドできません。
-- **シャットダウンは自分で行います。** `start()` は `CronRuntime` を返します。`shutdown().await` を呼ぶと、実行中の処理を完了させてから停止します。
+- **コンストラクタはクロージャです。** `compose_cron_job` はクロージャにビルダーを渡し、`s.provide::<T, _>()` が登録済みの依存を型で引きます。コンストラクタインジェクションと同じ役割で、足りない依存はコンパイルエラーになります。依存が 1 つだけのコンポーネントは、`ServiceCreation` を実装して `cron_job::<Job, _>()` で登録することもできます。依存はレジストリからクローンされるので、安価にクローンできるもの (プール、ハンドル、`Arc`) にしてください。
+- **スケジュールは定数です。** `INTERVAL` はジョブの型の一部です。`AtLeast` は `fixedRate` のように少なくとも 1 時間おきに実行を始めますが、2 つの実行が重なることはありません。間隔が 0 だとビルドできません。
+- **シャットダウンは自分で行います。** `start()` は `CronRuntime` を返します。`shutdown().await` を呼ぶと、スケジュールを止め、実行中の処理を完了させてから停止します。`abort().await` は実行中の処理をキャンセルします。
 
 ## 主な違い
 

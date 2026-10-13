@@ -137,14 +137,14 @@ Every lock query, including `try_read`, writes to Redis, so its effect is `Write
 
 ## Cron jobs on several replicas
 
-A [cron job](/en/docs/services/cron-jobs) runs in every replica that starts it, on each replica's own schedule. To run it once per interval across the whole deployment, take a lock whose lease covers most of the interval and *don't release it*: the first replica to tick takes it, the others find it held until the next interval.
+A [cron job](/en/docs/services/cron-jobs) runs in every replica that starts it, on each replica's own schedule, starting with a run at startup. To run it once per interval across the whole deployment, take a lock whose lease covers most of the interval and *don't release it*: the first replica to tick takes it, the others find it held until the next interval.
 
 ```rust title="src/report.rs"
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
 use wakuwaku::deps::redis::RedisError;
 use wakuwaku::entity::redis::collection::lock::Lock;
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -179,7 +179,8 @@ impl Processor<CronTick> for HourlyReport {
 }
 
 impl CronJob for HourlyReport {
-    const INTERVAL: Duration = HOUR;
+    /// Starts at least an hour apart, and never overlapping, in each replica.
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(HOUR);
 }
 ```
 
@@ -195,14 +196,17 @@ pub async fn main_like() -> Result<(), Box<dyn std::error::Error>> {
         .cron_job::<HourlyReport, _>()
         .start();
     // … serve until shutdown …
+    // Stops scheduling and waits for the run in progress, if any.
     cron.shutdown().await;
     Ok(())
 }
 ```
 
-Why not release the lock after the run? Releasing only prevents *overlapping* runs. Replicas start at different times, so their schedules are offset: with release, replica A runs at 12:00 and releases at 12:01, and replica B, whose grid falls at 12:20, takes the free lock and runs the same hour's report again.
+Why not release the lock after the run? Releasing only prevents *overlapping* runs. Replicas start at different times, so their schedules are offset: with release, replica A runs at 12:00 and releases at 12:01, and replica B, whose schedule falls at 12:20, takes the free lock and runs the same hour's report again.
 
 The lease must stay shorter than the interval: with a lease of an hour or more, even the replica that took it at 12:00 could find it still held at its 13:00 tick, and that hour would be skipped. If a run may take longer than the lease, wrap it in `while_held` from above so the lease keeps being extended while the run is in progress.
+
+Space such a job with `CronJobInterval::AtLeast` or `AfterFinish`: both guarantee that the runs of one replica never overlap and start at least an interval apart, which is what the lease arithmetic above relies on. `AfterStart` guarantees neither: a slow run overlaps the next one, and runs may fire slightly less than an interval apart.
 
 A returned `RedisError` is logged by the cron runtime and the job keeps its schedule. Keep the job idempotent anyway: if Redis loses the key (a failover without persistence, an eviction), two replicas may both run in the same interval.
 

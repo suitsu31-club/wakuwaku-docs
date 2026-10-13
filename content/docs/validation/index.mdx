@@ -33,7 +33,7 @@ The `proof` feature is on by default, so `wakuwaku` alone is enough. Predicates 
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = "1.0.0-rc1"
+wakuwaku = "1.0.0-rc2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -44,7 +44,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 | [`ValidateContext`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.ValidateContext.html) | What a check reads while deciding (configuration, connection handles, caches), plus the error type for "could not decide". |
 | [`Predicate<T>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.Predicate.html) | A proposition about a `T`, decided at runtime. The predicate type is also its own evidence. |
 | [`prove`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/fn.prove.html) | Runs a predicate against a subject and wraps both in a `Proven` on success. |
-| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | The subject plus evidence that `P` held. Only obtainable from `prove` or from another proof. |
+| [`PureVerifier<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) | A pure check as a function pointer, declared as a `static` or `const`. The other way to obtain a `Proven`. |
+| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | The subject plus evidence that `P` held. Only obtainable from `prove`, a `PureVerifier`, or another proof. |
 | [`ValidateError<E>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.ValidateError.html) | `Deny(DeniedReason)` when the rule is false, `IoError(E)` when it could not be decided. |
 | [`DeniedReason`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.DeniedReason.html) | A `&'static str` explaining a denial, compared by identity. |
 
@@ -148,6 +149,57 @@ pub async fn handle(input: String) -> Result<String, &'static str> {
 
 `handle("haruki".into())` returns `Ok("haruki (10 bytes to spare)")`; an empty string returns `Err("username is empty")`. When the check fails, the subject is dropped along with the error.
 
+### Pure checks: `PureVerifier`
+
+Some rules read nothing but the subject: a slug format, a range, a checksum. They need no context, cannot fail to decide, and have nothing to compose. For those, a [`PureVerifier<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) is the check itself as a function pointer, `fn(&T) -> Result<P, ValidateError<Infallible>>`. `PureVerifier::new` is a `const fn`, so the verifier is declared once as a `static` (or `const`) next to its evidence type, and proving is a plain synchronous call:
+
+```rust title="src/validation/slug.rs"
+use std::convert::Infallible;
+use wakuwaku::proof::{DeniedReason, Proven, PureVerifier, ValidateError};
+
+pub static NOT_A_SLUG: DeniedReason = DeniedReason("not a lowercase slug");
+
+/// "The string is a URL slug." The private field: only this module can build one.
+pub struct Slug(());
+
+fn is_slug(s: &String) -> Result<Slug, ValidateError<Infallible>> {
+    let valid = !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if valid { Ok(Slug(())) } else { Err(ValidateError::Deny(NOT_A_SLUG)) }
+}
+
+pub static SLUG: PureVerifier<String, Slug> = PureVerifier::new(is_slug);
+
+/// Only callable with a string that went through `SLUG`.
+pub fn publish(slug: Proven<String, Slug>) -> String {
+    format!("/posts/{}", slug.subject())
+}
+
+pub fn handle(input: String) -> Result<String, &'static str> {
+    match SLUG.prove(input) {
+        Ok(slug) => Ok(publish(slug)),
+        Err(ValidateError::Deny(reason)) => Err(reason.0),
+        // The I/O error type is `Infallible`: a pure check can only deny.
+        Err(ValidateError::IoError(never)) => match never {},
+    }
+}
+```
+
+The result is an ordinary `Proven<String, Slug>`; code that requires it cannot tell, and does not care, which way it was obtained.
+
+**Who can write a verifier.** The function must return a `Slug`, so only code that can construct a `Slug` can write a verifier for it. That is why `Slug` has a private field. A predicate's meaning is fixed by its single `impl Predicate<T>`, but any number of verifiers can target the same evidence type, and a unit struct like `pub struct NonEmpty;` would let anyone write `PureVerifier::new(|_| Ok(NonEmpty))` and prove anything. With a private field, every proof of `Slug` is written in the module that defines it, which is where the rule's meaning lives.
+
+**When to use which.**
+
+| | `Predicate` + `prove` | `PureVerifier` |
+| --- | --- | --- |
+| Reads | subject and a `ValidateContext` (configuration, database handles, …) | the subject only |
+| Outcomes | holds, `Deny`, `IoError` | holds, `Deny` |
+| Call | `async`, takes a `CheckOrder` | synchronous, usable in constructors and `TryFrom` impls |
+| Composes with `And` / `Or` and the [derivation laws](/en/docs/validation/derivation) | yes | no: `P` need not implement `Predicate` |
+
+Reach for a `PureVerifier` when the rule is a local property of the value and you want it checked where the value is created, without a context type or an `.await`. Use a predicate when the rule needs configuration or I/O, or when it is one operand of a larger rule. A verifier's proof still joins others through `Proven::from_both`, `from_a` and `from_b`, which do not require a predicate.
+
 ## Three outcomes
 
 A check ends in exactly one of three ways:
@@ -202,7 +254,7 @@ fn register(name: String, _proof: NonEmpty) { /* ... */ }
 
 Anyone can write `NonEmpty`, and calling `Predicate::check` directly returns evidence that is not tied to any subject. Take `Proven<T, P>` in signatures, never a bare `P`.
 
-`Proven` is safe to require because its fields are private. Outside the crate a `Proven` comes only from `prove`, or from another proof through `Proven::from_a`, `from_b`, `from_both`, `into_a`, `into_b` and `derive`. Both shortcuts fail to compile:
+`Proven` is safe to require because its fields are private. Outside the crate a `Proven` comes only from `prove`, from a `PureVerifier`, or from another proof through `Proven::from_a`, `from_b`, `from_both`, `into_a`, `into_b` and `derive`. Both shortcuts fail to compile:
 
 ```rust
 let input = String::from("haruki");

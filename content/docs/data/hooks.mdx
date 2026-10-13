@@ -3,7 +3,7 @@ title: Write Hooks
 description: Run code before or after every write query, for audit logs, cache invalidation and search sync, without changing the handlers that issue the writes.
 ---
 
-A write hook wraps a handle and runs a processor around every **write** query that goes through it. Handlers don't change: the wrapped handle has the same output and error as the handle it wraps, so a function that takes `D: Processor<RenameUser>` accepts either one.
+A write hook wraps a handle and runs a processor around every **write** query that goes through it. Handlers don't change: the wrapped handle has the same output and error as the handle it wraps (for a `Db`, the query's own `Output` and `Error`), so a function that takes `D: Processor<RenameUser>` accepts either one.
 
 There are two wrappers, both in [`wakuwaku::entity`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/effect/hook/index.html):
 
@@ -81,6 +81,7 @@ impl Query for RecordAudit {
 
 impl Execute<PgSource> for RecordAudit {
     type Output = ();
+    type Error = sqlx::Error;
 
     async fn execute(self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO audit_log (subject, action, at) VALUES ($1, $2, now())")
@@ -236,7 +237,7 @@ Implement `Processor<PostChanged>` for the hook, or run post writes through a di
 
 ## Transactions bypass write hooks
 
-Queries inside a [transaction](/en/docs/data/transactions) run on the transaction's connection, so they don't pass through `BeforeWrite` / `AfterWrite`. To act on a transaction, hook its final state with `AfterTransaction`. Its hook receives the flow's report together with what became of the transaction: committed, rolled back, or commit outcome unknown. The two compose: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>` hooks queries run on their own *and* transactions. `AfterWrite::inner()` gives you back the transaction hook.
+Queries inside a [transaction](/en/docs/data/transactions) run on the transaction's connection, so they don't pass through `BeforeWrite` / `AfterWrite`. To act on a transaction, hook its final state with [`AfterTransaction`](/en/docs/data/transactions#hooking-the-end-of-a-transaction). Its hook receives the flow's report together with what became of the transaction: committed, rolled back, or commit outcome unknown. Queries run on their own pass through it unchanged, so the two compose: `AfterWrite<AfterTransaction<Db<_, _>, _, _>, _, _>` hooks queries run on their own *and* transactions. `AfterWrite::inner()` gives you back the transaction hook.
 
 ## Test a hook
 

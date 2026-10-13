@@ -6,7 +6,7 @@ icon: Download
 
 ## Rust toolchain
 
-wakuwaku is written in Rust edition 2024, which needs Rust 1.85 or newer. Its dependencies raise that floor. At the versions locked for wakuwaku 1.0.0-rc1, the minimum depends on the features you enable:
+wakuwaku is written in Rust edition 2024, which needs Rust 1.85 or newer. Its dependencies raise that floor. At the versions locked for wakuwaku 1.0.0-rc2, the minimum depends on the features you enable:
 
 | Features                     | Minimum Rust | Raised by               |
 | ---------------------------- | ------------ | ----------------------- |
@@ -30,33 +30,33 @@ Add `wakuwaku` with the features you need, plus `tokio` for the runtime:
 
 ```toml tab="gRPC service"
 [dependencies]
-wakuwaku = "1.0.0-rc1" # defaults: grpc, proof
+wakuwaku = "1.0.0-rc2" # defaults: grpc, proof
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 ```toml tab="Events + PostgreSQL + Redis"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["iggy", "sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["iggy", "sqlx-pg", "redis"] }
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 ```toml tab="Search indexer"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg", "meilisearch"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg", "meilisearch"] }
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 ```toml tab="No gRPC"
 [dependencies]
 # A worker that only consumes events and writes to MySQL.
-wakuwaku = { version = "1.0.0-rc1", default-features = false, features = ["iggy", "sqlx-mysql"] }
+wakuwaku = { version = "1.0.0-rc2", default-features = false, features = ["iggy", "sqlx-mysql"] }
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 `entity` is enabled automatically by any of `sqlx-pg`, `sqlx-mysql`, `redis`, and `meilisearch`. Enable it alone only if you want the query and capability types without a data source, for example in a crate that defines queries for an in-memory store.
 
 <Callout type="info" title="Release candidates">
-The requirement `"1.0.0-rc1"` also accepts later release candidates and 1.0.0 itself. Write `"=1.0.0-rc1"` if you want to move to the next candidate only when you choose to.
+The requirement `"1.0.0-rc2"` also accepts later release candidates and 1.0.0 itself. Write `"=1.0.0-rc2"` if you want to move to the next candidate only when you choose to.
 </Callout>
 
 ## Why `wakuwaku::deps`
@@ -109,7 +109,7 @@ tonic-prost-build = "0.14"
 
 ```toml
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg", "redis"] }
 sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "migrate", "uuid"] }
 redis = { version = "1", default-features = false, features = ["tokio-rustls-comp"] }
 ```

@@ -99,7 +99,7 @@ mod tests {
 
 ## Registering through the service builder
 
-Handlers usually need shared dependencies: a database pool, an HTTP client, a `Publisher`. Implement [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) for the handler, as above, and let [`ServiceBuilder::iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/iggy_consumer/index.html) build it from a dependency already registered in the [service builder](/en/docs/core/service-builder):
+Handlers usually need shared dependencies: a database pool, an HTTP client, a `Publisher`. Implement [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) for the handler, as above, and let [`ServiceBuilder::iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/iggy_consumer/index.html) build it from a dependency already registered in the [service builder](/en/docs/core/service-builder) (a handler that needs several services is [composed](#handlers-that-need-several-services) instead):
 
 ```rust title="src/main.rs"
 use std::sync::Arc;
@@ -136,55 +136,90 @@ The three type parameters are `<Handler, Event, Position>`:
 - **`Event`** can be `_` when the handler implements `EventHandler` for exactly one event. Name it when one handler type handles several events: `.iggy_consumer::<MyHandler, MyEvent, _>()`.
 - **`Position`** is where the handler's `Dep` sits in the builder. `_` works when that type is registered once; otherwise name it with `Here` / `There`, as for any [`provide`](/en/docs/core/service-builder) call. A dependency that was never registered is a compile error.
 
-Each `iggy_consumer` call builds its handler immediately: it clones the `Dep` out of the builder, calls `create_service`, and wraps the handler in an `Arc`. The chain ends with either:
+Each `iggy_consumer` call builds its handler immediately: it clones the `Dep` out of the builder, calls `create_service`, and wraps the handler in an `Arc`. Calls to `iggy_consumer` and [`compose_iggy_consumer`](#handlers-that-need-several-services) chain in any order, and the chain ends with either:
 
 - **`start(client, config)`**, which starts consuming and returns the service builder together with the running [`ConsumerRuntime`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html), so you can keep building the rest of the service; or
-- **`into_parts()`**, which returns the service builder and the unstarted `IggyConsumerRegisterCenter`, to start later or to extend with handlers built by hand.
+- **`into_parts()`**, which returns the service builder and the unstarted `IggyConsumerRegisterCenter`, to start later:
+
+```rust title="src/main.rs"
+let (services, orders) = ServiceBuilder::new(OrderStore::default())
+    .iggy_consumer::<RecordOrder, _, _>()
+    .iggy_consumer::<ApplyPayment, _, _>()
+    .into_parts();
+
+// ... finish setting up the service from `services`, then:
+let consumers = orders
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .await?;
+```
+
+## Handlers that need several services
+
+`iggy_consumer` builds a handler from **one** registered dependency. A handler that needs several, or one you construct by hand, is registered with [`compose_iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html#method.compose_iggy_consumer) instead. Its closure borrows the service builder, takes what it needs with `provide`, and returns the handler in an `Arc`. The handler needs no `ServiceCreation` impl, and it is not registered as a service, so it can't be another component's dependency.
+
+Say recording an order should also mail a confirmation. The handler now needs the `OrderStore` and a `Mailer` (another stand-in, a cheap-to-clone handle):
+
+```rust title="src/handlers.rs"
+/// Writes new orders and mails a confirmation.
+pub struct RecordAndConfirmOrder {
+    pub store: OrderStore,
+    pub mailer: Mailer,
+}
+
+impl EventHandler<OrderPlaced> for RecordAndConfirmOrder {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+    async fn handle(&self, run: &[OrderPlaced]) -> Result<(), HandleError> {
+        for order in run {
+            self.store.insert(order.order_id, order.total_cents).await;
+            self.mailer
+                .confirm(&order.customer, order.order_id)
+                .await
+                .map_err(HandleError::retryable)?;
+        }
+        Ok(())
+    }
+}
+```
+
+```rust title="src/main.rs"
+let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
+    .push(Mailer::default())
+    .compose_iggy_consumer(|s| {
+        Arc::new(RecordAndConfirmOrder {
+            store: s.provide::<OrderStore, _>().clone(),
+            mailer: s.provide::<Mailer, _>().clone(),
+        })
+    })
+    .iggy_consumer::<ApplyPayment, _, _>()
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .await?;
+```
+
+The handler and event types are inferred from the returned `Arc`. When the handler implements `EventHandler` for several events, name the event: `.compose_iggy_consumer::<_, MyEvent>(|s| …)`. A handler built before the builder, or shared with other code, is moved in as is: `.compose_iggy_consumer(move |_| handler)`. The other `compose_*` methods of the service builder work the same way; see [Composing components with a closure](/en/docs/core/service-builder#composing-components-with-a-closure).
 
 ## Registering directly
 
-`ServiceBuilder::iggy_consumer` is a convenience over [`IggyConsumerRegisterCenter`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/struct.IggyConsumerRegisterCenter.html), a type-level list of handlers. You can use it directly, for example when the handlers do not come from the service builder:
+`ServiceBuilder::iggy_consumer` is a convenience over [`IggyConsumerRegisterCenter`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/struct.IggyConsumerRegisterCenter.html), a type-level list of handlers. You can use it directly, for example when your service has no `ServiceBuilder`:
 
 ```rust title="src/direct.rs"
 pub async fn start_by_hand(
     client: Arc<IggyClient>,
     store: OrderStore,
 ) -> Result<ConsumerRuntime, Error> {
-    IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::new(store.clone())))
-        .push(Arc::new(ApplyPayment::new(store)))
+    IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::create_service(store.clone())))
+        .push(Arc::new(ApplyPayment::create_service(store)))
         .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
         .await
 }
 ```
 
-`new` starts the list with its first handler and every `push` adds one. Handlers are passed as `Arc`, so one handler value can serve several event types. When the handler type implements `EventHandler` for more than one event, name the event. Here `Audit` is a dependency-free handler that implements `EventHandler<OrderPlaced>` and `EventHandler<PaymentReceived>`:
+`new` starts the list with its first handler and every `push` adds one. Handlers are passed as `Arc`, so one handler value can serve several event types. When the handler type implements `EventHandler` for more than one event, name the event. Here `Audit` implements both `EventHandler<OrderPlaced>` and `EventHandler<PaymentReceived>`:
 
 ```rust title="src/direct.rs"
-pub async fn audit_only(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
-    let audit = Arc::new(Audit);
-    IggyConsumerRegisterCenter::<_, OrderPlaced>::new(audit.clone())
-        .push::<_, PaymentReceived>(audit)
-        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
-        .await
-}
-```
-
-Both styles mix through `into_parts`:
-
-```rust title="src/direct.rs"
-pub async fn mixed(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
-    let (services, orders) = ServiceBuilder::new(OrderStore::default())
-        .iggy_consumer::<RecordOrder, _, _>()
-        .into_parts();
-
-    let _store: &OrderStore = services.provide::<OrderStore, _>();
-
-    // `orders` is a plain `IggyConsumerRegisterCenter`: push hand-built handlers.
-    orders
-        .push::<Audit, PaymentReceived>(Arc::new(Audit))
-        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
-        .await
-}
+let audit = Arc::new(Audit);
+let handlers = IggyConsumerRegisterCenter::<_, OrderPlaced>::new(audit.clone())
+    .push::<_, PaymentReceived>(audit);
 ```
 
 ## One main topic per consumer
@@ -201,7 +236,11 @@ A consumer reads exactly one main topic: the `SUPER_PARTITION_NAME` of its event
 | `Error::PartitionCountMismatch` | `retry_<topic>` exists with a different partition count than the main topic |
 | `Error::Iggy` | an Iggy call failed (for example the server is unreachable or the retry topic cannot be created), or the stream or consumer name is not a valid identifier |
 
-To consume events of another key type, start a second consumer. Records whose tag no registered handler matches are dropped and logged, and the offset moves past them. A consumer that registers only some of a topic's event types therefore simply skips the others, which is fine on purpose but a silent loss by mistake: when you add an event type to a topic, also register it in every consumer that needs it.
+To consume events of another key type, start a second consumer. Records whose tag no registered handler matches are dropped and logged, and the offset moves past them. A consumer that registers only some of a topic's event types therefore simply skips the others, which is fine on purpose but a silent loss by mistake: when you add an event type to a topic, also register its handler in the topic's consumer.
+
+<Callout type="warn" title="One consumer name per topic and stream">
+  The retry topic is named after the main topic only (`retry_<topic>`), so every consumer of a topic in one stream shares it, whatever its `consumer_name`. Two consumers with different names on the same topic would each read the other's retry records and run them with their own handlers, and each would quarantine keys because of the other's failures. Run one consumer name per topic and stream: register all handlers of a topic in that one consumer (its replicas share the name and [split the partitions](#partitions-and-tasks)). If two independent consumers really need the same events, publish them to two streams.
+</Callout>
 
 ## Configuration
 
@@ -340,17 +379,39 @@ Any error convertible into `anyhow::Error` can be wrapped, which includes every 
 
 ## Shutdown
 
-[`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) aborts every partition task and waits for them to stop:
+A [`ConsumerRuntime`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) stops in one of three ways:
+
+| Way | What happens |
+|---|---|
+| `shutdown().await` | **Graceful.** Each partition task stops polling. Its waits for new work (reading offsets, polling, idling between polls) are cancelled, but work that has started runs to the end: the handler calls of the batch in flight and of the retries already started finish, failures are written to the retry topic, and offsets are stored. Then the call returns. |
+| `abort().await` | Every partition task is cancelled now, and the call waits for them to stop. A handler is cut off at its next `.await`, possibly midway through side effects outside Iggy. |
+| dropping the runtime | Same as `abort`, without waiting. |
+
+What a stop costs depends on the [delivery mode](#delivery-modes):
+
+| | `NoEventLose` | `NoDoubleConsume` |
+|---|---|---|
+| `shutdown` | nothing is lost or repeated from the work in flight; retries not run yet stay in the retry topic and are read again by the next consumer with the same `consumer_name` | nothing is lost from the batch in flight; retry records already read from the retry partition but not run yet are lost |
+| `abort` or drop | nothing is lost; everything not yet committed is processed again by the next consumer with the same `consumer_name`, including the handler calls that were cut off | the unprocessed events of the batch in flight are lost, and so are retry records already read but not run yet |
+
+`shutdown` waits as long as the work in flight takes. A handler that keeps returning `Transient` is retried until it succeeds, and Iggy calls (storing an offset, writing to the retry topic) are retried while the server is unreachable. Bound the wait with a timeout that fits your platform's grace period (Kubernetes, for example, kills a pod 30 seconds after asking it to stop, by default):
 
 ```rust
+use std::time::Duration;
+
 tokio::signal::ctrl_c().await?;
-consumers.shutdown().await;
+if tokio::time::timeout(Duration::from_secs(20), consumers.shutdown())
+    .await
+    .is_err()
+{
+    eprintln!("consumer shutdown timed out; the remaining work was aborted");
+}
 ```
 
-This is an abort, not a drain: handler calls in flight are cancelled at their next `.await`. With `NoEventLose` that loses nothing, because the work that was not committed is read again by the next consumer with the same `consumer_name`. With `NoDoubleConsume`, the events of the batch in flight are lost.
+When the timeout fires, the unfinished `shutdown` future is dropped together with the runtime it owns, which aborts the tasks still running: the work that did not finish costs what an abort costs. Use `abort` directly only when the work in flight can't be waited for at all.
 
 <Callout type="error" title="Keep the runtime alive">
-  Dropping the `ConsumerRuntime` also aborts every partition task. Bind it to a named variable for as long as the service runs; `let _ = … .start(…).await?;` drops it immediately and stops consuming before a single batch is processed.
+  Dropping the `ConsumerRuntime` aborts every partition task. Bind it to a named variable for as long as the service runs; `let _ = … .start(…).await?;` drops it immediately and stops consuming before a single batch is processed.
 </Callout>
 
 ## Next steps

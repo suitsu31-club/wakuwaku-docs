@@ -99,7 +99,7 @@ mod tests {
 
 ## サービスビルダーで登録する [#registering-through-the-service-builder]
 
-ハンドラはたいてい、データベースのプール、HTTP クライアント、`Publisher` などの共有依存を必要とします。上の例のようにハンドラに [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装し、[`ServiceBuilder::iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/iggy_consumer/index.html) に、[サービスビルダー](/ja/docs/core/service-builder) に登録済みの依存から組み立てさせます。
+ハンドラはたいてい、データベースのプール、HTTP クライアント、`Publisher` などの共有依存を必要とします。上の例のようにハンドラに [`ServiceCreation`](https://docs.rs/wakuwaku/latest/wakuwaku/services/trait.ServiceCreation.html) を実装し、[`ServiceBuilder::iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/iggy_consumer/index.html) に、[サービスビルダー](/ja/docs/core/service-builder) に登録済みの依存から組み立てさせます（複数のサービスを必要とするハンドラは、代わりに [組み立てて登録](#handlers-that-need-several-services) します）。
 
 ```rust title="src/main.rs"
 use std::sync::Arc;
@@ -136,55 +136,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **`Event`** は、ハンドラがちょうど 1 つのイベントに対して `EventHandler` を実装しているなら `_` にできます。1 つのハンドラ型が複数のイベントを扱う場合は名前を指定します: `.iggy_consumer::<MyHandler, MyEvent, _>()`。
 - **`Position`** は、ハンドラの `Dep` がビルダー内のどこにあるかを表します。その型が 1 回だけ登録されていれば `_` で推論できます。そうでなければ、他の [`provide`](/ja/docs/core/service-builder) 呼び出しと同様に `Here` / `There` で指定します。登録されていない依存はコンパイルエラーになります。
 
-`iggy_consumer` を呼ぶたびに、その場でハンドラが組み立てられます。ビルダーから `Dep` をクローンして `create_service` を呼び、ハンドラを `Arc` で包みます。チェーンの最後は次のどちらかです。
+`iggy_consumer` を呼ぶたびに、その場でハンドラが組み立てられます。ビルダーから `Dep` をクローンして `create_service` を呼び、ハンドラを `Arc` で包みます。`iggy_consumer` と [`compose_iggy_consumer`](#handlers-that-need-several-services) は任意の順序でチェーンでき、チェーンの最後は次のどちらかです。
 
 - **`start(client, config)`**: 購読を開始し、サービスビルダーと実行中の [`ConsumerRuntime`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) を返します。続けてサービスの残りを組み立てられます。
-- **`into_parts()`**: サービスビルダーと未起動の `IggyConsumerRegisterCenter` を返します。後で起動したり、手で組み立てたハンドラを追加したりできます。
+- **`into_parts()`**: サービスビルダーと未起動の `IggyConsumerRegisterCenter` を返します。後で起動できます。
+
+```rust title="src/main.rs"
+let (services, orders) = ServiceBuilder::new(OrderStore::default())
+    .iggy_consumer::<RecordOrder, _, _>()
+    .iggy_consumer::<ApplyPayment, _, _>()
+    .into_parts();
+
+// ... `services` からサービスの残りを組み立ててから:
+let consumers = orders
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .await?;
+```
+
+## 複数のサービスを必要とするハンドラ [#handlers-that-need-several-services]
+
+`iggy_consumer` は、登録済みの依存 **1 つ** からハンドラを組み立てます。複数の依存を必要とするハンドラや、手で組み立てるハンドラは、代わりに [`compose_iggy_consumer`](https://docs.rs/wakuwaku/latest/wakuwaku/services/builder/struct.ServiceBuilder.html#method.compose_iggy_consumer) で登録します。そのクロージャはサービスビルダーを借用し、必要なものを `provide` で取り出して、ハンドラを `Arc` で包んで返します。ハンドラに `ServiceCreation` の実装は不要です。また、サービスとしては登録されないので、他のコンポーネントの依存にはなれません。
+
+たとえば、注文を記録するときに確認メールも送るとします。ハンドラには `OrderStore` に加えて `Mailer`（これも代役で、安価にクローンできるハンドル）が必要になります。
+
+```rust title="src/handlers.rs"
+/// 新しい注文を書き込み、確認メールを送る。
+pub struct RecordAndConfirmOrder {
+    pub store: OrderStore,
+    pub mailer: Mailer,
+}
+
+impl EventHandler<OrderPlaced> for RecordAndConfirmOrder {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+    async fn handle(&self, run: &[OrderPlaced]) -> Result<(), HandleError> {
+        for order in run {
+            self.store.insert(order.order_id, order.total_cents).await;
+            self.mailer
+                .confirm(&order.customer, order.order_id)
+                .await
+                .map_err(HandleError::retryable)?;
+        }
+        Ok(())
+    }
+}
+```
+
+```rust title="src/main.rs"
+let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
+    .push(Mailer::default())
+    .compose_iggy_consumer(|s| {
+        Arc::new(RecordAndConfirmOrder {
+            store: s.provide::<OrderStore, _>().clone(),
+            mailer: s.provide::<Mailer, _>().clone(),
+        })
+    })
+    .iggy_consumer::<ApplyPayment, _, _>()
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .await?;
+```
+
+ハンドラとイベントの型は、返された `Arc` から推論されます。ハンドラが複数のイベントに対して `EventHandler` を実装している場合は、イベントを指定します: `.compose_iggy_consumer::<_, MyEvent>(|s| …)`。ビルダーより前に組み立てたハンドラや、他のコードと共有するハンドラは、そのまま move で渡せます: `.compose_iggy_consumer(move |_| handler)`。サービスビルダーの他の `compose_*` メソッドも同じ仕組みです。[クロージャでコンポーネントを組み立てる](/ja/docs/core/service-builder#composing-components-with-a-closure) を参照してください。
 
 ## 直接登録する [#registering-directly]
 
-`ServiceBuilder::iggy_consumer` は、ハンドラの型レベルリストである [`IggyConsumerRegisterCenter`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/struct.IggyConsumerRegisterCenter.html) を便利に使うためのものです。ハンドラがサービスビルダーから来ない場合などは、これを直接使えます。
+`ServiceBuilder::iggy_consumer` は、ハンドラの型レベルリストである [`IggyConsumerRegisterCenter`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/handler/struct.IggyConsumerRegisterCenter.html) を便利に使うためのものです。サービスに `ServiceBuilder` がない場合などは、これを直接使えます。
 
 ```rust title="src/direct.rs"
 pub async fn start_by_hand(
     client: Arc<IggyClient>,
     store: OrderStore,
 ) -> Result<ConsumerRuntime, Error> {
-    IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::new(store.clone())))
-        .push(Arc::new(ApplyPayment::new(store)))
+    IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::create_service(store.clone())))
+        .push(Arc::new(ApplyPayment::create_service(store)))
         .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
         .await
 }
 ```
 
-`new` で最初のハンドラからリストを始め、`push` のたびに 1 つ追加します。ハンドラは `Arc` で渡すので、1 つのハンドラの値で複数のイベント型を処理できます。ハンドラ型が複数のイベントに対して `EventHandler` を実装している場合は、イベントを指定します。ここでの `Audit` は依存を持たないハンドラで、`EventHandler<OrderPlaced>` と `EventHandler<PaymentReceived>` を実装しています。
+`new` で最初のハンドラからリストを始め、`push` のたびに 1 つ追加します。ハンドラは `Arc` で渡すので、1 つのハンドラの値で複数のイベント型を処理できます。ハンドラ型が複数のイベントに対して `EventHandler` を実装している場合は、イベントを指定します。ここでの `Audit` は `EventHandler<OrderPlaced>` と `EventHandler<PaymentReceived>` の両方を実装しています。
 
 ```rust title="src/direct.rs"
-pub async fn audit_only(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
-    let audit = Arc::new(Audit);
-    IggyConsumerRegisterCenter::<_, OrderPlaced>::new(audit.clone())
-        .push::<_, PaymentReceived>(audit)
-        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
-        .await
-}
-```
-
-2 つの方法は `into_parts` で組み合わせられます。
-
-```rust title="src/direct.rs"
-pub async fn mixed(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
-    let (services, orders) = ServiceBuilder::new(OrderStore::default())
-        .iggy_consumer::<RecordOrder, _, _>()
-        .into_parts();
-
-    let _store: &OrderStore = services.provide::<OrderStore, _>();
-
-    // `orders` は普通の `IggyConsumerRegisterCenter`。手で作ったハンドラを push できる。
-    orders
-        .push::<Audit, PaymentReceived>(Arc::new(Audit))
-        .start(client, ConsumerConfig::new("shop", "order-audit", vec![0, 1, 2, 3]))
-        .await
-}
+let audit = Arc::new(Audit);
+let handlers = IggyConsumerRegisterCenter::<_, OrderPlaced>::new(audit.clone())
+    .push::<_, PaymentReceived>(audit);
 ```
 
 ## 1 つのコンシューマにメイントピックは 1 つ [#one-main-topic-per-consumer]
@@ -201,7 +236,11 @@ pub async fn mixed(client: Arc<IggyClient>) -> Result<ConsumerRuntime, Error> {
 | `Error::PartitionCountMismatch` | `retry_<topic>` が、メイントピックと異なるパーティション数で存在する |
 | `Error::Iggy` | Iggy の呼び出しが失敗した（サーバーに到達できない、リトライトピックを作成できない、など）、またはストリーム名やコンシューマ名が有効な識別子でない |
 
-別のキー型のイベントを購読するには、2 つ目のコンシューマを起動します。登録したどのハンドラにも一致しないタグのレコードは、ログに記録されたうえで破棄され、オフセットはその先へ進みます。トピックのイベント型の一部だけを登録したコンシューマは、残りを単に読み飛ばします。意図的なら問題ありませんが、うっかりなら静かなデータ欠落です。トピックにイベント型を追加したら、それを必要とするすべてのコンシューマにも登録してください。
+別のキー型のイベントを購読するには、2 つ目のコンシューマを起動します。登録したどのハンドラにも一致しないタグのレコードは、ログに記録されたうえで破棄され、オフセットはその先へ進みます。トピックのイベント型の一部だけを登録したコンシューマは、残りを単に読み飛ばします。意図的なら問題ありませんが、うっかりなら静かなデータ欠落です。トピックにイベント型を追加したら、そのハンドラもトピックのコンシューマに登録してください。
+
+<Callout type="warn" title="トピックとストリームごとにコンシューマ名は 1 つ">
+  リトライトピックの名前はメイントピックだけから決まる（`retry_<topic>`）ので、1 つのストリームで同じトピックを読むコンシューマは、`consumer_name` に関係なくすべて同じリトライトピックを共有します。名前の異なる 2 つのコンシューマが同じトピックを読むと、それぞれが相手のリトライレコードを読んで自分のハンドラで実行し、相手の失敗によってキーを隔離します。トピックとストリームごとにコンシューマ名は 1 つにしてください。つまり、トピックのハンドラはすべて 1 つのコンシューマに登録します（そのレプリカは同じ名前を使い、[パーティションを分担](#partitions-and-tasks) します）。互いに独立した 2 つのコンシューマが本当に同じイベントを必要とするなら、イベントを 2 つのストリームに発行してください。
+</Callout>
 
 ## 設定 [#configuration]
 
@@ -340,17 +379,39 @@ Iggy 自体の失敗（ポーリング、オフセットの保存、リトライ
 
 ## シャットダウン [#shutdown]
 
-[`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) はすべてのパーティションのタスクを中断し、停止するまで待ちます。
+[`ConsumerRuntime`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) の止め方は 3 通りあります。
+
+| 方法 | 何が起きるか |
+|---|---|
+| `shutdown().await` | **グレースフル。** 各パーティションのタスクはポーリングをやめます。新しい作業を待つ処理（オフセットの読み込み、ポーリング、ポーリング間の待機）はキャンセルされますが、始まった作業は最後まで実行されます。処理中のバッチと、すでに始まったリトライのハンドラ呼び出しが完了し、失敗はリトライトピックに書き込まれ、オフセットが保存されます。そのうえで呼び出しが返ります。 |
+| `abort().await` | すべてのパーティションのタスクを直ちにキャンセルし、停止するまで待ちます。ハンドラは次の `.await` の時点で打ち切られます。Iggy 以外への副作用の途中かもしれません。 |
+| ランタイムをドロップする | `abort` と同じですが、停止を待ちません。 |
+
+止めたときに何を失うかは [配信モード](#delivery-modes) によって決まります。
+
+| | `NoEventLose` | `NoDoubleConsume` |
+|---|---|---|
+| `shutdown` | 処理中の作業からは何も失われず、繰り返されもしない。まだ実行していないリトライはリトライトピックに残り、同じ `consumer_name` を使う次のコンシューマがもう一度読む | 処理中のバッチからは何も失われない。リトライパーティションから読み込み済みでまだ実行していないリトライレコードは失われる |
+| `abort` またはドロップ | 何も失われない。まだコミットされていないものはすべて、打ち切られたハンドラ呼び出しも含めて、同じ `consumer_name` を使う次のコンシューマがもう一度処理する | 処理中のバッチの未処理のイベントは失われる。読み込み済みでまだ実行していないリトライレコードも失われる |
+
+`shutdown` は処理中の作業にかかるだけ待ちます。`Transient` を返し続けるハンドラは成功するまで再試行され、Iggy の呼び出し（オフセットの保存、リトライトピックへの書き込み）もサーバーに到達できない間は再試行されます。待ち時間は、プラットフォームの猶予期間に合ったタイムアウトで制限してください（たとえば Kubernetes は、既定では停止を求めてから 30 秒後に Pod を強制終了します）。
 
 ```rust
+use std::time::Duration;
+
 tokio::signal::ctrl_c().await?;
-consumers.shutdown().await;
+if tokio::time::timeout(Duration::from_secs(20), consumers.shutdown())
+    .await
+    .is_err()
+{
+    eprintln!("consumer shutdown timed out; the remaining work was aborted");
+}
 ```
 
-これは中断 (abort) であり、処理中の作業を流し切る (drain) ものではありません。実行中のハンドラ呼び出しは、次の `.await` の時点でキャンセルされます。`NoEventLose` なら何も失われません。コミットされていない作業は、同じ `consumer_name` を使う次のコンシューマがもう一度読むからです。`NoDoubleConsume` では、処理中だったバッチのイベントが失われます。
+タイムアウトすると、終わっていない `shutdown` の future が、それが所有するランタイムごとドロップされ、まだ動いているタスクは中断されます。終わらなかった作業は、中断 (abort) した場合と同じ扱いになります。`abort` を直接使うのは、処理中の作業をまったく待てない場合だけにしてください。
 
 <Callout type="error" title="ランタイムを生かしておく">
-  `ConsumerRuntime` をドロップしても、すべてのパーティションのタスクが中断されます。サービスが動いている間は名前付きの変数に束縛しておいてください。`let _ = … .start(…).await?;` と書くと即座にドロップされ、1 バッチも処理しないうちに購読が止まります。
+  `ConsumerRuntime` をドロップすると、すべてのパーティションのタスクが中断されます。サービスが動いている間は名前付きの変数に束縛しておいてください。`let _ = … .start(…).await?;` と書くと即座にドロップされ、1 バッチも処理しないうちに購読が止まります。
 </Callout>
 
 ## 次のステップ [#next-steps]

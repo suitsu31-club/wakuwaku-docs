@@ -1,16 +1,16 @@
 ---
 title: 0.3 からの移行
-description: wakuwaku 0.3 から 1.0.0-rc1 へサービスを移行する方法を、置き換えられた各モジュールの移行前後のコードとともに説明します。
+description: wakuwaku 0.3 から 1.0.0-rc2 へサービスを移行する方法を、置き換えられた各モジュールの移行前後のコードとともに説明します。
 icon: ArrowUpCircle
 ---
 
-wakuwaku 0.3 はユーティリティの集まりでした。RabbitMQ との連携、Redis と sqlx のヘルパー、リソースプール、そしてサービスビルダーです。1.0.0-rc1 はサービスビルダーを引き継ぎつつ、フレームワークになりました。データアクセス、イベント、バリデーションは別クレートとなってフィーチャーフラグの裏で再エクスポートされ、RabbitMQ は Apache Iggy に置き換わっています。
+wakuwaku 0.3 はユーティリティの集まりでした。RabbitMQ との連携、Redis と sqlx のヘルパー、リソースプール、そしてサービスビルダーです。1.0.0-rc2 はサービスビルダーを引き継ぎつつ、フレームワークになりました。データアクセス、イベント、バリデーションは別クレートとなってフィーチャーフラグの裏で再エクスポートされ、RabbitMQ は Apache Iggy に置き換わっています。
 
-このページでは変更点をモジュールごとに説明します。各節では、0.3.1 向けに書いたコードと、それに相当する 1.0.0-rc1 のコードを示します。どちらも、それぞれのバージョンに対してコンパイルを確認しています。
+このページでは変更点をモジュールごとに説明します。各節では、0.3.1 向けに書いたコードと、それに相当する 1.0.0-rc2 のコードを示します。どちらも、それぞれのバージョンに対してコンパイルを確認しています。
 
 ## まとめ
 
-| 0.3                                                         | 1.0.0-rc1                                                    |
+| 0.3                                                         | 1.0.0-rc2                                                    |
 | ----------------------------------------------------------- | ------------------------------------------------------------ |
 | `services::builder::ServiceBuilder`、`services::ServiceCreation` | 変更なし。`wakuwaku::ServiceBuilder`、`wakuwaku::ServiceCreation` としても再エクスポート |
 | `services::grpc_service`、`ServiceBuilder::grpc_service`    | 変更なし                                                     |
@@ -27,7 +27,7 @@ wakuwaku 0.3 はユーティリティの集まりでした。RabbitMQ との連�
 
 フィーチャーフラグは次のように変わりました。
 
-| 0.3 のフィーチャー     | 1.0.0-rc1                                                              |
+| 0.3 のフィーチャー     | 1.0.0-rc2                                                              |
 | ---------------------- | ---------------------------------------------------------------------- |
 | `amqprs` (デフォルト)  | 削除。イベントには `iggy` を使います (ブローカーが異なります。後述)。  |
 | `redis` (デフォルト)   | `redis`                                                                |
@@ -39,7 +39,7 @@ wakuwaku 0.3 はユーティリティの集まりでした。RabbitMQ との連�
 | `tonic` (暗黙のフィーチャー) | `grpc`。デフォルトで有効になりました                             |
 | なし                   | 新規: `proof`、`iggy`、`entity`、`meilisearch`                         |
 
-0.3 では `kanau`、`sqlx`、`tonic` に自分で依存していました。1.0.0-rc1 では、バージョンを wakuwaku と一致させるために `wakuwaku::deps` 経由でインポートします。例外は、クレートをパスで参照するコード生成と derive マクロです。[インストール](/ja/docs/getting-started/installation#when-you-need-a-direct-dependency) を参照してください。
+0.3 では `kanau`、`sqlx`、`tonic` に自分で依存していました。1.0.0-rc2 では、バージョンを wakuwaku と一致させるために `wakuwaku::deps` 経由でインポートします。例外は、クレートをパスで参照するコード生成と derive マクロです。[インストール](/ja/docs/getting-started/installation#when-you-need-a-direct-dependency) を参照してください。
 
 ```toml tab="0.3"
 [dependencies]
@@ -51,7 +51,7 @@ tonic = "0.14"
 
 ```toml tab="1.0"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["iggy", "sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["iggy", "sqlx-pg", "redis"] }
 tokio = { version = "1.53", features = ["full"] }
 # Only for #[derive(JsonMessageSer, JsonMessageDe)] on message bodies.
 kanau = { version = "0.6", features = ["serde_json"] }
@@ -234,7 +234,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 0.3 の各要素は次のように対応します。
 
-| 0.3                                         | 1.0.0-rc1                                                                 |
+| 0.3                                         | 1.0.0-rc2                                                                 |
 | ------------------------------------------- | ------------------------------------------------------------------------- |
 | `AmqpRouting::EXCHANGE`                     | `Publisher::new` と `ConsumerConfig::new` に渡す Iggy のストリーム        |
 | `AmqpRouting::ROUTING_KEY`                  | `Event::TYPE_TAG` と、キー型の `SUPER_PARTITION_NAME` (トピック)          |
@@ -256,7 +256,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 ## インターバルジョブは cron ジョブに
 
-0.3 の `IntervalJobExecutionSignal` は、シグナルメッセージを出すべきタイミングを表すものでした。`time_pool` を自分のループから呼び、シグナルを RabbitMQ に発行し、それをコンシューマーで処理する必要がありました。1.0.0-rc1 では、`CronJob` がプロセス内で一定間隔ごとに処理そのものを実行します。
+0.3 の `IntervalJobExecutionSignal` は、シグナルメッセージを出すべきタイミングを表すものでした。`time_pool` を自分のループから呼び、シグナルを RabbitMQ に発行し、それをコンシューマーで処理する必要がありました。1.0.0-rc2 では、`CronJob` がプロセス内で、`INTERVAL` が宣言するスケジュールに従って処理そのものを実行します。
 
 ```rust tab="0.3"
 use std::task::Poll;
@@ -298,7 +298,7 @@ impl IntervalJobExecutionSignal for ExpireSessionsSignal {
 use std::convert::Infallible;
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::{CronJob, CronTick, ServiceBuilder, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceBuilder, ServiceCreation};
 
 #[derive(Clone)]
 struct SessionStore;
@@ -324,7 +324,7 @@ impl Processor<CronTick> for ExpireSessions {
 }
 
 impl CronJob for ExpireSessions {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 
 async fn run() {
@@ -424,7 +424,7 @@ async fn connect() -> Result<Db<RedisSource, ReadWrite>, Box<dyn std::error::Err
 
 ## `DatabaseProcessor` は `SqlxSource` と `Db` に
 
-0.3 では `PgPool` を `DatabaseProcessor` で包み、`db.db()` に対してどんな SQL でも実行できました。1.0.0-rc1 では、各クエリが読み書きする対象を宣言する値になり、その対象をカバーするケイパビリティを持つ `Db` を通して実行します。
+0.3 では `PgPool` を `DatabaseProcessor` で包み、`db.db()` に対してどんな SQL でも実行できました。1.0.0-rc2 では、各クエリが読み書きする対象を宣言する値になり、その対象をカバーするケイパビリティを持つ `Db` を通して実行します。
 
 ```rust tab="0.3"
 use wakuwaku::integration::sqlx::DatabaseProcessor;
@@ -456,6 +456,7 @@ impl Query for CountUsers {
 /// ...and how it runs.
 impl Execute<PgSource> for CountUsers {
     type Output = i64;
+    type Error = sqlx::Error;
     async fn execute(self, conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
         let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")
             .fetch_one(conn)
@@ -476,13 +477,13 @@ fn read_only(pool: PgPool) -> Db<PgSource, ReadOnly> {
 - プールは `SqlxSource` の中に隠されているので、ケイパビリティを迂回できません。マイグレーションは、プールをラップする前にそのプールで実行します。
 - `Db<PgSource, ReadOnly>` は、書き込みと宣言されたクエリを実行できません。コンパイルエラーになります。
 - MySQL は `sqlx-mysql` と `MySqlSource` でサポートされています。
-- トランザクションはステートマシンとして書きます。[トランザクション](/ja/docs/data/transactions) を参照してください。
+- トランザクションはフローとして書きます。フローは状態の型で、そのステップが 1 つの開いたトランザクションの中でクエリを実行し、BEGIN・COMMIT・ROLLBACK はライブラリが受け持ちます。[トランザクション](/ja/docs/data/transactions) を参照してください。
 
 詳細は [クエリ](/ja/docs/data/queries) と [sqlx](/ja/docs/data/sqlx) で説明しています。
 
 ## `wakuwaku::Error` の削除
 
-0.3 にはすべてに使う 1 つのエラー列挙型があり、`From<wakuwaku::Error> for tonic::Status` の変換も用意されていました。1.0.0-rc1 では、それぞれが包んでいる層のエラー型を使います。sqlx のソースは `sqlx::Error`、Redis は `RedisError`、イベントハンドラーは `HandleError`、バリデーションは `ValidateError` です。サービス独自のエラー型と、その `Status` への変換を定義してください。
+0.3 にはすべてに使う 1 つのエラー列挙型があり、`From<wakuwaku::Error> for tonic::Status` の変換も用意されていました。1.0.0-rc2 では、それぞれが包んでいる層のエラー型を使います。sqlx のソースは `sqlx::Error`、Redis は `RedisError`、イベントハンドラーは `HandleError`、バリデーションは `ValidateError` です。クエリは自分の `Error` を `Execute` の実装で宣言するので、自ら拒否しうるクエリ (楽観ロックの喪失、ビジネスルール違反) はその拒否をエラーとして返します。サービス独自のエラー型と、その `Status` への変換を定義してください。
 
 ```rust tab="0.3"
 use tonic::Status;
@@ -540,7 +541,7 @@ fn get_user(id: u64) -> Result<String, Status> {
 ## 次のステップ
 
 <Cards>
-  <Card title="クイックスタート" href="/ja/docs/getting-started/quick-start" description="gRPC と cron ジョブを備えた 1.0.0-rc1 の完全なサービス。" />
+  <Card title="クイックスタート" href="/ja/docs/getting-started/quick-start" description="gRPC と cron ジョブを備えた 1.0.0-rc2 の完全なサービス。" />
   <Card title="イベント" href="/ja/docs/events" description="Apache Iggy 上の型付きイベント。" />
   <Card title="データアクセス" href="/ja/docs/data" description="クエリ、ケイパビリティ、トランザクション。" />
 </Cards>

@@ -27,7 +27,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["iggy"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["iggy"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -95,7 +95,7 @@ use wakuwaku::iggy::{
     Event, EventAtomicOrdering, EventBody, EventHandler, EventTypeTag, IggySuperPartitionName,
     NonAssociative, PartitionKey,
 };
-use wakuwaku::{CronJob, CronTick, ServiceCreation};
+use wakuwaku::{CronJob, CronJobInterval, CronTick, ServiceCreation};
 
 use crate::proto::accounts_server::Accounts;
 use crate::proto::{Balance, GetBalanceRequest};
@@ -182,7 +182,7 @@ impl Processor<CronTick> for ExpireSessions {
 }
 
 impl CronJob for ExpireSessions {
-    const INTERVAL: Duration = Duration::from_secs(60);
+    const INTERVAL: CronJobInterval = CronJobInterval::AtLeast(Duration::from_secs(60));
 }
 
 // ---- Event handler: welcome mail for every new user.
@@ -410,8 +410,18 @@ If a step fails after earlier steps started components, `?` drops the `ConsumerR
 Step 6 runs until the shutdown signal. `shutdown_signal` completes on Ctrl-C and, on Unix, on `SIGTERM`, which is what container orchestrators send. The order then is: stop taking new work at the edge, then stop the background work.
 
 1. **gRPC.** When the signal completes, [`serve_with_incoming_shutdown`](https://docs.rs/tonic/0.14/tonic/transport/server/struct.Router.html#method.serve_with_incoming_shutdown) stops accepting connections, asks the open ones to shut down gracefully, and returns once all of them have closed, so requests in flight complete. A long-lived streaming RPC keeps its connection open until it ends; if you have those, bound the wait (for example with `tokio::time::timeout`). Use `serve_with_shutdown(addr, signal)` instead if you do not bind the port yourself.
-2. **Consumers.** [`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) aborts every partition task and waits until they have stopped. A handler call in progress is cancelled. What that costs depends on the [`DeliveryMode`](/en/docs/events/consuming): with the default `NoEventLose`, everything not yet committed is read again by the next consumer with the same name, so handlers must tolerate seeing an event twice; with `NoDoubleConsume`, events polled but not processed are lost.
-3. **Cron jobs.** [`CronRuntime::shutdown`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html) stops scheduling new runs and **waits** for runs in progress to finish. Dropping the `CronRuntime` instead aborts them.
+2. **Consumers.** [`ConsumerRuntime::shutdown`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) drains gracefully: it stops polling, lets handler calls already started complete, writes their failures to the retry partition, and stores offsets. Waits for new work (polling, idling) are cancelled. Retries not run yet are left as after a crash: with the default [`DeliveryMode`](/en/docs/events/consuming) `NoEventLose`, the next consumer with the same name reads them again, so handlers must tolerate seeing an event twice; with `NoDoubleConsume`, those already read from the retry partition are lost. [`ConsumerRuntime::abort`](https://docs.rs/wakuwaku-iggy/latest/wakuwaku_iggy/consumer/struct.ConsumerRuntime.html) cancels every partition task at once instead, cutting a handler at its next `.await`.
+3. **Cron jobs.** [`CronRuntime::shutdown`](https://docs.rs/wakuwaku/latest/wakuwaku/services/cron_job/struct.CronRuntime.html) stops scheduling new runs and **waits** for runs in progress to finish, including every overlapping run of an `AfterStart` job. `CronRuntime::abort` cancels runs in progress at their next `.await` and waits for them to stop.
+
+Dropping either runtime aborts its work without waiting. `shutdown` waits as long as the work takes, including a consumer retrying Iggy requests while the server is unreachable, so bound it with `tokio::time::timeout`. When the timeout fires, the `shutdown` future is dropped together with the runtime it owns, which aborts what is left:
+
+```rust
+// Give the background work at most 20 seconds; past that, cancel it.
+if tokio::time::timeout(Duration::from_secs(20), consumers.shutdown()).await.is_err() {
+    tracing::warn!("consumers did not drain in time");
+}
+```
+
 
 `main` keeps the result of serving in `served` and only applies `?` after the drain, so consumers and cron jobs are stopped cleanly even when the gRPC server failed.
 

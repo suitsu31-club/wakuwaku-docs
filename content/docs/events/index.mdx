@@ -58,7 +58,7 @@ Events are behind the `iggy` feature, which is off by default:
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["iggy"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["iggy"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -66,7 +66,7 @@ The feature enables:
 
 - `wakuwaku::iggy`: the re-exported `wakuwaku-iggy` crate (events, publisher, handlers, consumer runtime).
 - `wakuwaku::deps::iggy`: the Apache Iggy client SDK (`iggy` 0.11) that wakuwaku is built against. Use it for `IggyClient` and for creating streams and topics, instead of adding `iggy` yourself, so the versions always match.
-- `ServiceBuilder::iggy_consumer`: building event handlers from your service's shared dependencies.
+- `ServiceBuilder::iggy_consumer` and `ServiceBuilder::compose_iggy_consumer`: building event handlers from your service's shared dependencies.
 
 Event bodies are serialized with the `kanau::message` traits. Deriving them with serde JSON needs two extra dependencies; see [Serializing the body](/en/docs/events/defining-events#serializing-the-body).
 

@@ -256,13 +256,14 @@ pub struct MemorySource {
 impl DataSource for MemorySource {
     type Connection = Self;
     type Error = Infallible;
-    async fn run<Q: Execute<Self>>(&self, query: Q) -> Result<Q::Output, Infallible> {
+    async fn run<Q: Execute<Self>>(&self, query: Q) -> Result<Q::Output, Q::Error> {
         query.execute(&mut self.clone()).await
     }
 }
 
 impl Execute<MemorySource> for FindUser {
     type Output = Option<String>;
+    type Error = Infallible;
     async fn execute(self, conn: &mut MemorySource) -> Result<Option<String>, Infallible> {
         Ok(conn.users.lock().unwrap().get(&self.0).cloned())
     }
@@ -270,6 +271,7 @@ impl Execute<MemorySource> for FindUser {
 
 impl Execute<MemorySource> for RenameUser {
     type Output = ();
+    type Error = Infallible;
     async fn execute(self, conn: &mut MemorySource) -> Result<(), Infallible> {
         conn.users.lock().unwrap().insert(self.id, self.name);
         Ok(())
@@ -301,6 +303,8 @@ mod tests {
 ```
 
 Keep the in-memory source and its `Execute` implementations in test-only code (`#[cfg(test)]` or a test-support module) if production never uses them. What they cannot test is the SQL or the Redis commands themselves; those belong in integration tests against a real database.
+
+Transaction flows are the same: each step of a flow runs its queries inside an open transaction, so a flow runs only against a real database. Keep the decisions a step makes in plain functions of the state and the query results, and unit-test those; see [Testing transactions](/en/docs/data/transactions#testing).
 
 ## Controlling time
 

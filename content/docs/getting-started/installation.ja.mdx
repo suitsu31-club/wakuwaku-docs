@@ -6,7 +6,7 @@ icon: Download
 
 ## Rust ツールチェーン
 
-wakuwaku は Rust edition 2024 で書かれているため、Rust 1.85 以上が必要です。さらに依存クレートによって下限が引き上げられます。wakuwaku 1.0.0-rc1 でロックされているバージョンでは、有効にするフィーチャーごとに次のとおりです。
+wakuwaku は Rust edition 2024 で書かれているため、Rust 1.85 以上が必要です。さらに依存クレートによって下限が引き上げられます。wakuwaku 1.0.0-rc2 でロックされているバージョンでは、有効にするフィーチャーごとに次のとおりです。
 
 | フィーチャー                 | 必要な Rust | 引き上げている依存      |
 | ---------------------------- | ----------- | ----------------------- |
@@ -30,33 +30,33 @@ gRPC のコード生成には、Protocol Buffers コンパイラ `protoc` が `P
 
 ```toml tab="gRPC サービス"
 [dependencies]
-wakuwaku = "1.0.0-rc1" # デフォルト: grpc, proof
+wakuwaku = "1.0.0-rc2" # デフォルト: grpc, proof
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 ```toml tab="イベント + PostgreSQL + Redis"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["iggy", "sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["iggy", "sqlx-pg", "redis"] }
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 ```toml tab="検索インデクサー"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg", "meilisearch"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg", "meilisearch"] }
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 ```toml tab="gRPC なし"
 [dependencies]
 # イベントを消費して MySQL に書き込むだけのワーカー
-wakuwaku = { version = "1.0.0-rc1", default-features = false, features = ["iggy", "sqlx-mysql"] }
+wakuwaku = { version = "1.0.0-rc2", default-features = false, features = ["iggy", "sqlx-mysql"] }
 tokio = { version = "1.53", features = ["full"] }
 ```
 
 `entity` は `sqlx-pg`、`sqlx-mysql`、`redis`、`meilisearch` のどれかを有効にすると自動で有効になります。`entity` だけを有効にするのは、データソースなしでクエリやケイパビリティの型だけを使いたい場合 (たとえばインメモリストア向けのクエリを定義するクレート) に限られます。
 
 <Callout type="info" title="リリース候補について">
-`"1.0.0-rc1"` という指定は、以降のリリース候補や 1.0.0 自体も受け入れます。次の候補版へ移るタイミングを自分で決めたい場合は `"=1.0.0-rc1"` と書いてください。
+`"1.0.0-rc2"` という指定は、以降のリリース候補や 1.0.0 自体も受け入れます。次の候補版へ移るタイミングを自分で決めたい場合は `"=1.0.0-rc2"` と書いてください。
 </Callout>
 
 ## `wakuwaku::deps` を使う理由
@@ -109,7 +109,7 @@ tonic-prost-build = "0.14"
 
 ```toml
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg", "redis"] }
 sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "migrate", "uuid"] }
 redis = { version = "1", default-features = false, features = ["tokio-rustls-comp"] }
 ```

@@ -256,13 +256,14 @@ pub struct MemorySource {
 impl DataSource for MemorySource {
     type Connection = Self;
     type Error = Infallible;
-    async fn run<Q: Execute<Self>>(&self, query: Q) -> Result<Q::Output, Infallible> {
+    async fn run<Q: Execute<Self>>(&self, query: Q) -> Result<Q::Output, Q::Error> {
         query.execute(&mut self.clone()).await
     }
 }
 
 impl Execute<MemorySource> for FindUser {
     type Output = Option<String>;
+    type Error = Infallible;
     async fn execute(self, conn: &mut MemorySource) -> Result<Option<String>, Infallible> {
         Ok(conn.users.lock().unwrap().get(&self.0).cloned())
     }
@@ -270,6 +271,7 @@ impl Execute<MemorySource> for FindUser {
 
 impl Execute<MemorySource> for RenameUser {
     type Output = ();
+    type Error = Infallible;
     async fn execute(self, conn: &mut MemorySource) -> Result<(), Infallible> {
         conn.users.lock().unwrap().insert(self.id, self.name);
         Ok(())
@@ -301,6 +303,8 @@ mod tests {
 ```
 
 本番で使わないのであれば、インメモリのソースとその `Execute` 実装はテスト専用のコード (`#[cfg(test)]` やテスト支援用モジュール) に置いてください。これらでテストできないのは SQL や Redis のコマンドそのものです。それは本物のデータベースに対する結合テストの役割です。
+
+トランザクションのフローも同じです。フローの各ステップは開いたトランザクションの中でクエリを実行するので、フローは本物のデータベースに対してしか動きません。ステップが下す判断は、状態とクエリ結果を受け取る普通の関数にしておき、それをユニットテストしてください。[トランザクションのテスト](/ja/docs/data/transactions#testing) を参照してください。
 
 ## 時間の制御 [#controlling-time]
 

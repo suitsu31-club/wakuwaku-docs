@@ -6,7 +6,7 @@ icon: Database
 
 wakuwaku's data layer lives in `wakuwaku::entity` (the `wakuwaku-entity` crate). It runs on PostgreSQL and MySQL through sqlx, on Redis, and on Meilisearch. The same three ideas apply to all of them:
 
-1. **Queries are values.** A query is a plain struct such as `FindUser { id: 7 }` that describes one operation. It is not a method on a repository object.
+1. **Queries are values.** A query is a plain struct such as `FindUser { id: 7 }` that describes one operation, with its own `Output` and its own `Error`. It is not a method on a repository object.
 2. **Handles are processors.** A [`Db<S, C>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/struct.Db.html) handle implements kanau's `Processor<Q>` for every query `Q` it may run, so running a query is `db.process(query).await`. Cron jobs and event handlers use the same trait. Hooks, transactions and test doubles all build on it.
 3. **Capability types must cover effects.** Each query declares its `Effect`, the entities it reads and writes. Each handle carries a capability type `C`. `Db<S, C>` implements `Processor<Q>` only when `C: Covers<Q::Effect>`. If a write query is sent to a read-only handle, the program doesn't compile.
 
@@ -121,7 +121,7 @@ Turn on the data sources you need as `wakuwaku` features. Each one enables the `
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 ```
 
 | Feature | Data source | Third-party crate | Guide |
@@ -140,7 +140,7 @@ wakuwaku = { version = "1.0.0-rc1", features = ["sqlx-pg"] }
   <Card title="Queries and handles" href="/en/docs/data/queries" description="Define queries, build Db handles, route reads to a replica, and inject handles into components." />
   <Card title="Write hooks" href="/en/docs/data/hooks" description="Audit, invalidate caches, and sync search indexes around every write." />
   <Card title="sqlx" href="/en/docs/data/sqlx" description="PostgreSQL and MySQL data sources." />
-  <Card title="Transactions" href="/en/docs/data/transactions" description="Transactions written as pure state machines." />
+  <Card title="Transactions" href="/en/docs/data/transactions" description="Several queries atomically, written as a state machine whose steps run queries." />
   <Card title="Redis" href="/en/docs/data/redis" description="Caches, locks, rate limiters, and live structures." />
   <Card title="Meilisearch" href="/en/docs/data/meilisearch" description="Search indexes as entities, kept in sync with their source." />
 </Cards>
