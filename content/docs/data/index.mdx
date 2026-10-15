@@ -1,7 +1,6 @@
 ---
-title: Data Access
+title: Capability Check
 description: Capability-typed data access, where every query declares what it reads and writes and the compiler checks that the handle running it may do so.
-icon: Database
 ---
 
 wakuwaku's data layer lives in `wakuwaku::entity` (the `wakuwaku-entity` crate). It runs on PostgreSQL and MySQL through sqlx, on Redis, and on Meilisearch. The same three ideas apply to all of them:
