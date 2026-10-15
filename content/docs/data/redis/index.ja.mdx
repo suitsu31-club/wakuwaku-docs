@@ -1,7 +1,6 @@
 ---
 title: Redis
 description: Redis を capability で検査されるデータソースとして使い、型付きのキャッシュ、ロック、レートリミッター、パイプ、ライブビュー、ストリームバッファを利用します。
-icon: Zap
 ---
 
 Redis は、レプリカ間で共有したいがメインのデータベースに置くほどではない状態を保持する場所です。キャッシュした読み取り結果、ロック、レート制限のカウンター、websocket へ届ける途中のメッセージ、ストリーミングされる LLM の回答のチャンクなどがこれに当たります。wakuwaku の `redis` feature は、Redis を PostgreSQL と同じ[データソース](/ja/docs/data/queries)にします。すべてのコマンドは型付きのクエリであり、`Db` ハンドルは自身の capability が許可するクエリしか実行しません。

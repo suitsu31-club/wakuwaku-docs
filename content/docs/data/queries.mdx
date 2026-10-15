@@ -20,14 +20,28 @@ tokio = { version = "1", features = ["full"] }
 ```rust title="src/entities.rs"
 use wakuwaku::entity::Entity;
 
+/// The primary key of [`User`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UserId(pub i64);
+
 /// The `users` table.
 pub struct User;
 impl Entity for User {}
+
+/// The primary key of [`Post`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PostId(pub i64);
 
 /// The `posts` table.
 pub struct Post;
 impl Entity for Post {}
 ```
+
+<Callout type="info" title="Give each primary key its own type">
+A bare `i64` doesn't say which table it identifies. `PostsByAuthor { author }` accepts a post id as readily as a user id, and swapping `id` and `version` in `EditPostTitle` compiles. A newtype per primary key turns these mix-ups into type errors, and it documents foreign keys: `author: UserId` says the field points at `users`, and "Go to Type Definition" on `author` anywhere it is used takes you to `UserId`, right next to the `User` entity. The wrapper costs nothing at runtime. Unwrap it with `.0` where you bind it, and wrap it where you read it.
+
+If you also depend on sqlx directly, at the version wakuwaku uses and with its `derive` feature, `#[derive(sqlx::Type)]` with `#[sqlx(transparent)]` lets you bind and decode the newtype itself.
+</Callout>
 
 ## Define a query
 
@@ -37,20 +51,20 @@ A query implements two traits:
 - [`Execute<S>`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/query/trait.Execute.html) says **how it runs** on the data source `S`: its `Output`, its `Error`, and the code that runs on a connection. A query written in portable SQL may implement it for several sources.
 
 ```rust title="src/queries.rs"
-use crate::entities::{Post, User};
+use crate::entities::{Post, PostId, User, UserId};
 use wakuwaku::deps::sqlx::{self, PgConnection};
 use wakuwaku::entity::sqlx::backend::PgSource;
 use wakuwaku::entity::{Execute, Query, Read, Write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRow {
-    pub id: i64,
+    pub id: UserId,
     pub name: String,
 }
 
 /// Load one user by id.
 pub struct FindUser {
-    pub id: i64,
+    pub id: UserId,
 }
 
 impl Query for FindUser {
@@ -63,10 +77,10 @@ impl Execute<PgSource> for FindUser {
 
     async fn execute(self, conn: &mut PgConnection) -> Result<Option<UserRow>, sqlx::Error> {
         let row: Option<(i64, String)> = sqlx::query_as("SELECT id, name FROM users WHERE id = $1")
-            .bind(self.id)
+            .bind(self.id.0)
             .fetch_optional(conn)
             .await?;
-        Ok(row.map(|(id, name)| UserRow { id, name }))
+        Ok(row.map(|(id, name)| UserRow { id: UserId(id), name }))
     }
 }
 ```
@@ -78,7 +92,7 @@ A query that touches several entities lists them all. A tuple is the union of it
 ```rust title="src/queries.rs"
 /// Titles of the posts of an active author.
 pub struct PostsByAuthor {
-    pub author: i64,
+    pub author: UserId,
 }
 
 impl Query for PostsByAuthor {
@@ -95,7 +109,7 @@ impl Execute<PgSource> for PostsByAuthor {
             "SELECT p.title FROM posts p JOIN users u ON u.id = p.author_id \
              WHERE u.id = $1 AND u.active ORDER BY p.created_at DESC",
         )
-        .bind(self.author)
+        .bind(self.author.0)
         .fetch_all(conn)
         .await
     }
@@ -107,7 +121,7 @@ A write declares `Write<E>`. A capability that can write `E` can also read it, s
 ```rust title="src/queries.rs"
 /// Change a user's display name.
 pub struct RenameUser {
-    pub id: i64,
+    pub id: UserId,
     pub name: String,
 }
 
@@ -122,7 +136,7 @@ impl Execute<PgSource> for RenameUser {
 
     async fn execute(self, conn: &mut PgConnection) -> Result<u64, sqlx::Error> {
         let done = sqlx::query("UPDATE users SET name = $2 WHERE id = $1")
-            .bind(self.id)
+            .bind(self.id.0)
             .bind(self.name)
             .execute(conn)
             .await?;
@@ -169,6 +183,7 @@ You rarely implement it yourself. wakuwaku provides one per backend:
 A `Db<S, C>` owns a data source `S` and has a capability `C`. The capability is only a type parameter, so you choose it when you build the handle. A service with a primary and a read replica builds two handles:
 
 ```rust title="src/wiring.rs"
+use crate::entities::{PostId, UserId};
 use crate::queries::{
     DeactivateUsers, DormantUsers, EditPostError, EditPostTitle, FindUser, PostsByAuthor, RenameUser, UserRow,
 };
@@ -211,8 +226,8 @@ Once a pool is wrapped, you can't get it back out of the handle. That is what ma
 
 ```rust title="src/wiring.rs"
 pub async fn run_one(dbs: &Databases) -> Result<(), sqlx::Error> {
-    let user: Option<UserRow> = dbs.replica.process(FindUser { id: 7 }).await?;
-    let renamed: u64 = dbs.primary.process(RenameUser { id: 7, name: "Haruki".into() }).await?;
+    let user: Option<UserRow> = dbs.replica.process(FindUser { id: UserId(7) }).await?;
+    let renamed: u64 = dbs.primary.process(RenameUser { id: UserId(7), name: "Haruki".into() }).await?;
     println!("{user:?}, {renamed} row(s) updated");
     Ok(())
 }
@@ -231,7 +246,7 @@ pub struct Profile {
 }
 
 /// Works with any handle that can run both queries.
-pub async fn load_profile<D>(db: &D, id: i64) -> Result<Option<Profile>, sqlx::Error>
+pub async fn load_profile<D>(db: &D, id: UserId) -> Result<Option<Profile>, sqlx::Error>
 where
     D: Processor<FindUser, Output = Option<UserRow>, Error = sqlx::Error>
         + Processor<PostsByAuthor, Output = Vec<String>, Error = sqlx::Error>,
@@ -243,7 +258,7 @@ where
     Ok(Some(Profile { user, posts }))
 }
 
-pub async fn rename_user<D>(db: &D, id: i64, name: String) -> Result<bool, sqlx::Error>
+pub async fn rename_user<D>(db: &D, id: UserId, name: String) -> Result<bool, sqlx::Error>
 where
     D: Processor<RenameUser, Output = u64, Error = sqlx::Error>,
 {
@@ -282,7 +297,7 @@ impl From<sqlx::Error> for EditPostError {
 
 /// Change a post's title, if nobody changed the post since `version` was read.
 pub struct EditPostTitle {
-    pub id: i64,
+    pub id: PostId,
     pub version: i64,
     pub title: String,
 }
@@ -301,7 +316,7 @@ impl Execute<PgSource> for EditPostTitle {
             "UPDATE posts SET title = $3, version = version + 1 \
              WHERE id = $1 AND version = $2 RETURNING version",
         )
-        .bind(self.id)
+        .bind(self.id.0)
         .bind(self.version)
         .bind(self.title)
         .fetch_optional(conn)
@@ -314,7 +329,7 @@ impl Execute<PgSource> for EditPostTitle {
 `Db::process` returns `Result<i64, EditPostError>`, so the caller decides what each failure means in one place:
 
 ```rust title="src/wiring.rs"
-pub async fn save_title(dbs: &Databases, id: i64, version: i64, title: String) -> Result<Option<i64>, sqlx::Error> {
+pub async fn save_title(dbs: &Databases, id: PostId, version: i64, title: String) -> Result<Option<i64>, sqlx::Error> {
     match dbs.primary.process(EditPostTitle { id, version, title }).await {
         Ok(new_version) => Ok(Some(new_version)),
         // Someone else won: tell the client to reload and retry.
@@ -352,13 +367,13 @@ At the call site, pick the handle:
 ```rust title="src/wiring.rs"
 pub async fn handle_requests(dbs: &Databases) -> Result<(), sqlx::Error> {
     // A profile page: a slightly stale read is fine.
-    let _profile = load_profile(&dbs.replica, 7).await?;
+    let _profile = load_profile(&dbs.replica, UserId(7)).await?;
 
     // Writes go to the primary.
-    rename_user(&dbs.primary, 7, "Haruki".into()).await?;
+    rename_user(&dbs.primary, UserId(7), "Haruki".into()).await?;
 
     // Read your own write: the primary can read too.
-    let _fresh = load_profile(&dbs.primary, 7).await?;
+    let _fresh = load_profile(&dbs.primary, UserId(7)).await?;
     Ok(())
 }
 ```
@@ -371,7 +386,7 @@ Pass the replica to a handler that writes:
 
 ```rust
 pub async fn oops(dbs: &Databases) -> Result<bool, sqlx::Error> {
-    rename_user(&dbs.replica, 7, "Haruki".into()).await
+    rename_user(&dbs.replica, UserId(7), "Haruki".into()).await
 }
 ```
 
@@ -381,7 +396,7 @@ The program doesn't compile:
 error[E0277]: the trait bound `ReadOnly: CanWrite<User>` is not satisfied
   --> src/fails.rs:18:17
    |
-18 |     rename_user(&dbs.replica, 7, "Haruki".into()).await
+18 |     rename_user(&dbs.replica, UserId(7), "Haruki".into()).await
    |     ----------- ^^^^^^^^^^^^ the trait `CanWrite<User>` is not implemented for `ReadOnly`
    |     |
    |     required by a bound introduced by this call
@@ -426,7 +441,7 @@ impl CronJob for DeactivateDormantUsers {
 }
 ```
 
-`DormantUsers` (`Read<User>`) and `DeactivateUsers` (`Write<User>`) are defined like the queries above. Register the handles, then build the job from both of them:
+`DormantUsers` (`Read<User>`, outputs `Vec<UserId>`) and `DeactivateUsers` (`Write<User>`, takes `ids: Vec<UserId>`) are defined like the queries above. Register the handles, then build the job from both of them:
 
 ```rust title="src/wiring.rs"
 pub async fn start() -> Result<(), sqlx::Error> {
@@ -446,7 +461,7 @@ pub async fn start() -> Result<(), sqlx::Error> {
 
     // Everything else gets the handles from the builder too.
     let replica: &Db<PgSource, ReadOnly> = services.provide::<Db<PgSource, ReadOnly>, _>();
-    let _profile = load_profile(replica, 7).await?;
+    let _profile = load_profile(replica, UserId(7)).await?;
     handle_requests(&dbs).await?;
 
     cron.shutdown().await;

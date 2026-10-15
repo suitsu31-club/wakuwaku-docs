@@ -1,7 +1,6 @@
 ---
 title: Search
 description: Build typed filters and sorts, accept them safely from client JSON, and run searches under a scope the client can't remove.
-icon: SearchCode
 ---
 
 Most search requests originate with an end user: a search box, a set of facet checkboxes, a sort dropdown. The usual shortcut, concatenating user input into a Meilisearch filter string, is injection waiting to happen. wakuwaku replaces filter strings with a typed tree that can only name the fields of its index, deserializes it from client JSON, and combines it with a server-side scope that nothing in the client's filter can lift.

@@ -1,7 +1,6 @@
 ---
 title: ストリームバッファ
 description: 終端を持つ順序付き配列に本体を追記し、任意の数の購読者が任意のインデックスから追従できるようにします。LLM の回答のチャンクなどに使います。
-icon: ListEnd
 ---
 
 [`StreamBuffer`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/stream_buffer/struct.StreamBuffer.html) は追記専用の本体の配列で、プロデューサーが finish すると終わります。任意の数の購読者が任意のインデックスから読み、追記される新しい本体に追従できるので、再接続したクライアントはちょうど止まったところから再開できます。

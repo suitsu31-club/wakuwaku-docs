@@ -1,7 +1,6 @@
 ---
 title: Locks
 description: Mutual exclusion and reader-writer locks across replicas, with leases that keep a crashed holder from blocking everyone.
-icon: Lock
 ---
 
 When several replicas of a service may touch the same thing (finalize the same invoice, run the same cron job, rebuild the same index), they need to agree on who goes first. [`collection::lock`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/lock/index.html) provides two locks keyed by name:

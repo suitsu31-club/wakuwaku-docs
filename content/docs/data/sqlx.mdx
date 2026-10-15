@@ -1,7 +1,6 @@
 ---
 title: sqlx (PostgreSQL and MySQL)
 description: Connect wakuwaku to PostgreSQL or MySQL through sqlx, write queries as typed values, and send reads to a replica with the split checked by the compiler.
-icon: Database
 ---
 
 wakuwaku talks to relational databases through [sqlx](https://github.com/launchbadge/sqlx). An sqlx connection pool becomes a **data source**, `SqlxSource<DB>`, and the data source goes into a `Db<S, C>` handle. A `Db` handle runs your queries, and its capability `C` decides which queries it is allowed to run. Queries are ordinary Rust values: a struct describes what it touches (`Query`) and how it runs on sqlx (`Execute`).

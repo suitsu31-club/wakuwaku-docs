@@ -1,7 +1,6 @@
 ---
 title: Pipes
 description: Send ordered messages from one sender to one receiver anywhere in the cluster, like one direction of a websocket.
-icon: ArrowRightLeft
 ---
 
 A [`Pipe`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/pipe/struct.Pipe.html) is a queue of messages from one sender to one receiver: the receiver gets each message once, in the order they were sent, until the sender closes the pipe. It is the shape of one direction of a websocket, but the two ends may live in different replicas. A typical use: the replica holding a browser's websocket receives, while whichever replica handles a backend event sends. Use a second pipe for the other direction.

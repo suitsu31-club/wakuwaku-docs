@@ -1,7 +1,6 @@
 ---
 title: Stream buffers
 description: Append bodies to an ordered array with an end, and let any number of subscribers follow it from any index, such as the chunks of an LLM response.
-icon: ListEnd
 ---
 
 A [`StreamBuffer`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/stream_buffer/struct.StreamBuffer.html) is an append-only array of bodies that ends when its producer finishes it. Any number of subscribers can read it from any index and follow new bodies as they are appended, so a client that reconnects resumes exactly where it stopped.

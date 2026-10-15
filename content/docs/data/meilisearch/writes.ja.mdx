@@ -1,7 +1,6 @@
 ---
 title: 書き込み
 description: ドキュメントの upsert と削除、インデックス設定の適用、Meilisearch の非同期タスクの待機を行います。
-icon: PenLine
 ---
 
 Meilisearch への書き込みは、データベースへの書き込みとは振る舞いが異なります。リクエストは *タスクをキューに入れる* だけで、Meilisearch はそれを後で適用します。主キーのないドキュメントのようなエラーは、タスクが実行されたときに初めて現れます。wakuwaku の書き込みクエリはこれを明示的にします。各クエリは自分のタスクの [`TaskInfo`](https://docs.rs/meilisearch-sdk/0.33.0/meilisearch_sdk/task_info/struct.TaskInfo.html) を出力し、別のクエリでその完了を待ちます。

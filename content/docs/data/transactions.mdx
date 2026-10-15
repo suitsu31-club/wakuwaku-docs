@@ -1,7 +1,6 @@
 ---
 title: Transactions
 description: Write sqlx transactions as state machines whose steps run queries, let wakuwaku own BEGIN, COMMIT and ROLLBACK, and hook into how they end.
-icon: ArrowLeftRight
 ---
 
 A query run through a `Db` handle runs on its own, in autocommit mode. When several statements must succeed or fail together, write a **transaction flow**: a type that implements `TxFlow`. A flow is a state machine whose steps run queries on an open transaction, a `Tx`, and decide what comes next from their results.

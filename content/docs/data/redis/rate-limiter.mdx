@@ -1,7 +1,6 @@
 ---
 title: Rate limiter
 description: Limit how often a caller may act with token buckets kept in Redis and refilled continuously by the server clock.
-icon: Gauge
 ---
 
 [`TokenBucket`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/token_bucket_limiter/struct.TokenBucket.html) limits how often something happens per name: login attempts per IP address, API calls per tenant, exported rows per account. Because the state lives in Redis, the limit holds across every replica of your service.

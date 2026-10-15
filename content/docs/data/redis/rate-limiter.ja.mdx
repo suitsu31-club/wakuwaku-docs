@@ -1,7 +1,6 @@
 ---
 title: レートリミッター
 description: Redis に置いたトークンバケットをサーバーの時刻で連続的に補充し、呼び出し側が行動できる頻度を制限します。
-icon: Gauge
 ---
 
 [`TokenBucket`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/token_bucket_limiter/struct.TokenBucket.html) は、名前ごとに何かが起こる頻度を制限します。IP アドレスごとのログイン試行、テナントごとの API 呼び出し、アカウントごとのエクスポート行数などです。状態は Redis にあるので、制限はサービスのすべてのレプリカにまたがって効きます。

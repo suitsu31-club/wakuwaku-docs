@@ -1,7 +1,6 @@
 ---
 title: Tenant tokens
 description: Let a frontend search Meilisearch directly with short-lived tokens whose indexes and scopes Meilisearch enforces.
-icon: KeyRound
 ---
 
 Search-as-you-type feels best when the browser talks to Meilisearch directly, without a round trip through your service. A *tenant token* makes that safe. It is a JWT your server signs with a Meilisearch API key and hands to the client. The client sends it to Meilisearch as its API key, and Meilisearch then lets it search only the indexes listed in the token, and only the documents matching the token's filter for each index.

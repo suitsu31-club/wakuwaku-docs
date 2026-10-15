@@ -1,7 +1,6 @@
 ---
 title: ライブビュー
 description: Redis に永続的でバージョン付きのドキュメントを置き、書き手は楽観的に差分をコミットし、購読者はすべての変化に追従します。
-icon: Eye
 ---
 
 [`LiveView`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/live_view/struct.LiveView.html) は、1 から始まるバージョンにおける本体 `B` と、そこに至った差分の履歴を保持します。書き手は 1 コミットずつ前に進め、購読者は差分のストリームとして追従します。ライブのスコアボード、注文追跡ページ、共有の ToDo リスト、少数のバックエンドが更新し多数のブラウザが見守るダッシュボードなどを想像してください。

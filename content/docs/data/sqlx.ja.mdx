@@ -1,7 +1,6 @@
 ---
 title: sqlx（PostgreSQL と MySQL）
 description: sqlx を通じて wakuwaku を PostgreSQL や MySQL に接続し、クエリを型付きの値として書き、読み取りをレプリカへ振り分ける構成をコンパイラに検査させます。
-icon: Database
 ---
 
 wakuwaku はリレーショナルデータベースと [sqlx](https://github.com/launchbadge/sqlx) を通じて通信します。sqlx のコネクションプールは **データソース** `SqlxSource<DB>` になり、データソースは `Db<S, C>` ハンドルに格納されます。`Db` ハンドルがクエリを実行し、ケイパビリティ `C` がどのクエリを実行してよいかを決めます。クエリは普通の Rust の値です。構造体が、何に触れるか（`Query`）と sqlx 上でどう実行されるか（`Execute`）を記述します。

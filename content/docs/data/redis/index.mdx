@@ -1,7 +1,6 @@
 ---
 title: Redis
 description: Use Redis as a capability-checked data source, with typed caches, locks, a rate limiter, pipes, live views and stream buffers.
-icon: Zap
 ---
 
 Redis is where a microservice keeps the state that is shared between replicas but doesn't belong in the primary database: cached reads, locks, rate-limit counters, messages on their way to a websocket, the chunks of a streamed LLM answer. The `redis` feature of wakuwaku turns Redis into a [data source](/en/docs/data/queries) like PostgreSQL: every command is a typed query, and a `Db` handle only runs the queries its capability allows.

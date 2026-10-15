@@ -1,7 +1,6 @@
 ---
 title: ロック
 description: レプリカ間の排他ロックとリーダー・ライターロック。リースにより、クラッシュした保持者が全員をブロックし続けることを防ぎます。
-icon: Lock
 ---
 
 サービスの複数のレプリカが同じもの（同じ請求書の確定、同じ cron ジョブの実行、同じインデックスの再構築）に触れる可能性があるとき、誰が先に行うかを合意する必要があります。[`collection::lock`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/lock/index.html) は名前をキーとする 2 種類のロックを提供します。

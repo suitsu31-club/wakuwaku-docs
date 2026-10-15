@@ -1,7 +1,6 @@
 ---
 title: キャッシュ
 description: 型付きの本体を TTL 付きで Redis に保存し、本体をダウンロードせずに BLAKE3 ハッシュでコピーを再検証します。
-icon: HardDrive
 ---
 
 キャッシュは、コストの高い読み取りの結果をしばらく手元に置いておくためのものです。wakuwaku は [`collection::cache`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/collection/cache/index.html) に 2 種類のキャッシュを用意しています。

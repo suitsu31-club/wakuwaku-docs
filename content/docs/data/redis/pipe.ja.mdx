@@ -1,7 +1,6 @@
 ---
 title: パイプ
 description: 1 人の送信者からクラスター内のどこかにいる 1 人の受信者へ、websocket の片方向のように順序付きのメッセージを送ります。
-icon: ArrowRightLeft
 ---
 
 [`Pipe`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/pipe/struct.Pipe.html) は、1 人の送信者から 1 人の受信者へのメッセージのキューです。受信者は各メッセージを送られた順に 1 回ずつ受け取り、送信者がパイプを閉じるまで続きます。形は websocket の片方向そのものですが、両端は別々のレプリカにいてかまいません。典型的な使い方は、ブラウザの websocket を持つレプリカが受信し、バックエンドのイベントを処理したどれかのレプリカが送信するというものです。逆方向には 2 本目のパイプを使います。

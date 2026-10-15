@@ -1,7 +1,6 @@
 ---
 title: Writes
 description: Upsert and delete documents, apply index settings, and wait for Meilisearch's asynchronous tasks.
-icon: PenLine
 ---
 
 Writes to Meilisearch don't behave like writes to a database. A request only *enqueues a task*; Meilisearch applies it later, and errors such as a document without a primary key only show up when the task runs. wakuwaku's write queries make this explicit: each one outputs the [`TaskInfo`](https://docs.rs/meilisearch-sdk/0.33.0/meilisearch_sdk/task_info/struct.TaskInfo.html) of its task, and a separate query waits for it.

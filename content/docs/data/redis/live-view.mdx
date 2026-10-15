@@ -1,7 +1,6 @@
 ---
 title: Live views
 description: Keep a durable, versioned document in Redis whose writers commit diffs optimistically and whose subscribers follow every change.
-icon: Eye
 ---
 
 A [`LiveView`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/live_view/struct.LiveView.html) holds a body `B` at a version, starting at 1, and the history of diffs that led to it. Writers move it forward one commit at a time; subscribers follow it as a stream of diffs. Think of a live scoreboard, an order-tracking page, a shared to-do list, or a dashboard that many browsers watch while a few backends update it.
