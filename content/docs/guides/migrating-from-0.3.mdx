@@ -1,16 +1,16 @@
 ---
 title: Migrating from 0.3
-description: Move a service from wakuwaku 0.3 to 1.0.0-rc2, with before-and-after code for each replaced module.
+description: Move a service from wakuwaku 0.3 to 1.0.0-rc3, with before-and-after code for each replaced module.
 icon: ArrowUpCircle
 ---
 
-wakuwaku 0.3 was a set of utilities: a RabbitMQ integration, Redis and sqlx helpers, a resource pool, and a service builder. 1.0.0-rc2 keeps the service builder, but it is now a framework. Data access, events, and validation are separate crates, re-exported behind feature flags, and RabbitMQ is replaced by Apache Iggy.
+wakuwaku 0.3 was a set of utilities: a RabbitMQ integration, Redis and sqlx helpers, a resource pool, and a service builder. 1.0.0-rc3 keeps the service builder, but it is now a framework. Data access, events, and validation are separate crates, re-exported behind feature flags, and RabbitMQ is replaced by Apache Iggy.
 
-This page goes through the changes one module at a time. Each section shows code written against 0.3.1 and the equivalent for 1.0.0-rc2. Both sides were compiled against their respective versions.
+This page goes through the changes one module at a time. Each section shows code written against 0.3.1 and the equivalent for 1.0.0-rc3. Both sides were compiled against their respective versions.
 
 ## Summary
 
-| 0.3                                                         | 1.0.0-rc2                                                    |
+| 0.3                                                         | 1.0.0-rc3                                                    |
 | ----------------------------------------------------------- | ------------------------------------------------------------ |
 | `services::builder::ServiceBuilder`, `services::ServiceCreation` | unchanged, also re-exported as `wakuwaku::ServiceBuilder`, `wakuwaku::ServiceCreation` |
 | `services::grpc_service`, `ServiceBuilder::grpc_service`    | unchanged                                                    |
@@ -27,7 +27,7 @@ This page goes through the changes one module at a time. Each section shows code
 
 The feature flags changed:
 
-| 0.3 feature            | 1.0.0-rc2                                                              |
+| 0.3 feature            | 1.0.0-rc3                                                              |
 | ---------------------- | ---------------------------------------------------------------------- |
 | `amqprs` (default)     | removed. Use `iggy` for events (a different broker; see below).        |
 | `redis` (default)      | `redis`                                                                |
@@ -39,7 +39,7 @@ The feature flags changed:
 | `tonic` (implicit)     | `grpc`, now enabled by default                                         |
 | none                   | new: `proof`, `iggy`, `entity`, `meilisearch`                          |
 
-In 0.3 you depended on `kanau`, `sqlx`, and `tonic` yourself. In 1.0.0-rc2, import them through `wakuwaku::deps` so their versions match wakuwaku's. The exceptions are code generators and derive macros that name a crate by path; see [Installation](/en/docs/getting-started/installation#when-you-need-a-direct-dependency).
+In 0.3 you depended on `kanau`, `sqlx`, and `tonic` yourself. In 1.0.0-rc3, import them through `wakuwaku::deps` so their versions match wakuwaku's. The exceptions are code generators and derive macros that name a crate by path; see [Installation](/en/docs/getting-started/installation#when-you-need-a-direct-dependency).
 
 ```toml tab="0.3"
 [dependencies]
@@ -51,7 +51,7 @@ tonic = "0.14"
 
 ```toml tab="1.0"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["iggy", "sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["iggy", "sqlx-pg", "redis"] }
 tokio = { version = "1.53", features = ["full"] }
 # Only for #[derive(JsonMessageSer, JsonMessageDe)] on message bodies.
 kanau = { version = "0.6", features = ["serde_json"] }
@@ -234,7 +234,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 How the 0.3 pieces map:
 
-| 0.3                                         | 1.0.0-rc2                                                                 |
+| 0.3                                         | 1.0.0-rc3                                                                 |
 | ------------------------------------------- | ------------------------------------------------------------------------- |
 | `AmqpRouting::EXCHANGE`                     | the Iggy stream passed to `Publisher::new` and `ConsumerConfig::new`      |
 | `AmqpRouting::ROUTING_KEY`                  | `Event::TYPE_TAG` plus the key type's `SUPER_PARTITION_NAME` (the topic)  |
@@ -256,7 +256,7 @@ Things to watch for:
 
 ## Interval jobs become cron jobs
 
-In 0.3, `IntervalJobExecutionSignal` described when a signal message was due. You had to call `time_pool` from a loop of your own, publish the signal to RabbitMQ, and handle it in a consumer. In 1.0.0-rc2, a `CronJob` runs the work itself, inside the process, on the schedule its `INTERVAL` declares:
+In 0.3, `IntervalJobExecutionSignal` described when a signal message was due. You had to call `time_pool` from a loop of your own, publish the signal to RabbitMQ, and handle it in a consumer. In 1.0.0-rc3, a `CronJob` runs the work itself, inside the process, on the schedule its `INTERVAL` declares:
 
 ```rust tab="0.3"
 use std::task::Poll;
@@ -424,7 +424,7 @@ async fn connect() -> Result<Db<RedisSource, ReadWrite>, Box<dyn std::error::Err
 
 ## `DatabaseProcessor` becomes `SqlxSource` and `Db`
 
-0.3 wrapped a `PgPool` in `DatabaseProcessor`, and any SQL could run on `db.db()`. In 1.0.0-rc2 every query is a value that declares what it reads and writes, and it runs through a `Db` whose capability must cover that:
+0.3 wrapped a `PgPool` in `DatabaseProcessor`, and any SQL could run on `db.db()`. In 1.0.0-rc3 every query is a value that declares what it reads and writes, and it runs through a `Db` whose capability must cover that:
 
 ```rust tab="0.3"
 use wakuwaku::integration::sqlx::DatabaseProcessor;
@@ -483,7 +483,7 @@ fn read_only(pool: PgPool) -> Db<PgSource, ReadOnly> {
 
 ## `wakuwaku::Error` is removed
 
-0.3 had one error enum for everything, including a `From<wakuwaku::Error> for tonic::Status` conversion. In 1.0.0-rc2, each part uses the error type of the layer it wraps: `sqlx::Error` for sqlx sources, `RedisError` for Redis, `HandleError` for event handlers, and `ValidateError` for validation. A query declares its own `Error` on its `Execute` impl, so a query that can refuse (a lost optimistic lock, a broken business rule) returns that refusal as its error. Define your service's own error type and its mapping to `Status`:
+0.3 had one error enum for everything, including a `From<wakuwaku::Error> for tonic::Status` conversion. In 1.0.0-rc3, each part uses the error type of the layer it wraps: `sqlx::Error` for sqlx sources, `RedisError` for Redis, `HandleError` for event handlers, and `ValidateError` for validation. A query declares its own `Error` on its `Execute` impl, so a query that can refuse (a lost optimistic lock, a broken business rule) returns that refusal as its error. Define your service's own error type and its mapping to `Status`:
 
 ```rust tab="0.3"
 use tonic::Status;
@@ -541,7 +541,7 @@ fn get_user(id: u64) -> Result<String, Status> {
 ## Next steps
 
 <Cards>
-  <Card title="Quick start" href="/en/docs/getting-started/quick-start" description="A complete 1.0.0-rc2 service with gRPC and a cron job." />
+  <Card title="Quick start" href="/en/docs/getting-started/quick-start" description="A complete 1.0.0-rc3 service with gRPC and a cron job." />
   <Card title="Events" href="/en/docs/events" description="Typed events on Apache Iggy." />
   <Card title="Data access" href="/en/docs/data" description="Queries, capabilities, and transactions." />
 </Cards>

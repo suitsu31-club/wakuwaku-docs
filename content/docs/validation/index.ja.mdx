@@ -33,7 +33,7 @@ fn register(name: Proven<String, ValidUsername>) { /* ... */ }
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = "1.0.0-rc2"
+wakuwaku = "1.0.0-rc3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -44,10 +44,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 | [`ValidateContext`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.ValidateContext.html) | 判定中にチェックが参照するもの (設定、接続ハンドル、キャッシュなど) と、「判定できなかった」ときのエラー型。 |
 | [`Predicate<T>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.Predicate.html) | 実行時に判定される `T` についての命題。述語の型そのものが証拠になります。 |
 | [`prove`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/fn.prove.html) | 対象 (subject) に述語を適用し、成功すれば両者を `Proven` に包みます。 |
-| [`PureVerifier<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) | 関数ポインタとして表した純粋なチェック。`static` や `const` として宣言できます。`Proven` を得るもう一つの方法です。 |
-| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | 対象と、`P` が成り立った証拠。`prove`、`PureVerifier`、または別の証明からしか得られません。 |
-| [`ValidateError<E>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.ValidateError.html) | ルールが偽なら `Deny(DeniedReason)`、判定できなければ `IoError(E)`。 |
-| [`DeniedReason`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.DeniedReason.html) | 拒否の理由を表す `&'static str`。同一性で比較されます。 |
+| [`PureVerifier<T, P, B = T>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) | `T` の借用形 `&B` を受け取る関数ポインタとして表した純粋なチェック。`static` や `const` として宣言できます。`Proven` を得るもう一つの方法です。 |
+| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | 対象と、`P` が成り立った証拠。`prove`、`PureVerifier`、または別の証明からしか得られません。`T` と `P` が `Debug` なら `Debug` です。 |
+| [`ValidateError<E>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.ValidateError.html) | ルールが偽なら `Deny(DeniedReason)`、判定できなければ `IoError(E)`。`E` が `Debug + Display` なら `std::error::Error` です。 |
+| [`DeniedReason`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.DeniedReason.html) | 拒否の理由を表す `&'static str`。同一性で比較されます。`Display` はそのテキストです。 |
 
 ### コンテキスト [#a-context]
 
@@ -151,7 +151,7 @@ pub async fn handle(input: String) -> Result<String, &'static str> {
 
 ### 純粋なチェック: `PureVerifier` [#pure-checks-pureverifier]
 
-スラッグの形式、値の範囲、チェックサムのように、対象以外を何も読まないルールがあります。こうしたルールはコンテキストを必要とせず、判定に失敗することもなく、合成するものもありません。その場合は [`PureVerifier<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) を使えます。これはチェックそのものを関数ポインタ `fn(&T) -> Result<P, ValidateError<Infallible>>` として表したものです。`PureVerifier::new` は `const fn` なので、検証器は証拠の型の隣に `static` (または `const`) として一度だけ宣言でき、証明は普通の同期呼び出しになります。
+スラッグの形式、値の範囲、チェックサムのように、対象以外を何も読まないルールがあります。こうしたルールはコンテキストを必要とせず、判定に失敗することもなく、合成するものもありません。その場合は [`PureVerifier<T, P, B>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) を使えます。これはチェックそのものを関数ポインタ `fn(&B) -> Result<P, ValidateError<Infallible>>` として表したものです。`B` は対象の型 `T` の借用形 (`T: Borrow<B>`) で、省略すると `T` になります。`PureVerifier::new` は `const fn` なので、検証器は証拠の型の隣に `static` (または `const`) として一度だけ宣言でき、証明は普通の同期呼び出しになります。
 
 ```rust title="src/validation/slug.rs"
 use std::convert::Infallible;
@@ -162,13 +162,14 @@ pub static NOT_A_SLUG: DeniedReason = DeniedReason("not a lowercase slug");
 /// 「文字列が URL スラッグである」。非公開フィールドにより、このモジュールだけが作れる
 pub struct Slug(());
 
-fn is_slug(s: &String) -> Result<Slug, ValidateError<Infallible>> {
+fn is_slug(s: &str) -> Result<Slug, ValidateError<Infallible>> {
     let valid = !s.is_empty()
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     if valid { Ok(Slug(())) } else { Err(ValidateError::Deny(NOT_A_SLUG)) }
 }
 
-pub static SLUG: PureVerifier<String, Slug> = PureVerifier::new(is_slug);
+/// `String` を所有し、`&str` として検査する
+pub static SLUG: PureVerifier<String, Slug, str> = PureVerifier::new(is_slug);
 
 /// `SLUG` を通った文字列でしか呼べない
 pub fn publish(slug: Proven<String, Slug>) -> String {
@@ -186,6 +187,8 @@ pub fn handle(input: String) -> Result<String, &'static str> {
 ```
 
 結果は普通の `Proven<String, Slug>` です。これを要求するコードには、どちらの方法で得られたかは区別できず、区別する必要もありません。
+
+**借用を通した検査。** 3 つ目のパラメーターにより、関数は対象を借用形で受け取れます。`SLUG` は `String` を所有し、`&str` として検査します。`Vec<u8>` の検証器なら `&[u8]` を検査できます。同じ `is_slug` は `PureVerifier<Box<str>, Slug, str>` にも使えます。`B` を省略すると `T` になり、関数は `&T` を受け取ります。証明の健全性は `T` の `Borrow<B>` に依存します。関数が `P` を判定するのは借用されたビューについてであり、そのビューが対象を表すと言えるのは、借用形が所有された値と同じように振る舞うという [`Borrow`](https://doc.rust-lang.org/std/borrow/trait.Borrow.html) の契約があるからです。標準ライブラリの実装はこの契約を守っています。別のビューを返すような手書きの `Borrow` では、`P` はそのビューについての証明になってしまいます。
 
 **誰が検証器を書けるか。** 関数は `Slug` を返さなければならないので、`Slug` を構築できるコードだけがその検証器を書けます。`Slug` に非公開フィールドがあるのはそのためです。述語の意味はただ一つの `impl Predicate<T>` で決まりますが、同じ証拠の型を対象とする検証器はいくつでも書けます。`pub struct NonEmpty;` のようなユニット構造体だと、誰でも `PureVerifier::new(|_| Ok(NonEmpty))` と書いて何でも証明できてしまいます。非公開フィールドがあれば、`Slug` の証明はすべてそれを定義するモジュール、つまりルールの意味が置かれている場所で書かれることになります。
 
@@ -214,6 +217,27 @@ pub fn handle(input: String) -> Result<String, &'static str> {
 `IoError` は対象が正しいかどうかについて何も語りません。これをクライアントに「不正な入力」として返すと、障害の責任をユーザーに押し付けることになります。2 つのアームは分けて扱ってください。`tonic::Status` への変換例は [サービスでの証明の利用](/ja/docs/validation/in-services#mapping-validateerror-to-a-grpc-status) にあります。
 </Callout>
 
+### 標準のエラーとして [#as-a-standard-error]
+
+`ValidateError<E>` は、`E` が `Debug + Display` であれば (`Infallible` も含みます) `std::error::Error` と `Display` を実装します。`Deny` は理由のテキストとして、`IoError` は `could not decide the proposition: ` に続けて I/O エラーとして表示されます。最初の失敗で止まるバッチジョブのように、呼び出し側が 2 つを区別する必要がない場合は、`?` で `Box<dyn Error>` や `anyhow::Error` に伝播できます。
+
+```rust title="src/validation.rs"
+use std::error::Error;
+
+/// 不正な名前が 1 つでもあればインポートを中断する
+pub async fn import(names: Vec<String>) -> Result<Vec<String>, Box<dyn Error>> {
+    let limits = Limits { max_len: 16 };
+    let mut registered = Vec::new();
+    for name in names {
+        let name = prove::<_, ValidUsername>(name, &limits, CheckOrder::Sequential).await?;
+        registered.push(register(name));
+    }
+    Ok(registered)
+}
+```
+
+`import(vec![String::new()])` は、`username is empty` と表示されるエラーで失敗します。
+
 ### 拒否の理由 [#denied-reasons]
 
 `DeniedReason` は `&'static str` を包んだ型で、等価性は文字列の内容ではなく **ポインタの同一性** で判定されます。同じテキストでもアドレスが異なれば等しくならず、文字列リテラルや `const` への参照が同じアドレスを共有する保証もありません。理由はそれぞれ一度だけ `static` として宣言し、その `static` と比較してください。
@@ -225,7 +249,7 @@ pub static TAKEN: DeniedReason = DeniedReason("username is already taken");
 if reason == TAKEN { /* ... */ }
 ```
 
-表示用のテキストは `reason.0` で取り出せます。
+`DeniedReason` は `Display` を実装しており、そのテキストを書き出すので、`format!("rejected: {reason}")` のように使えます。`reason.0` は `&'static str` そのもので、`&'static str` を受け取る API に渡すときに使います。
 
 ## 証拠 [#evidence]
 
@@ -238,6 +262,8 @@ if reason == TAKEN { /* ... */ }
 `Proven`、`And`、`Or` の中では、各証拠は [`Evidence<P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Evidence.html) に包まれています。これは `&P` に Deref でき、値として取り出すことはできず、`P` が `Clone` でも **`Clone` ではありません**。証拠を複製するのはクレートが提供するブール代数の法則のうち、結果に同じ証明を 2 回含むものだけで、それらは `P: Clone` を要求します ([証明の導出](/ja/docs/validation/derivation#when-evidence-must-be-clone) を参照)。
 
 対象も `Proven::subject()` を通して `&T` としてしか公開されないため、チェック後に変更することはできません (内部可変性を除く)。対象を値で返すメソッドはないので、所有権が必要な場合はクローンしてください。
+
+`Proven<T, P>` は `T` と `P` が `Debug` なら `Debug` を実装します (`Evidence`、`And`、`Or` も同様です)。そのため、対象と述語の型が `Debug` を実装していれば、証明を持つ構造体にも `#[derive(Debug)]` を付けられます。
 
 <Callout type="info" title="証明はスナップショットです">
 対象も証拠も、チェックした瞬間の状態を表しています。「このユーザー名は空いている」のように外部の状態に依存する述語では、その状態がすでに変わっている可能性があります。最終的な防御としてデータベース自身の制約 (一意インデックスなど) を残してください。

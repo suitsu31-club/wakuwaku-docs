@@ -174,8 +174,9 @@ pub async fn ensure_topology(client: &IggyClient) -> Result<(), IggyError> {
 
     let topic = OrderId::SUPER_PARTITION_NAME.0; // "orders"
     if client.get_topic(&stream, &Identifier::named(topic)?).await?.is_none() {
+        // One partition, consumed as `vec![0]`. See "Choose the partition count up front".
         let options = TopicCreateOptions {
-            partitions_count: Some(4),
+            partitions_count: Some(1),
             ..Default::default()
         };
         client.create_topic(&stream, topic, &options).await?;
@@ -184,10 +185,10 @@ pub async fn ensure_topology(client: &IggyClient) -> Result<(), IggyError> {
 }
 ```
 
-Reading the topic name from `SUPER_PARTITION_NAME` keeps the setup and the event types from drifting apart. If `partitions_count` is left unset, the Iggy SDK's default is a single partition.
+Reading the topic name from `SUPER_PARTITION_NAME` keeps the setup and the event types from drifting apart. If `partitions_count` is left unset, the Iggy SDK's default is also a single partition; setting it keeps the count visible next to the consumers' partition lists.
 
 <Callout type="warn" title="Choose the partition count up front">
-  The partition of a key is derived from its hash and the topic's partition count. Adding partitions later moves keys to other partitions, so events of one key published before and after the change can be processed out of order. The consumer also refuses to start if the retry topic's partition count no longer matches the main topic's (`Error::PartitionCountMismatch`). Size the topic for the concurrency you will need.
+  Use one partition unless you need the concurrency of several: inside one partition the consumer already processes the keys of a batch concurrently. The partition of a key is derived from its hash and the topic's partition count, so adding partitions later moves keys to other partitions, and events of one key published before and after the change can be processed out of order. The consumer also refuses to start if the retry topic's partition count no longer matches the main topic's (`Error::PartitionCountMismatch`), and new partitions are consumed only once you [assign them](/en/docs/events/consuming#splitting-across-replicas) to a replica.
 </Callout>
 
 ## Errors

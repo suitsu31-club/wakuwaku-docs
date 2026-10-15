@@ -47,7 +47,7 @@ Everything else in wakuwaku is imported through `wakuwaku` alone, but generated 
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = "1.0.0-rc2"  # the default features include `grpc`
+wakuwaku = "1.0.0-rc3"  # the default features include `grpc`
 # Named directly by the generated code.
 tonic = "0.14"
 tonic-prost = "0.14"
@@ -58,7 +58,7 @@ tokio = { version = "1", features = ["full"] }
 tonic-prost-build = "0.14"
 ```
 
-Keep `tonic` on the same minor version as wakuwaku (0.14 for wakuwaku 1.0.0-rc2). Cargo then resolves both to one crate, so `tonic` and `wakuwaku::deps::tonic` are the same types. With a different version, the generated servers would implement the traits of another `tonic` and would not be accepted by wakuwaku.
+Keep `tonic` on the same minor version as wakuwaku (0.14 for wakuwaku 1.0.0-rc3). Cargo then resolves both to one crate, so `tonic` and `wakuwaku::deps::tonic` are the same types. With a different version, the generated servers would implement the traits of another `tonic` and would not be accepted by wakuwaku.
 
 The code generator calls `protoc`, the Protocol Buffers compiler. Install it from your package manager (or point the `PROTOC` environment variable at it) before the first build.
 

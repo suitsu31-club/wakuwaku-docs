@@ -14,7 +14,7 @@ This page assumes you know how to write a query for sqlx; see [sqlx (PostgreSQL 
 
 <TransactionFlowDiagram lang="en" />
 
-The **state is the flow value itself**, usually an enum with one variant per stage. Two functions define the machine:
+The **state is the flow value itself**, usually an enum: a working state for each point the transaction can be at, and a terminal state. Two functions define the machine:
 
 - `async fn step(tx: Tx<'_, Self>, state: Self) -> TxState<'_, Self>`: run the queries of `state` on `tx` and return the next state. It is never called with a terminal state.
 - `fn finished(self) -> Either<Self, TxEnd<Self>>`: `Right` with how the transaction ends if the state is terminal, `Left(self)` otherwise.
@@ -36,11 +36,11 @@ Inside a step, the `Tx` is moved in and handed back:
 
 Both return a `TxState`, the state together with its transaction. A step can only produce a `TxState` from the `Tx` it was given, so the transaction never escapes the step.
 
-The associated items say what the flow talks about:
+The associated items say what the flow talks about. A flow is not a query and doesn't implement `Query`: what it may touch is the `Capability` it declares with `tx_effect!` (see [Capabilities and read-only transactions](#capabilities-and-read-only-transactions)).
 
 <TypeTable
   type={{
-    Effect: { type: 'Effect (from Query)', description: 'Everything the transaction may touch. The flow implements Query; the Db capability must cover this effect, and an effect that only reads makes the transaction READ ONLY.' },
+    Capability: { type: 'TxEffect', description: 'Everything the transaction may read and write, declared with tx_effect!. Every query the flow runs must stay within it, the Db capability must cover it, and a flow that declares no write begins READ ONLY.' },
     Database: { type: 'SqlxBackend', description: 'The database: Postgres or MySql.' },
     Commit: { type: 'Send', description: 'Returned to the caller after a commit.' },
     Abort: { type: 'Send', description: 'Returned to the caller after a rollback.' },
@@ -62,7 +62,7 @@ First the queries. Each is an ordinary standalone query with its own `Output` an
 use wakuwaku::deps::sqlx::{self, PgConnection, Postgres};
 use wakuwaku::entity::sqlx::backend::SqlxSource;
 use wakuwaku::entity::sqlx::transaction::{Either, IsolationLevel, Tx, TxEnd, TxFlow, TxState};
-use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write, tx_effect};
 
 pub struct Account;
 impl Entity for Account {}
@@ -125,7 +125,7 @@ impl Execute<SqlxSource<Postgres>> for Credit {
 use wakuwaku::deps::sqlx::{self, MySql, MySqlConnection};
 use wakuwaku::entity::sqlx::backend::SqlxSource;
 use wakuwaku::entity::sqlx::transaction::{Either, IsolationLevel, Tx, TxEnd, TxFlow, TxState};
-use wakuwaku::entity::{Entity, Execute, Query, Read, Write};
+use wakuwaku::entity::{Entity, Execute, Query, Read, Write, tx_effect};
 
 pub struct Account;
 impl Entity for Account {}
@@ -185,7 +185,7 @@ impl Execute<SqlxSource<MySql>> for Credit {
 </Tab>
 </Tabs>
 
-Then the flow. Each state is a stage plus what later stages need. The decisions are plain functions of the state and a query result (`after_debit`, `after_credit`), and `step` only runs the query and hands the result over:
+Then the flow. A transfer is a fixed sequence of statements followed by a commit, so it has a single working state, `Start`, and its one step runs the debit and the credit in order. `TransferEffect` declares the one entity both queries touch. The decisions are plain functions of a query result (`check_debit`, `check_credit`), and `step` only runs the queries and acts on the answers:
 
 ```rust title="src/transfer.rs"
 /// Published once the money has moved.
@@ -216,11 +216,15 @@ impl TransferFailed {
     }
 }
 
+tx_effect! {
+    /// Everything a transfer touches.
+    pub enum TransferEffect { write Account }
+}
+
 /// The state of a transfer.
 #[derive(Debug)]
 pub enum Transfer {
     Start { from: i64, to: i64, amount: i64 },
-    Debited { from: i64, to: i64, amount: i64 },
     End(TxEnd<Transfer>),
 }
 
@@ -229,34 +233,34 @@ impl Transfer {
         Transfer::Start { from, to, amount }
     }
 
+    fn commit(from: i64, to: i64, amount: i64) -> Self {
+        Transfer::End(TxEnd::Commit {
+            output: (),
+            report: Some(Transferred { from, to, amount }),
+        })
+    }
+
     fn rollback(why: TransferFailed) -> Self {
         Transfer::End(TxEnd::Rollback { output: why, report: None })
     }
 
-    /// What follows the debit.
-    fn after_debit(from: i64, to: i64, amount: i64, debited: Result<u64, sqlx::Error>) -> Self {
+    /// Whether the debit took the money.
+    fn check_debit(debited: Result<u64, sqlx::Error>) -> Result<(), TransferFailed> {
         match debited {
-            Ok(1) => Transfer::Debited { from, to, amount },
-            Ok(_) => Self::rollback(TransferFailed::InsufficientFunds),
-            Err(error) => Self::rollback(TransferFailed::from_sqlx(error)),
+            Ok(1) => Ok(()),
+            Ok(_) => Err(TransferFailed::InsufficientFunds),
+            Err(error) => Err(TransferFailed::from_sqlx(error)),
         }
     }
 
-    /// What follows the credit.
-    fn after_credit(from: i64, to: i64, amount: i64, credited: Result<u64, sqlx::Error>) -> Self {
+    /// Whether the credit reached an account.
+    fn check_credit(credited: Result<u64, sqlx::Error>) -> Result<(), TransferFailed> {
         match credited {
-            Ok(1) => Transfer::End(TxEnd::Commit {
-                output: (),
-                report: Some(Transferred { from, to, amount }),
-            }),
-            Ok(_) => Self::rollback(TransferFailed::UnknownAccount),
-            Err(error) => Self::rollback(TransferFailed::from_sqlx(error)),
+            Ok(1) => Ok(()),
+            Ok(_) => Err(TransferFailed::UnknownAccount),
+            Err(error) => Err(TransferFailed::from_sqlx(error)),
         }
     }
-}
-
-impl Query for Transfer {
-    type Effect = (Read<Account>, Write<Account>);
 }
 
 impl From<TxEnd<Transfer>> for Transfer {
@@ -266,6 +270,7 @@ impl From<TxEnd<Transfer>> for Transfer {
 }
 
 impl TxFlow for Transfer {
+    type Capability = TransferEffect;
     type Database = Postgres;
     type Commit = ();
     type Abort = TransferFailed;
@@ -274,17 +279,18 @@ impl TxFlow for Transfer {
     const ISOLATION: Option<IsolationLevel> = Some(IsolationLevel::Serializable);
 
     async fn step(tx: Tx<'_, Self>, state: Self) -> TxState<'_, Self> {
-        match state {
-            Transfer::Start { from, to, amount } => {
-                let (tx, debited) = tx.run(Debit { from, amount }).await;
-                tx.with(Self::after_debit(from, to, amount, debited))
-            }
-            Transfer::Debited { from, to, amount } => {
-                let (tx, credited) = tx.run(Credit { to, amount }).await;
-                tx.with(Self::after_credit(from, to, amount, credited))
-            }
+        let Transfer::Start { from, to, amount } = state else {
             // Never stepped: the driver ends a terminal state first.
-            end @ Transfer::End(_) => tx.end(end).await,
+            return tx.end(state).await;
+        };
+        let (tx, debited) = tx.run(Debit { from, amount }).await;
+        if let Err(why) = Self::check_debit(debited) {
+            return tx.end(Self::rollback(why)).await;
+        }
+        let (tx, credited) = tx.run(Credit { to, amount }).await;
+        match Self::check_credit(credited) {
+            Ok(()) => tx.end(Self::commit(from, to, amount)).await,
+            Err(why) => tx.end(Self::rollback(why)).await,
         }
     }
 
@@ -297,7 +303,7 @@ impl TxFlow for Transfer {
 }
 ```
 
-For MySQL, the flow is identical except `type Database = MySql;`. Each query result keeps its own type, and the code using it sits in the same match arm as the query: no enum of queries, no enum of rows, no catch-all arm for a result that cannot happen.
+For MySQL, the flow is identical except `type Database = MySql;`. Each query result keeps its own type, and the code using it follows the query that produced it: no enum of queries, no enum of rows, no catch-all arm for a result that cannot happen.
 
 `TxEnd` derives `Debug`, so a flow enum that embeds it can derive `Debug` too, as long as its `Commit`, `Abort` and `Report` types are `Debug`. It is deliberately not `Clone`: a flow value is one run of the transaction, and its terminal state is consumed once when the transaction ends, the way an awaited future is not awaited again. See [Retries](#retries) for what that means in practice.
 
@@ -334,23 +340,39 @@ pub fn is_conflict(error: &sqlx::Error) -> bool {
 
 ### Running it
 
-Wrap the first state in `Transaction` and process it with a `Db` whose capability covers the flow's effect:
+Wrap the first state in `Transaction` and process it with a `Db` whose capability covers what the flow declares. What each outcome means is the caller's business, so map the result into the caller's own error where the transaction runs:
 
 ```rust title="src/pay.rs"
-use crate::transfer::Transfer;
+use crate::transfer::{Transfer, TransferFailed};
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::deps::sqlx::PgPool;
-use wakuwaku::entity::sqlx::backend::{PgSource, SqlxSource};
+use wakuwaku::deps::sqlx;
+use wakuwaku::entity::sqlx::backend::PgSource;
 use wakuwaku::entity::sqlx::transaction::{Transaction, TxError, TxOutput};
 use wakuwaku::entity::{Db, ReadWrite};
 
-pub async fn pay(pool: PgPool) -> Result<(), TxError> {
-    let db: Db<PgSource, ReadWrite> = Db::new(SqlxSource::new(pool));
-    match db.process(Transaction(Transfer::new(1, 2, 10))).await? {
-        TxOutput::Committed(()) => println!("transferred"),
-        TxOutput::RolledBack(why) => println!("rolled back: {why:?}"),
+/// Why a payment did not go through.
+#[derive(Debug)]
+pub enum PayError {
+    /// The transfer rolled back, and this is why.
+    Refused(TransferFailed),
+    /// `COMMIT` was sent but its answer was lost: the money may have moved.
+    OutcomeUnknown(sqlx::Error),
+    /// The transaction did not end as the flow planned.
+    Transaction(TxError),
+}
+
+pub async fn pay(
+    db: &Db<PgSource, ReadWrite>,
+    from: i64,
+    to: i64,
+    amount: i64,
+) -> Result<(), PayError> {
+    match db.process(Transaction(Transfer::new(from, to, amount))).await {
+        Ok(TxOutput::Committed(())) => Ok(()),
+        Ok(TxOutput::RolledBack(why)) => Err(PayError::Refused(why)),
+        Err(TxError::CommitUnknown(error)) => Err(PayError::OutcomeUnknown(error)),
+        Err(error) => Err(PayError::Transaction(error)),
     }
-    Ok(())
 }
 ```
 
@@ -366,12 +388,39 @@ pub async fn pay(pool: PgPool) -> Result<(), TxError> {
 | `Err(TxError::Aborted)` | The flow ended with `TxEnd::Commit` after a query had aborted the transaction; it was rolled back |
 | `Err(TxError::EndMismatch)` | `finished` did not give back the end the transaction was closed with: a bug in the flow |
 
+### A flow is not a query
+
+Run a flow as `db.process(Transaction(flow))` and handle its outcome there, as `pay` does. Don't hide it behind a `Processor<Input>` implementation for the `Db`, so that `db.process(CreateServer { … })` runs a whole transaction and answers with one `Output` and one `Error` as if it were a single query. That shape loses three things:
+
+- `TxError::CommitUnknown` is folded into an ordinary database error. A caller that retries failed statements then retries a transaction that may already have committed.
+- To fit one success type, a rollback the caller should treat as success has to travel in `Abort`, which becomes a second success channel (see [What `Abort` is for](#what-abort-is-for)).
+- A call site can no longer tell a transaction from a single statement, though the two fail differently.
+
+The business function is the boundary: it runs the transaction and maps `Committed`, `RolledBack` and `TxError` into its own error, with `CommitUnknown` as a case of its own. Whoever gets `PayError::OutcomeUnknown` must reconcile before reporting a failure or trying again; see [Retries](#retries).
+
+## Designing a flow
+
+### States are for loops and branches
+
+A state is a point the transaction can come back to: the top of a loop, or a branch that continues in a later step. It is not a slot per statement sent. A straight-line transaction, a fixed sequence of statements followed by a commit, is a single step: it runs its queries in order with `Tx::run`, ends with a rollback as soon as one answer rules out the rest, and otherwise finishes with `tx.end(...)`, as the transfer does. Splitting it into one state per query (`Start`, `Debited`, `Credited`, …) only carries the same data from variant to variant.
+
+Use several states when the shape of the transaction depends on what it reads:
+
+- **A loop** whose length is known only at run time. `PublishAll` in [Delivering changes from transactions](/en/docs/data/meilisearch/sync#a-flow-that-reports-what-it-touched) steps once per post, and its state carries the posts still pending and those already published.
+- **A branch that comes back**, such as retry-with-read: a conditional write that lost a race goes to a state that re-reads the row and tries again.
+
+### What `Abort` is for
+
+`Abort` is why the flow rolled back: a domain reason, such as `TransferFailed::InsufficientFunds`, or the statement that failed, such as `TransferFailed::Database`. It is never a second way to succeed. Don't make it `Result<Commit, _>` so that a rolled-back transaction can still hand the caller a result: if the flow got what it came for, it commits.
+
+That includes a write that changed nothing. A conditional write that matched no row wrote nothing, so when "nothing matched" is an acceptable answer (the row was already in the wanted state, say), commit that empty result, for example as a `Commit` of `Option<T>` or of the rows affected. Roll back when the flow cannot do what it was asked to, as the transfer does when the debit finds too little money.
+
 ## How the driver runs a flow
 
 The driver does exactly this, and nothing more:
 
 1. Acquire a connection from the pool.
-2. Send `BEGIN` in the flow's mode: the isolation level from `ISOLATION`, and `READ ONLY` if the flow's effect only reads, `READ WRITE` otherwise. If either fails, the result is `Err(TxError::Begin)` and the flow never runs.
+2. Send `BEGIN` in the flow's mode: the isolation level from `ISOLATION`, and `READ ONLY` if the flow declares no write, `READ WRITE` otherwise. If either fails, the result is `Err(TxError::Begin)` and the flow never runs.
 3. Loop: if the state is terminal (`finished` returns `Right`), end the transaction (`COMMIT` or `ROLLBACK`, as `Tx::end` does) and stop. Otherwise call `step` with the open `Tx` and the state, and loop on the `TxState` it returns.
 
 So a step can either end the transaction itself with `tx.end(state)` or return a terminal state with `tx.with(state)` and let the driver end it; the result is the same.
@@ -382,7 +431,24 @@ So a step can either end the transaction itself with `tx.end(state)` or return a
 
 ## Capabilities and read-only transactions
 
-The effect of a transaction is the flow's own `Query::Effect`, which declares everything its steps may touch. `Db<S, C>` processes `Transaction<F>` only if `C` covers that effect, exactly as for single queries. The transfer writes `Account`, so it does not compile against a replica handle:
+A flow declares everything its steps may touch with [`tx_effect!`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/macro.tx_effect.html), and names the declaration as `TxFlow::Capability`, as `TransferEffect` does for the transfer. A flow that also reads who owns the accounts would declare:
+
+```rust
+tx_effect! {
+    /// Moves money between accounts, after checking who owns them.
+    pub enum CheckedTransferEffect { write Account, read User }
+}
+```
+
+`write E` lets the flow's queries read and write the entity `E`; `read E` lets them only read it. List each entity once: `write` already covers reading, and an entity listed twice does not compile. The macro generates an empty enum that is both a capability (it has the `CanRead` / `CanWrite` markers) and the matching effect ([`TxEffect`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.TxEffect.html)); don't implement `TxEffect` by hand.
+
+The declaration is checked at compile time, three ways:
+
+- **Each query against the flow.** `Tx::run` requires the flow's capability to cover the query's effect. A query that touches an entity the flow did not declare, or writes one it declared `read`, is `error[E0277]`.
+- **The flow against the handle.** `Db<S, C>`, and `AfterTransaction` around it, processes `Transaction<F>` only if `C` covers the declared effect, exactly as for single queries.
+- **The mode.** A flow that declares no write begins `READ ONLY`.
+
+So a handle that may run a flow may run every query in it: a transaction can't reach an entity its handle was never checked for. The transfer writes `Account`, so it does not compile against a replica handle:
 
 ```rust
 async fn on_replica(replica: &Db<PgSource, ReadOnly>) {
@@ -392,17 +458,15 @@ async fn on_replica(replica: &Db<PgSource, ReadOnly>) {
 }
 ```
 
-The kind of the effect also chooses how the transaction begins. A flow whose effect only reads (for example `Read<Account>` for a consistent report across several `SELECT`s) begins `READ ONLY` and runs on a `Db<_, ReadOnly>` handle. In such a flow, `Tx::run` rejects a query that writes **at compile time**:
+A flow that only reads (for example a consistent report across several `SELECT`s, declared as `read Account`) begins `READ ONLY` and runs on a `Db<_, ReadOnly>` handle. In such a flow, `Tx::run` rejects a query that writes:
 
 ```rust
 async fn step(tx: Tx<'_, Self>, state: Self) -> TxState<'_, Self> {
-    // Does not compile: `Debit` writes, and this flow's effect is `Read<Account>`.
+    // Does not compile: `Debit` writes `Account`, and this flow declares `read Account`.
     let (tx, _) = tx.run(Debit { from: 1, amount: 10 }).await;
     // …
 }
 ```
-
-`Tx::run` checks only the kind (read or write) of each query against the flow. Which entities a step touches is not checked per query: the flow's declared `Effect` is what the `Db` capability is checked against, so declare every entity its queries touch.
 
 ## Isolation levels
 
@@ -597,7 +661,7 @@ pub fn accounts(pool: PgPool, events: Sender<Transferred>) -> Accounts {
 
 A `Tx` cannot be built outside wakuwaku, so `step` itself only runs against a real database. Split the testing accordingly:
 
-- **Decisions without a database.** Keep the logic in pure functions of a state and a query result, as `after_debit` and `after_credit` are, and test them together with `finished`. These tests need no database, no Docker, and no async runtime.
+- **Decisions without a database.** Keep the logic in pure functions of query results and the request, as `check_debit`, `check_credit`, `commit` and `rollback` are, and test them together with `finished`. These tests need no database, no Docker, and no async runtime.
 - **Steps against a database.** Run the whole flow through a `Db` in an integration test, to check the SQL and that each step runs the query you meant.
 - **The protocol is not yours to test.** Which errors abort, refusing to commit an aborted transaction, and what a lost `COMMIT` means are tested inside wakuwaku.
 - **Hooks are processors.** Call `process` on the hook with a `TxFinalState` you build yourself.
@@ -609,54 +673,57 @@ mod tests {
     use wakuwaku::entity::sqlx::transaction::Either;
 
     #[test]
-    fn a_debit_leads_to_the_credit() {
-        let next = Transfer::after_debit(1, 2, 10, Ok(1));
-        assert!(matches!(next, Transfer::Debited { from: 1, to: 2, amount: 10 }));
-        assert!(next.finished().is_left());
+    fn no_row_debited_is_insufficient_funds() {
+        assert!(matches!(Transfer::check_debit(Ok(0)), Err(TransferFailed::InsufficientFunds)));
     }
 
     #[test]
-    fn no_row_debited_rolls_back() {
-        let next = Transfer::after_debit(1, 2, 10, Ok(0));
-        assert!(matches!(
-            next.finished(),
-            Either::Right(TxEnd::Rollback { output: TransferFailed::InsufficientFunds, report: None })
-        ));
+    fn no_row_credited_is_an_unknown_account() {
+        assert!(matches!(Transfer::check_credit(Ok(0)), Err(TransferFailed::UnknownAccount)));
     }
 
     #[test]
-    fn a_credit_commits_and_reports_the_transfer() {
-        let next = Transfer::after_credit(1, 2, 10, Ok(1));
-        let Either::Right(TxEnd::Commit { report, .. }) = next.finished() else {
-            panic!("a successful credit commits");
+    fn a_failed_query_is_a_database_error() {
+        let lost = sqlx::Error::Io(std::io::Error::other("connection reset"));
+        assert!(matches!(Transfer::check_credit(Err(lost)), Err(TransferFailed::Database(_))));
+    }
+
+    #[test]
+    fn a_commit_reports_the_transfer() {
+        let Either::Right(TxEnd::Commit { report, .. }) = Transfer::commit(1, 2, 10).finished() else {
+            panic!("`commit` is a terminal commit");
         };
         assert_eq!(report, Some(Transferred { from: 1, to: 2, amount: 10 }));
     }
 
     #[test]
-    fn a_failed_query_rolls_back() {
-        let lost = sqlx::Error::Io(std::io::Error::other("connection reset"));
-        let next = Transfer::after_credit(1, 2, 10, Err(lost));
+    fn a_rollback_reports_nothing() {
         assert!(matches!(
-            next.finished(),
-            Either::Right(TxEnd::Rollback { output: TransferFailed::Database(_), .. })
+            Transfer::rollback(TransferFailed::InsufficientFunds).finished(),
+            Either::Right(TxEnd::Rollback { output: TransferFailed::InsufficientFunds, report: None })
         ));
+    }
+
+    #[test]
+    fn the_start_is_not_terminal() {
+        assert!(Transfer::new(1, 2, 10).finished().is_left());
     }
 }
 ```
 
 <Accordions>
 <Accordion title="Why are transactions state machines instead of async closures?">
-An async closure that receives a transaction can do anything with it: hold it across an `await` on another service, send it elsewhere, or swallow an error and carry on after the database has already aborted the transaction. A `TxFlow` step is narrower. Each query and the code using its result share one match arm, and each query keeps its own typed `Output` and `Error`. The `Tx` is moved into the step and can only leave as a `TxState`, so it cannot escape. A read-only flow cannot run a writing query, which is checked at compile time. And the rules that are easy to get wrong (an aborted PostgreSQL transaction, a MySQL deadlock that drops you into autocommit, a `COMMIT` with an unknown outcome) live in wakuwaku's protocol, implemented and tested once. This is the micro-correctness half of [proof-driven programming](/en/docs/core/proof-driven).
+An async closure that receives a transaction can do anything with it: hold it across an `await` on another service, send it elsewhere, or swallow an error and carry on after the database has already aborted the transaction. A `TxFlow` step is narrower. Each query is followed by the code using its result, and each query keeps its own typed `Output` and `Error`. The `Tx` is moved into the step and can only leave as a `TxState`, so it cannot escape. A query that touches anything the flow did not declare, or writes what it declared as read-only, does not compile. And the rules that are easy to get wrong (an aborted PostgreSQL transaction, a MySQL deadlock that drops you into autocommit, a `COMMIT` with an unknown outcome) live in wakuwaku's protocol, implemented and tested once. This is the micro-correctness half of [proof-driven programming](/en/docs/core/proof-driven).
 </Accordion>
 <Accordion title="Can a flow choose its next query based on data it read?">
-Yes. A step can run several queries and branch on their results, and the next state can carry anything a later step needs, as `Transfer::Debited` carries the accounts and amount. Choosing the next state from read data is ordinary Rust in the match arm.
+Yes. A step can run several queries and branch on their results, as the transfer's step runs the credit only after a successful debit. When a later step needs what was read, the next state carries it. Choosing what comes next from read data is ordinary Rust; see [Designing a flow](#designing-a-flow) for when a branch deserves a state of its own.
 </Accordion>
 </Accordions>
 
 ## API reference
 
-- [`transaction` module](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/index.html): [`TxFlow`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.TxFlow.html), [`Tx`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/struct.Tx.html), [`TxState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/struct.TxState.html), [`TxEnd`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxEnd.html), [`AsSqlxError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.AsSqlxError.html), [`Transaction`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/struct.Transaction.html), [`TxOutput`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxOutput.html), [`TxError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxError.html), [`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)
+- [`transaction` module](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/index.html): [`TxFlow`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.TxFlow.html), [`TxEffect`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.TxEffect.html), [`Tx`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/struct.Tx.html), [`TxState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/struct.TxState.html), [`TxEnd`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxEnd.html), [`AsSqlxError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/trait.AsSqlxError.html), [`Transaction`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/struct.Transaction.html), [`TxOutput`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxOutput.html), [`TxError`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxError.html), [`TxFinalState`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/flow/enum.TxFinalState.html)
+- [`tx_effect!`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/macro.tx_effect.html)
 - [`AfterTransaction`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/sqlx/transaction/hook/struct.AfterTransaction.html)
 
 <Cards>

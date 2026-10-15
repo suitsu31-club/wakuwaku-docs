@@ -12,15 +12,23 @@ wakuwaku aims to be a powerful, robust microservice framework for Rust, in the w
 
 The first release candidate. It contained the service builder, gRPC registration, cron jobs, typed events on Apache Iggy, capability-typed data access to PostgreSQL, MySQL, Redis, and Meilisearch, and proof-carrying validation.
 
-### 1.0.0-rc2 (current)
+### 1.0.0-rc2
 
-The current release candidate keeps everything rc1 contained and refines it:
+The second release candidate kept everything rc1 contained and refined it:
 
 - **Data access**: every query declares its own error type, so a query that can refuse (a lost optimistic lock, a broken business rule) says so in its error. A transaction is a flow whose steps run queries inside the open transaction, while the library owns BEGIN, COMMIT, ROLLBACK, and what an aborted transaction or a lost COMMIT means.
 - **Services**: components built from several dependencies are registered with a closure (`compose_cron_job`, `compose_grpc_service`, `compose_iggy_consumer`). A cron job chooses its schedule mode: after the previous run finishes, at least an interval apart, or on a fixed grid.
 - **Shutdown**: cron jobs and event consumers drain gracefully on `shutdown` and can be cancelled with `abort`.
 - **Events**: many events of one type can be published as a batch.
 - **Validation**: pure verifiers, declarable as constants, prove properties that need no context or I/O.
+
+### 1.0.0-rc3 (current)
+
+The current release candidate fixes what porting a production service to rc2 found:
+
+- **Data access**: a transaction flow declares the entities it reads and writes with `tx_effect!`, and every query it runs must stay within that declaration. A flow can no longer touch an entity that neither it nor its handle covers.
+- **Validation**: `ValidateError` is a standard error type, so it propagates with `?`. `Proven` values can be printed with `Debug`, and a pure verifier can check a `String` through `&str`.
+- **Documentation**: how to run a transaction and model its states, and how to assign consumer partitions.
 
 Everything listed as available in the table below ships in this release.
 
@@ -36,7 +44,7 @@ No dates are attached to these milestones.
 
 ## Spring modules and their counterparts
 
-"Available" means the counterpart exists in 1.0.0-rc2. It does not mean that wakuwaku copies the Spring API. The counterparts are designed so that the compiler checks as much as possible, so they often work differently. [Coming from Spring](/en/docs/guides/coming-from-spring) explains the differences.
+"Available" means the counterpart exists in 1.0.0-rc3. It does not mean that wakuwaku copies the Spring API. The counterparts are designed so that the compiler checks as much as possible, so they often work differently. [Coming from Spring](/en/docs/guides/coming-from-spring) explains the differences.
 
 | Spring                                                    | wakuwaku                                                                                | Status    |
 | --------------------------------------------------------- | --------------------------------------------------------------------------------------- | --------- |
@@ -67,4 +75,4 @@ A "not yet" row means that wakuwaku has nothing for it today. Until a counterpar
 
 ## Changes since 0.3
 
-0.3 was a set of utilities around RabbitMQ, Redis, and sqlx. 1.0.0-rc2 replaces most of them. See [Migrating from 0.3](/en/docs/guides/migrating-from-0.3).
+0.3 was a set of utilities around RabbitMQ, Redis, and sqlx. 1.0.0-rc3 replaces most of them. See [Migrating from 0.3](/en/docs/guides/migrating-from-0.3).

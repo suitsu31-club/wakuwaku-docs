@@ -17,7 +17,7 @@ sqlx 連携は `wakuwaku::entity::sqlx` にあり、`wakuwaku` クレートの 2
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["sqlx-pg"] }
 ```
 
 </Tab>
@@ -25,7 +25,7 @@ wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-mysql"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["sqlx-mysql"] }
 ```
 
 </Tab>
@@ -66,7 +66,7 @@ TLS フィーチャーがなくても sqlx は起動を拒否しません。デ�
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["sqlx-pg"] }
 sqlx = { version = "0.9", default-features = false, features = ["tls-rustls", "macros", "migrate"] }
 ```
 

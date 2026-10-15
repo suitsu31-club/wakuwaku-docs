@@ -174,8 +174,9 @@ pub async fn ensure_topology(client: &IggyClient) -> Result<(), IggyError> {
 
     let topic = OrderId::SUPER_PARTITION_NAME.0; // "orders"
     if client.get_topic(&stream, &Identifier::named(topic)?).await?.is_none() {
+        // パーティションは 1 つで、`vec![0]` として購読する。「パーティション数は最初に決める」を参照。
         let options = TopicCreateOptions {
-            partitions_count: Some(4),
+            partitions_count: Some(1),
             ..Default::default()
         };
         client.create_topic(&stream, topic, &options).await?;
@@ -184,10 +185,10 @@ pub async fn ensure_topology(client: &IggyClient) -> Result<(), IggyError> {
 }
 ```
 
-トピック名を `SUPER_PARTITION_NAME` から読めば、セットアップとイベント型の食い違いを防げます。`partitions_count` を指定しない場合、Iggy SDK の既定値はパーティション 1 つです。
+トピック名を `SUPER_PARTITION_NAME` から読めば、セットアップとイベント型の食い違いを防げます。`partitions_count` を指定しない場合も Iggy SDK の既定値はパーティション 1 つですが、明示しておけば、コンシューマのパーティションのリストと並べて数を確認できます。
 
 <Callout type="warn" title="パーティション数は最初に決める">
-  キーのパーティションは、キーのハッシュとトピックのパーティション数から決まります。後からパーティションを追加するとキーが別のパーティションへ移るので、変更の前後に発行された 1 つのキーのイベントが順不同で処理されることがあります。また、リトライトピックのパーティション数がメイントピックと一致しなくなると、コンシューマは起動を拒否します（`Error::PartitionCountMismatch`）。将来必要になる並行度に合わせてトピックのサイズを決めてください。
+  複数のパーティションによる並行性が必要でない限り、パーティションは 1 つにしてください。1 つのパーティションの中でも、コンシューマはバッチのキーを並行に処理します。キーのパーティションは、キーのハッシュとトピックのパーティション数から決まるので、後からパーティションを追加するとキーが別のパーティションへ移り、変更の前後に発行された 1 つのキーのイベントが順不同で処理されることがあります。また、リトライトピックのパーティション数がメイントピックと一致しなくなると、コンシューマは起動を拒否します（`Error::PartitionCountMismatch`）。追加したパーティションは、レプリカに [割り当てる](/ja/docs/events/consuming#splitting-across-replicas) まで購読されません。
 </Callout>
 
 ## エラー [#errors]

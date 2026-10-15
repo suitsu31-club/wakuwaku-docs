@@ -21,7 +21,7 @@ The examples sync the `posts` index from the [overview](/en/docs/data/meilisearc
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["meilisearch", "sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["meilisearch", "sqlx-pg"] }
 ```
 
 ## Describing the projection
@@ -247,11 +247,12 @@ For writes made inside a [transaction](/en/docs/data/transactions), wrap the han
 
 ### A flow that reports what it touched
 
-This flow publishes several drafts at once, all or none. Each step publishes one post with the `PublishPost` query from above; a post that doesn't exist rolls everything back.
+This flow publishes several drafts at once, all or none. It is a loop over the drafts, so each step is one turn (see [Designing a flow](/en/docs/data/transactions#designing-a-flow)): it publishes one post with the `PublishPost` query from above, and a post that doesn't exist rolls everything back. `PublishAllEffect` declares the only entity the flow touches.
 
 ```rust title="src/search/sync.rs"
 use wakuwaku::deps::sqlx::Postgres;
 use wakuwaku::entity::sqlx::transaction::{Either, Tx, TxEnd, TxFlow, TxState};
+use wakuwaku::entity::tx_effect;
 
 /// Publish several drafts in one transaction: all of them or none.
 pub enum PublishAll {
@@ -267,8 +268,9 @@ pub enum PublishAllFailed {
     Database(sqlx::Error),
 }
 
-impl Query for PublishAll {
-    type Effect = (Read<Post>, Write<Post>);
+tx_effect! {
+    /// Everything `PublishAll` touches.
+    pub enum PublishAllEffect { write Post }
 }
 
 impl From<TxEnd<Self>> for PublishAll {
@@ -278,6 +280,7 @@ impl From<TxEnd<Self>> for PublishAll {
 }
 
 impl TxFlow for PublishAll {
+    type Capability = PublishAllEffect;
     type Database = Postgres;
     type Commit = ();
     type Abort = PublishAllFailed;

@@ -72,7 +72,7 @@ where
 
 ## ValidateError を gRPC ステータスに変換する [#mapping-validateerror-to-a-grpc-status]
 
-`ValidateError` も `tonic::Status` も外部の型なので、オーファンルールにより `impl From<ValidateError<LookupError>> for Status` は書けません。関数を用意して `map_err` で使います。理由はそれぞれの `static` と比較し (等価性は同一性で判定されます。[拒否の理由](/ja/docs/validation#denied-reasons) を参照)、I/O エラーは拒否と分けて扱います。
+`ValidateError` も `tonic::Status` も外部の型なので、オーファンルールにより `impl From<ValidateError<LookupError>> for Status` は書けません。関数を用意して `map_err` で使います。理由はそれぞれの `static` と比較し (等価性は同一性で判定されます。[拒否の理由](/ja/docs/validation#denied-reasons) を参照)、I/O エラーは拒否と分けて扱います。`ValidateError` の `Display` (I/O エラーの型が `Display` を実装していれば使えます) を近道に使うこともしないでください。`Status::invalid_argument(error.to_string())` のように一律に変換すると、障害が不正な入力として報告されてしまいます。
 
 ```rust title="src/accounts.rs"
 use wakuwaku::deps::tonic::Status;

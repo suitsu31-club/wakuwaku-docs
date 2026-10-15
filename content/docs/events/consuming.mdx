@@ -4,7 +4,7 @@ description: Write event handlers, register them through ServiceBuilder or IggyC
 icon: Inbox
 ---
 
-A consumer is a list of event handlers that all read one Iggy topic. You write one handler per event type, register them, and call `start`; wakuwaku spawns one task per partition and runs the pipeline described on the [overview](/en/docs/events#what-the-consumer-does).
+A consumer is a list of event handlers that all read one Iggy topic. You write one handler per event type, register them, and call `start`; wakuwaku spawns one task per assigned partition and runs the pipeline described on the [overview](/en/docs/events#what-the-consumer-does).
 
 ## Event handlers
 
@@ -115,13 +115,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.connect().await?;
 
     // Consume both event types of the `orders` topic with one consumer.
+    // The topic has one partition; Iggy partition ids are zero-based.
     let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
         .iggy_consumer::<RecordOrder, _, _>()
         .iggy_consumer::<ApplyPayment, _, _>()
-        .start(
-            client,
-            ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]),
-        )
+        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
         .await?;
 
     tokio::signal::ctrl_c().await?;
@@ -149,7 +147,7 @@ let (services, orders) = ServiceBuilder::new(OrderStore::default())
 
 // ... finish setting up the service from `services`, then:
 let consumers = orders
-    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
     .await?;
 ```
 
@@ -192,7 +190,7 @@ let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
         })
     })
     .iggy_consumer::<ApplyPayment, _, _>()
-    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
     .await?;
 ```
 
@@ -209,7 +207,7 @@ pub async fn start_by_hand(
 ) -> Result<ConsumerRuntime, Error> {
     IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::create_service(store.clone())))
         .push(Arc::new(ApplyPayment::create_service(store)))
-        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
         .await
 }
 ```
@@ -260,7 +258,7 @@ To consume events of another key type, start a second consumer. Records whose ta
     },
     partitions: {
       type: 'Vec<u32>',
-      description: 'Partitions of the main topic to consume. Each gets its own task. Iggy partition ids start at 0. Must not be empty.',
+      description: 'Partitions of the main topic to consume, by zero-based Iggy partition id (0..partitions_count). An explicit assignment: a partition left out is not consumed. Each gets its own task. Must not be empty.',
       required: true,
     },
     mode: {
@@ -318,23 +316,40 @@ pub fn config(partitions: Vec<u32>) -> ConsumerConfig {
 
 `start` spawns **one Tokio task per entry in `partitions`**. Partitions are processed in parallel with each other; inside a partition, the keys of one polled batch are processed concurrently, and the next batch is polled only when every key of the current one is done, failed over to the retry topic, or dropped.
 
-To consume every partition, read the ids from the topic instead of hard-coding them:
+`partitions` is an explicit assignment, by design: the consumer reads the partitions you list and no others. There is intentionally no "all partitions" mode, and the list should not be read from the topic either. A consumer that silently follows the topic's partition count can't be split safely across replicas, and partitions added to the topic later would be picked up without anyone assigning them.
 
-```rust title="src/setup.rs"
-/// Every partition id of the main topic (ids are zero-based).
-pub async fn all_partitions(client: &IggyClient) -> Result<Vec<u32>, IggyError> {
-    let stream = Identifier::named("shop")?;
-    let topic = Identifier::named(OrderId::SUPER_PARTITION_NAME.0)?;
-    let details = client
-        .get_topic(&stream, &topic)
-        .await?
-        .ok_or_else(|| IggyError::TopicIdNotFound(topic.clone(), stream.clone()))?;
-    Ok(details.partitions.iter().map(|partition| partition.id).collect())
+Iggy partition ids are zero-based: for the Iggy server versions wakuwaku supports, a topic with `n` partitions has the ids `0..n`. Publishers spread events over every partition of the topic by key hash, so a partition that no consumer lists is not consumed at all.
+
+### One partition for a small deployment
+
+A small deployment creates its topic with **one** partition (see [What must exist on the server](/en/docs/events/publishing#what-must-exist-on-the-server)) and consumes `vec![0]`, as the examples on this page do. One partition task already processes the keys of each batch concurrently, which is enough for most services.
+
+### Splitting across replicas
+
+When one partition no longer keeps up, create the topic with more partitions, or grow it (which moves keys to other partitions, see [Publishing](/en/docs/events/publishing#what-must-exist-on-the-server)), and assign the partitions to replicas explicitly. Each replica reads its assignment from its own configuration, for example an environment variable, and passes it to [`config`](#configuration):
+
+```rust title="src/config.rs"
+use std::env;
+use std::error::Error;
+
+/// Partitions assigned to this replica, e.g. `ORDER_PARTITIONS=0,2`.
+pub fn assigned_partitions() -> Result<Vec<u32>, Box<dyn Error>> {
+    env::var("ORDER_PARTITIONS")?
+        .split(',')
+        .map(|id| Ok(id.trim().parse::<u32>()?))
+        .collect()
 }
 ```
 
+With four partitions and two replicas, replica `i` of `n` taking the ids with `id % n == i` gives:
+
+| Replica | `ORDER_PARTITIONS` |
+|---|---|
+| 0 | `0,2` |
+| 1 | `1,3` |
+
 <Callout type="warn" title="Replicas need disjoint partitions">
-  The consumer reads explicit partitions with a named Iggy consumer; it does not join an Iggy consumer group, so there is no automatic rebalancing. If you run several replicas with the same `consumer_name`, give each a disjoint set of `partitions` (for example, replica `i` of `n` takes the partitions with `id % n == i`). Two replicas reading the same partition both process its records.
+  The consumer reads its partitions with a named Iggy consumer; it does not join an Iggy consumer group, so there is no automatic rebalancing. Replicas that share a `consumer_name` need disjoint sets of `partitions` that together cover every partition of the topic. Two replicas reading the same partition both process its records, and a partition no replica lists is not consumed. When the topic's partition count or the number of replicas changes, update every replica's assignment.
 </Callout>
 
 ## The pipeline of one partition

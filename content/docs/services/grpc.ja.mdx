@@ -47,7 +47,7 @@ wakuwaku の機能は基本的に `wakuwaku` 一つから import しますが、
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = "1.0.0-rc2"  # デフォルト feature に `grpc` が含まれる
+wakuwaku = "1.0.0-rc3"  # デフォルト feature に `grpc` が含まれる
 # 生成コードが直接参照するクレート
 tonic = "0.14"
 tonic-prost = "0.14"
@@ -58,7 +58,7 @@ tokio = { version = "1", features = ["full"] }
 tonic-prost-build = "0.14"
 ```
 
-`tonic` は wakuwaku と同じマイナーバージョン(wakuwaku 1.0.0-rc2 では 0.14)にしてください。そうすれば Cargo が両者を一つのクレートに解決し、`tonic` と `wakuwaku::deps::tonic` は同じ型になります。バージョンが異なると、生成されたサーバーは別の `tonic` のトレイトを実装することになり、wakuwaku に受け付けられません。
+`tonic` は wakuwaku と同じマイナーバージョン(wakuwaku 1.0.0-rc3 では 0.14)にしてください。そうすれば Cargo が両者を一つのクレートに解決し、`tonic` と `wakuwaku::deps::tonic` は同じ型になります。バージョンが異なると、生成されたサーバーは別の `tonic` のトレイトを実装することになり、wakuwaku に受け付けられません。
 
 コード生成器は Protocol Buffers コンパイラ `protoc` を呼び出します。最初のビルドの前に、パッケージマネージャーでインストールする(または環境変数 `PROTOC` でパスを指定する)必要があります。
 

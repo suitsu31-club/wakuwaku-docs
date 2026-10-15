@@ -72,7 +72,7 @@ where
 
 ## Mapping ValidateError to a gRPC status
 
-`ValidateError` and `tonic::Status` are both foreign types, so the orphan rules forbid `impl From<ValidateError<LookupError>> for Status`. Write a function and use it with `map_err`. Compare reasons against their `static`s (equality is by identity; see [Denied reasons](/en/docs/validation#denied-reasons)) and keep I/O errors apart from denials:
+`ValidateError` and `tonic::Status` are both foreign types, so the orphan rules forbid `impl From<ValidateError<LookupError>> for Status`. Write a function and use it with `map_err`. Compare reasons against their `static`s (equality is by identity; see [Denied reasons](/en/docs/validation#denied-reasons)) and keep I/O errors apart from denials. Do not shortcut through `ValidateError`'s `Display` either (it has one when the I/O error type implements `Display`): a single `Status::invalid_argument(error.to_string())` would report an outage as bad input.
 
 ```rust title="src/accounts.rs"
 use wakuwaku::deps::tonic::Status;

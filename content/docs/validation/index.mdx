@@ -33,7 +33,7 @@ The `proof` feature is on by default, so `wakuwaku` alone is enough. Predicates 
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = "1.0.0-rc2"
+wakuwaku = "1.0.0-rc3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -44,10 +44,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 | [`ValidateContext`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.ValidateContext.html) | What a check reads while deciding (configuration, connection handles, caches), plus the error type for "could not decide". |
 | [`Predicate<T>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/trait.Predicate.html) | A proposition about a `T`, decided at runtime. The predicate type is also its own evidence. |
 | [`prove`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/fn.prove.html) | Runs a predicate against a subject and wraps both in a `Proven` on success. |
-| [`PureVerifier<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) | A pure check as a function pointer, declared as a `static` or `const`. The other way to obtain a `Proven`. |
-| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | The subject plus evidence that `P` held. Only obtainable from `prove`, a `PureVerifier`, or another proof. |
-| [`ValidateError<E>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.ValidateError.html) | `Deny(DeniedReason)` when the rule is false, `IoError(E)` when it could not be decided. |
-| [`DeniedReason`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.DeniedReason.html) | A `&'static str` explaining a denial, compared by identity. |
+| [`PureVerifier<T, P, B = T>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) | A pure check as a function pointer over `&B`, a borrowed form of `T`, declared as a `static` or `const`. The other way to obtain a `Proven`. |
+| [`Proven<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Proven.html) | The subject plus evidence that `P` held. Only obtainable from `prove`, a `PureVerifier`, or another proof. `Debug` when `T` and `P` are. |
+| [`ValidateError<E>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/enum.ValidateError.html) | `Deny(DeniedReason)` when the rule is false, `IoError(E)` when it could not be decided. A `std::error::Error` when `E` is `Debug + Display`. |
+| [`DeniedReason`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.DeniedReason.html) | A `&'static str` explaining a denial, compared by identity. Displays as its text. |
 
 ### A context
 
@@ -151,7 +151,7 @@ pub async fn handle(input: String) -> Result<String, &'static str> {
 
 ### Pure checks: `PureVerifier`
 
-Some rules read nothing but the subject: a slug format, a range, a checksum. They need no context, cannot fail to decide, and have nothing to compose. For those, a [`PureVerifier<T, P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) is the check itself as a function pointer, `fn(&T) -> Result<P, ValidateError<Infallible>>`. `PureVerifier::new` is a `const fn`, so the verifier is declared once as a `static` (or `const`) next to its evidence type, and proving is a plain synchronous call:
+Some rules read nothing but the subject: a slug format, a range, a checksum. They need no context, cannot fail to decide, and have nothing to compose. For those, a [`PureVerifier<T, P, B>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.PureVerifier.html) is the check itself as a function pointer, `fn(&B) -> Result<P, ValidateError<Infallible>>`, where `B` is a borrowed form of the subject type `T` (`T: Borrow<B>`) and defaults to `T`. `PureVerifier::new` is a `const fn`, so the verifier is declared once as a `static` (or `const`) next to its evidence type, and proving is a plain synchronous call:
 
 ```rust title="src/validation/slug.rs"
 use std::convert::Infallible;
@@ -162,13 +162,14 @@ pub static NOT_A_SLUG: DeniedReason = DeniedReason("not a lowercase slug");
 /// "The string is a URL slug." The private field: only this module can build one.
 pub struct Slug(());
 
-fn is_slug(s: &String) -> Result<Slug, ValidateError<Infallible>> {
+fn is_slug(s: &str) -> Result<Slug, ValidateError<Infallible>> {
     let valid = !s.is_empty()
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     if valid { Ok(Slug(())) } else { Err(ValidateError::Deny(NOT_A_SLUG)) }
 }
 
-pub static SLUG: PureVerifier<String, Slug> = PureVerifier::new(is_slug);
+/// Owns a `String`, checks it as `&str`.
+pub static SLUG: PureVerifier<String, Slug, str> = PureVerifier::new(is_slug);
 
 /// Only callable with a string that went through `SLUG`.
 pub fn publish(slug: Proven<String, Slug>) -> String {
@@ -186,6 +187,8 @@ pub fn handle(input: String) -> Result<String, &'static str> {
 ```
 
 The result is an ordinary `Proven<String, Slug>`; code that requires it cannot tell, and does not care, which way it was obtained.
+
+**Checking through a borrow.** The third parameter lets the function take the subject in its borrowed form: `SLUG` owns a `String` and checks it as `&str`, and a verifier for `Vec<u8>` can check `&[u8]`. The same `is_slug` also serves `PureVerifier<Box<str>, Slug, str>`. Leave `B` out and it is `T`, so the function takes `&T`. The proof is only as sound as `T`'s `Borrow<B>`: the function decides `P` for the borrowed view, and [`Borrow`](https://doc.rust-lang.org/std/borrow/trait.Borrow.html)'s contract, that the borrowed form behaves like the owned value, is what makes that view stand for the subject. The standard library's impls honor it; a hand-written `Borrow` that returns some other view would prove `P` about that view instead.
 
 **Who can write a verifier.** The function must return a `Slug`, so only code that can construct a `Slug` can write a verifier for it. That is why `Slug` has a private field. A predicate's meaning is fixed by its single `impl Predicate<T>`, but any number of verifiers can target the same evidence type, and a unit struct like `pub struct NonEmpty;` would let anyone write `PureVerifier::new(|_| Ok(NonEmpty))` and prove anything. With a private field, every proof of `Slug` is written in the module that defines it, which is where the rule's meaning lives.
 
@@ -214,6 +217,27 @@ A check ends in exactly one of three ways:
 `IoError` says nothing about whether the subject is valid. Reporting it to the client as "invalid input" blames the user for an outage. Keep the two arms separate; [Using proofs in services](/en/docs/validation/in-services#mapping-validateerror-to-a-grpc-status) shows a mapping to `tonic::Status`.
 </Callout>
 
+### As a standard error
+
+`ValidateError<E>` implements `std::error::Error` and `Display` whenever `E` is `Debug + Display`, which includes `Infallible`. `Deny` displays as the reason's text, `IoError` as `could not decide the proposition: ` followed by the I/O error. Where the caller does not need to tell the two apart, such as a batch job that stops at the first failure, `?` propagates it into a `Box<dyn Error>` or an `anyhow::Error`:
+
+```rust title="src/validation.rs"
+use std::error::Error;
+
+/// Any invalid name aborts the import.
+pub async fn import(names: Vec<String>) -> Result<Vec<String>, Box<dyn Error>> {
+    let limits = Limits { max_len: 16 };
+    let mut registered = Vec::new();
+    for name in names {
+        let name = prove::<_, ValidUsername>(name, &limits, CheckOrder::Sequential).await?;
+        registered.push(register(name));
+    }
+    Ok(registered)
+}
+```
+
+`import(vec![String::new()])` fails with an error that displays as `username is empty`.
+
 ### Denied reasons
 
 `DeniedReason` wraps a `&'static str`, and its equality is **pointer identity**, not string content. Two reasons with the same text may compare unequal if they live at different addresses, and string literals or references to a `const` are not guaranteed to share one. Declare each reason once as a `static` and compare against that `static`:
@@ -225,7 +249,7 @@ pub static TAKEN: DeniedReason = DeniedReason("username is already taken");
 if reason == TAKEN { /* ... */ }
 ```
 
-The text is in `reason.0` when you need to show it.
+`DeniedReason` implements `Display`, which writes its text, so `format!("rejected: {reason}")` works. `reason.0` is the `&'static str` itself, for APIs that take one.
 
 ## Evidence
 
@@ -238,6 +262,8 @@ The predicate type is its own evidence. `Proven::evidence()` hands it out **by r
 Inside `Proven`, `And` and `Or`, each piece of evidence is wrapped in [`Evidence<P>`](https://docs.rs/wakuwaku-proof/latest/wakuwaku_proof/struct.Evidence.html). It dereferences to `&P`, it cannot be moved out, and it is **not `Clone`**, even when `P` is. Only the crate's Boolean-algebra laws duplicate evidence, and only those whose result contains the same proof twice; those require `P: Clone` (see [Deriving proofs](/en/docs/validation/derivation#when-evidence-must-be-clone)).
 
 The subject is also exposed only as `&T` through `Proven::subject()`, so it cannot be changed after the check (interior mutability aside). There is no method that gives the subject back by value; clone it if you need an owned copy.
+
+`Proven<T, P>` implements `Debug` when `T` and `P` do (as do `Evidence`, `And` and `Or`), so a struct that holds a proof can `#[derive(Debug)]` once the subject and predicate types implement `Debug`.
 
 <Callout type="info" title="A proof is a snapshot">
 Both subject and evidence describe the moment of the check. If the predicate depends on external state, such as "this username is free", that state may have changed since. Keep the database's own constraints (for example a unique index) as the final guard.

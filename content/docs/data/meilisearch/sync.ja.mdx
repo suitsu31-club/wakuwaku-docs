@@ -21,7 +21,7 @@ wakuwaku は、どのプロジェクトでも共通する部品を提供しま�
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["meilisearch", "sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["meilisearch", "sqlx-pg"] }
 ```
 
 ## 射影を記述する
@@ -247,11 +247,12 @@ pub fn wire(
 
 ### 触れたものを報告するフロー [#a-flow-that-reports-what-it-touched]
 
-このフローは、複数の下書きをまとめて公開します。すべて公開するか、1 つも公開しないかのどちらかです。各ステップは上の `PublishPost` クエリで投稿を 1 つ公開し、存在しない投稿があればすべてをロールバックします。
+このフローは、複数の下書きをまとめて公開します。すべて公開するか、1 つも公開しないかのどちらかです。下書きを回るループなので、各ステップがその 1 周です（[フローの設計](/ja/docs/data/transactions#designing-a-flow) を参照）。各ステップは上の `PublishPost` クエリで投稿を 1 つ公開し、存在しない投稿があればすべてをロールバックします。`PublishAllEffect` は、フローが触れる唯一のエンティティを宣言します。
 
 ```rust title="src/search/sync.rs"
 use wakuwaku::deps::sqlx::Postgres;
 use wakuwaku::entity::sqlx::transaction::{Either, Tx, TxEnd, TxFlow, TxState};
+use wakuwaku::entity::tx_effect;
 
 /// 複数の下書きを 1 つのトランザクションで公開する: すべてか、何もしないか。
 pub enum PublishAll {
@@ -267,8 +268,9 @@ pub enum PublishAllFailed {
     Database(sqlx::Error),
 }
 
-impl Query for PublishAll {
-    type Effect = (Read<Post>, Write<Post>);
+tx_effect! {
+    /// `PublishAll` が触れるものすべて。
+    pub enum PublishAllEffect { write Post }
 }
 
 impl From<TxEnd<Self>> for PublishAll {
@@ -278,6 +280,7 @@ impl From<TxEnd<Self>> for PublishAll {
 }
 
 impl TxFlow for PublishAll {
+    type Capability = PublishAllEffect;
     type Database = Postgres;
     type Commit = ();
     type Abort = PublishAllFailed;

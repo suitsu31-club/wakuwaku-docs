@@ -4,7 +4,7 @@ description: イベントハンドラを書き、ServiceBuilder または IggyCo
 icon: Inbox
 ---
 
-コンシューマは、1 つの Iggy トピックを読むイベントハンドラの一覧です。イベント型ごとにハンドラを 1 つ書いて登録し、`start` を呼びます。wakuwaku はパーティションごとに 1 つのタスクを起動し、[概要](/ja/docs/events#what-the-consumer-does) で説明したパイプラインを実行します。
+コンシューマは、1 つの Iggy トピックを読むイベントハンドラの一覧です。イベント型ごとにハンドラを 1 つ書いて登録し、`start` を呼びます。wakuwaku は割り当てたパーティションごとに 1 つのタスクを起動し、[概要](/ja/docs/events#what-the-consumer-does) で説明したパイプラインを実行します。
 
 ## イベントハンドラ [#event-handlers]
 
@@ -115,13 +115,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.connect().await?;
 
     // `orders` トピックの 2 つのイベント型を 1 つのコンシューマで購読する。
+    // トピックのパーティションは 1 つ。Iggy のパーティション ID は 0 始まり。
     let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
         .iggy_consumer::<RecordOrder, _, _>()
         .iggy_consumer::<ApplyPayment, _, _>()
-        .start(
-            client,
-            ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]),
-        )
+        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
         .await?;
 
     tokio::signal::ctrl_c().await?;
@@ -149,7 +147,7 @@ let (services, orders) = ServiceBuilder::new(OrderStore::default())
 
 // ... `services` からサービスの残りを組み立ててから:
 let consumers = orders
-    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
     .await?;
 ```
 
@@ -192,7 +190,7 @@ let (_services, consumers) = ServiceBuilder::new(OrderStore::default())
         })
     })
     .iggy_consumer::<ApplyPayment, _, _>()
-    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+    .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
     .await?;
 ```
 
@@ -209,7 +207,7 @@ pub async fn start_by_hand(
 ) -> Result<ConsumerRuntime, Error> {
     IggyConsumerRegisterCenter::new(Arc::new(RecordOrder::create_service(store.clone())))
         .push(Arc::new(ApplyPayment::create_service(store)))
-        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0, 1, 2, 3]))
+        .start(client, ConsumerConfig::new("shop", "order-projection", vec![0]))
         .await
 }
 ```
@@ -260,7 +258,7 @@ let handlers = IggyConsumerRegisterCenter::<_, OrderPlaced>::new(audit.clone())
     },
     partitions: {
       type: 'Vec<u32>',
-      description: '購読するメイントピックのパーティション。それぞれに専用のタスクが割り当てられます。Iggy のパーティション ID は 0 から始まります。空にはできません。',
+      description: '購読するメイントピックのパーティション。0 始まりの Iggy パーティション ID（0..partitions_count）で指定します。明示的な割り当てなので、含めなかったパーティションは購読されません。それぞれに専用のタスクが割り当てられます。空にはできません。',
       required: true,
     },
     mode: {
@@ -318,23 +316,40 @@ pub fn config(partitions: Vec<u32>) -> ConsumerConfig {
 
 `start` は **`partitions` の要素ごとに Tokio タスクを 1 つ**起動します。パーティション同士は並列に処理されます。1 つのパーティションの中では、ポーリングした 1 バッチのキーが並行に処理され、現在のバッチのすべてのキーが完了するか、リトライトピックへ移されるか、破棄されるまで、次のバッチはポーリングされません。
 
-すべてのパーティションを購読するには、ID をハードコードせずトピックから読み取ります。
+`partitions` は設計上、明示的な割り当てです。コンシューマは列挙したパーティションだけを読み、それ以外は読みません。「すべてのパーティション」を読むモードは意図的に用意していません。リストをトピックから読み取るのも避けてください。トピックのパーティション数に黙って追従するコンシューマは、レプリカ間で安全に分割できません。また、後からトピックに追加されたパーティションを、誰も割り当てていないのに読み始めてしまいます。
 
-```rust title="src/setup.rs"
-/// メイントピックのすべてのパーティション ID（0 始まり）。
-pub async fn all_partitions(client: &IggyClient) -> Result<Vec<u32>, IggyError> {
-    let stream = Identifier::named("shop")?;
-    let topic = Identifier::named(OrderId::SUPER_PARTITION_NAME.0)?;
-    let details = client
-        .get_topic(&stream, &topic)
-        .await?
-        .ok_or_else(|| IggyError::TopicIdNotFound(topic.clone(), stream.clone()))?;
-    Ok(details.partitions.iter().map(|partition| partition.id).collect())
+Iggy のパーティション ID は 0 始まりです。wakuwaku が対応する Iggy サーバーのバージョンでは、パーティションが `n` 個のトピックの ID は `0..n` です。パブリッシャーはキーのハッシュでイベントをトピックのすべてのパーティションへ振り分けるので、どのコンシューマも列挙していないパーティションはまったく購読されません。
+
+### 小規模なデプロイではパーティションを 1 つに [#one-partition-for-a-small-deployment]
+
+小規模なデプロイでは、トピックを **1 つ** のパーティションで作成し（[サーバーに必要なもの](/ja/docs/events/publishing#what-must-exist-on-the-server) を参照）、このページの例のように `vec![0]` を購読します。1 つのパーティションのタスクでも、各バッチのキーは並行に処理されるので、たいていのサービスにはこれで足ります。
+
+### レプリカで分割する [#splitting-across-replicas]
+
+1 つのパーティションで処理が追いつかなくなったら、より多くのパーティションでトピックを作成するか、トピックのパーティションを増やし（キーが別のパーティションへ移ります。[発行](/ja/docs/events/publishing#what-must-exist-on-the-server) を参照）、パーティションをレプリカへ明示的に割り当てます。各レプリカは自分の割り当てを、環境変数などの自身の設定から読み取り、[`config`](#configuration) に渡します。
+
+```rust title="src/config.rs"
+use std::env;
+use std::error::Error;
+
+/// このレプリカに割り当てられたパーティション。例: `ORDER_PARTITIONS=0,2`。
+pub fn assigned_partitions() -> Result<Vec<u32>, Box<dyn Error>> {
+    env::var("ORDER_PARTITIONS")?
+        .split(',')
+        .map(|id| Ok(id.trim().parse::<u32>()?))
+        .collect()
 }
 ```
 
+パーティションが 4 つ、レプリカが 2 つの場合、`n` 個中 `i` 番目のレプリカが `id % n == i` の ID を担当すると、次のようになります。
+
+| レプリカ | `ORDER_PARTITIONS` |
+|---|---|
+| 0 | `0,2` |
+| 1 | `1,3` |
+
 <Callout type="warn" title="レプリカには重ならないパーティションを割り当てる">
-  コンシューマは名前付きの Iggy コンシューマで明示したパーティションを読みます。Iggy のコンシューマグループには参加しないので、自動的なリバランスはありません。同じ `consumer_name` で複数のレプリカを動かす場合は、それぞれに重ならない `partitions` を割り当ててください（たとえば `n` 個中 `i` 番目のレプリカは `id % n == i` のパーティションを担当する）。同じパーティションを 2 つのレプリカが読むと、どちらもそのレコードを処理します。
+  コンシューマは名前付きの Iggy コンシューマで自分のパーティションを読みます。Iggy のコンシューマグループには参加しないので、自動的なリバランスはありません。同じ `consumer_name` を使うレプリカには、互いに重ならず、合わせてトピックのすべてのパーティションを覆う `partitions` を割り当ててください。同じパーティションを 2 つのレプリカが読むと、どちらもそのレコードを処理します。どのレプリカも列挙していないパーティションは購読されません。トピックのパーティション数やレプリカ数が変わったら、すべてのレプリカの割り当てを更新してください。
 </Callout>
 
 ## 1 つのパーティションのパイプライン [#the-pipeline-of-one-partition]

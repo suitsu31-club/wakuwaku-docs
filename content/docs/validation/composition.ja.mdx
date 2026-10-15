@@ -90,7 +90,7 @@ pub fn resolve(login: &Proven<String, SignInId>) -> Result<i64, &'static str> {
 
 ```toml title="Cargo.toml"
 [dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["sqlx-pg"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["sqlx-pg"] }
 ```
 
 まずクエリです。`User` を読むと宣言しているので、`Db<_, ReadOnly>` を通して実行できます。
