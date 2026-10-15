@@ -248,7 +248,7 @@ const text: Record<"en" | "ja", Text> = {
         body: "The first release candidate.",
       },
       {
-        version: "1.0.0-rc2",
+        version: "1.0.0-rc3",
         label: "Now",
         body: "The release candidate these docs describe.",
       },
@@ -351,7 +351,7 @@ const text: Record<"en" | "ja", Text> = {
         body: "最初のリリース候補版です。",
       },
       {
-        version: "1.0.0-rc2",
+        version: "1.0.0-rc3",
         label: "現在",
         body: "このドキュメントが対象とするリリース候補版です。",
       },
