@@ -1,7 +1,7 @@
 ---
 title: Migrating from 0.3
 description: Move a service from wakuwaku 0.3 to 1.0.0-rc3, with before-and-after code for each replaced module.
-icon: ArrowUpCircle
+icon: CircleArrowUp
 ---
 
 wakuwaku 0.3 was a set of utilities: a RabbitMQ integration, Redis and sqlx helpers, a resource pool, and a service builder. 1.0.0-rc3 keeps the service builder, but it is now a framework. Data access, events, and validation are separate crates, re-exported behind feature flags, and RabbitMQ is replaced by Apache Iggy.
