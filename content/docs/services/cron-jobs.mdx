@@ -173,6 +173,30 @@ Different jobs are independent: a slow `ReindexSearch` never delays `ExpireSessi
 - Grid points missed because the runtime was blocked (for example by blocking code on a worker thread) are skipped, not run in a burst, and `run` does not count them.
 - `fired_at` includes the wake-up delay, so two consecutive `fired_at` can be slightly **less** than `d` apart. That matters for [fences across replicas](#once-per-interval-across-replicas).
 
+### Reading an interval
+
+`CronJobInterval` has no method that returns the bare duration, and that is deliberate. `AfterFinish(d)`, `AtLeast(d)` and `AfterStart(d)` with the same `d` are three different schedules: they differ in overlap, drift and catch-up, and a lone `d` erases exactly that difference. To log a job's schedule, print the interval with `Debug`, which keeps the variant:
+
+```rust
+tracing::info!(interval = ?ExpireSessions::INTERVAL, "cron job registered");
+// interval=AtLeast(60s)
+```
+
+Code that needs a number matches on the variant and handles each kind on its own terms. For example, the time from the start of one run to the start of the next, for runs that take `run_time`, which an alert on a job that stopped running can be built on:
+
+```rust
+fn start_to_start(interval: CronJobInterval, run_time: Duration) -> Duration {
+    match interval {
+        CronJobInterval::AfterFinish(pause) => run_time + pause,
+        CronJobInterval::AtLeast(period) => period.max(run_time),
+        // Ignores grid points skipped while the runtime was blocked.
+        CronJobInterval::AfterStart(period) => period,
+    }
+}
+```
+
+Avoid `AfterFinish(d) | AtLeast(d) | AfterStart(d) => d`: that is the missing accessor written by hand, and it collapses three schedules into one number.
+
 ### Errors and panics
 
 A run that returns `Err` is logged with [`tracing`](https://docs.rs/tracing) at error level (`cron job failed`, with the error's `Display` output). A run that **panics** is caught and logged as well (`cron job panicked`, with the panic message). In both cases the job keeps its schedule: the next run starts when its interval says, as if the run had succeeded.

@@ -173,6 +173,30 @@ cron.shutdown().await;
 - ランタイムがブロックされていた(たとえばワーカースレッド上のブロッキングなコードによって)ために逃したグリッド点は、まとめて実行されずにスキップされ、`run` にも数えられません。
 - `fired_at` には起床の遅れが含まれるので、連続する二つの `fired_at` の間隔が `d` よりわずかに **短く** なることがあります。これは [レプリカ間のフェンス](#once-per-interval-across-replicas) で問題になります。
 
+### 間隔を読み取る [#reading-an-interval]
+
+`CronJobInterval` には長さだけを返すメソッドがありませんが、これは意図的です。同じ `d` を持つ `AfterFinish(d)`、`AtLeast(d)`、`AfterStart(d)` は三つの異なるスケジュールで、実行の重なり、ずれ、遅れの取り戻し方が違います。`d` だけを取り出すと、まさにその違いが消えてしまいます。ジョブのスケジュールをログに出すときは、バリアントが残る `Debug` で間隔を出力します。
+
+```rust
+tracing::info!(interval = ?ExpireSessions::INTERVAL, "cron job registered");
+// interval=AtLeast(60s)
+```
+
+数値が必要なコードはバリアントでマッチし、それぞれの種類をその意味どおりに扱います。たとえば、実行に `run_time` かかるときの、ある実行の開始から次の実行の開始までの時間です。止まってしまったジョブを検知するアラートは、これをもとに組み立てられます。
+
+```rust
+fn start_to_start(interval: CronJobInterval, run_time: Duration) -> Duration {
+    match interval {
+        CronJobInterval::AfterFinish(pause) => run_time + pause,
+        CronJobInterval::AtLeast(period) => period.max(run_time),
+        // ランタイムがブロックされていた間にスキップされたグリッド点は考慮しない。
+        CronJobInterval::AfterStart(period) => period,
+    }
+}
+```
+
+`AfterFinish(d) | AtLeast(d) | AfterStart(d) => d` とは書かないでください。これは存在しないアクセサを手で書いたもので、三つのスケジュールを一つの数値に潰してしまいます。
+
 ### エラーと panic [#errors-and-panics]
 
 `Err` を返した実行は、[`tracing`](https://docs.rs/tracing) で error レベルとしてログに出力されます(`cron job failed` とエラーの `Display` 出力)。**panic** した実行も捕捉され、同様にログに出力されます(`cron job panicked` と panic メッセージ)。どちらの場合もジョブのスケジュールは保たれ、次の実行は、実行が成功した場合と同じく間隔の定めるとおりに始まります。
