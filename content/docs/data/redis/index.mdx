@@ -1,6 +1,6 @@
 ---
 title: Redis
-description: Use Redis as a capability-checked data source, with typed caches, locks, a rate limiter, pipes, live views and stream buffers.
+description: Use Redis as a capability-checked data source, with typed caches, locks, a rate limiter, promises, watches, pipes, live views and stream buffers.
 ---
 
 Redis is where a microservice keeps the state that is shared between replicas but doesn't belong in the primary database: cached reads, locks, rate-limit counters, messages on their way to a websocket, the chunks of a streamed LLM answer. The `redis` feature of wakuwaku turns Redis into a [data source](/en/docs/data/queries) like PostgreSQL: every command is a typed query, and a `Db` handle only runs the queries its capability allows.
@@ -12,11 +12,13 @@ On top of the data source, wakuwaku ships ready-made data structures, each one a
 | [`Cache`, `HashedCache`](/en/docs/data/redis/cache) | `collection::cache` | Bodies with a TTL; the hashed variant answers "has it changed?" without downloading the body. |
 | [`Lock`, `RwLock`](/en/docs/data/redis/lock) | `collection::lock` | Mutual exclusion across replicas, with leases. |
 | [`TokenBucket`](/en/docs/data/redis/rate-limiter) | `collection::token_bucket_limiter` | Rate limiting with bursts. |
+| [`Promise`](/en/docs/data/redis/promise) | `dynamic::promise` | A value completed once and waited on by anyone, like a `oneshot` across replicas. |
+| [`Watch`](/en/docs/data/redis/watch) | `dynamic::watch` | The latest version of some state, waited on for newer ones, like a `watch` channel across replicas. |
 | [`Pipe`](/en/docs/data/redis/pipe) | `dynamic::pipe` | A one-way, one-receiver message queue, like one direction of a websocket. |
 | [`LiveView`](/en/docs/data/redis/live-view) | `dynamic::live_view` | A durable document with versioned commits that subscribers follow as diffs. |
 | [`StreamBuffer`](/en/docs/data/redis/stream-buffer) | `dynamic::stream_buffer` | An append-only array with an end, followed by any number of subscribers. |
 
-The *collections* are queried on demand. The *dynamic* structures can also be followed as they change.
+The *collections* are queried on demand. The *dynamic* structures can also be waited on as they change, through one [watch hub](#following-changes-the-watch-hub) per process.
 
 If you come from Spring, this page covers what Spring Data Redis' connection setup does, and the subpages replace the usual mix of `RedisCacheManager`, a distributed lock registry and a rate-limiting library, with one typing discipline across all of them.
 
@@ -207,6 +209,8 @@ Each structure type is also the [entity](/en/docs/data/queries) its queries read
 | `Lock` | | `try_lock`, `release`, `extend` |
 | `RwLock` | | `try_read`, `try_write`, `release`, `extend` |
 | `TokenBucket` | | `acquire`, `reset` |
+| `Promise` | `get`, `wait` | `complete`, `remove` |
+| `Watch` | `get`, `changed` | `publish`, `remove` |
 | `Pipe` | | `send`, `close`, `receive` (taking a message removes it) |
 | `LiveView` | `get`, `version`, `history`, `subscribe`, `resume` | `create`, `commit`, `remove` |
 | `StreamBuffer` | `read`, `subscribe` | `append`, `finish`, `remove` |
@@ -242,32 +246,44 @@ impl<N: ?Sized, B> CanRead<Cache<N, B>> for Gateway {}
 impl CanWrite<Cache<SessionToken, Session>> for Gateway {}
 ```
 
-## Following changes: dedicated connections
+## Following changes: the watch hub
 
-Receiving from a pipe and subscribing to a live view or a stream buffer are queries too, so the capability is checked as usual. They output a receiver or subscription that waits with blocking Redis commands (`BLPOP`, `XREAD BLOCK`) on a connection you pass to the query.
+Waiting on a promise or a watch, receiving from a pipe and subscribing to a live view or a stream buffer are queries too, so the capability is checked as usual. None of them blocks a connection. A wait reads the item with ordinary commands on your `RedisSource` connection and, when there is nothing new yet, sleeps until the process's [`WatchHub`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/watch_hub/struct.WatchHub.html) wakes it.
 
-A blocking command stalls every other command sent on the same socket, so that connection must be used for nothing else: never pass a clone of the multiplexed connection inside your `RedisSource`. It must also not time out a response before the block ends. Open one per receiver with the response timeout turned off:
+The hub plays the part of the reactor in an async runtime. Every write to a dynamic structure publishes a wake-up on the item's channel, in the same Lua script as the write. The hub listens to the channels its waits need on one Pub/Sub connection, so a thousand pending waits still cost one connection. Connect one per process when the service starts:
 
-```rust title="src/redis.rs"
-use wakuwaku::deps::redis::AsyncConnectionConfig;
-use wakuwaku::deps::redis::aio::MultiplexedConnection;
+```rust title="src/main.rs"
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::redis;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
-/// A connection for one receiver or subscription, used for nothing else.
-pub async fn dedicated_connection(
-    client: &redis::Client,
-) -> redis::RedisResult<MultiplexedConnection> {
-    let config = AsyncConnectionConfig::new().set_response_timeout(None);
-    client.get_multiplexed_async_connection_with_config(&config).await
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let hub = WatchHub::connect(client.clone()).await?;
+    let services = ServiceBuilder::new(connect(&client).await?).push(hub);
+    let hub: &WatchHub = services.provide::<WatchHub, _>();
+    Ok(())
 }
 ```
 
-The examples in the following pages use this helper. Each receiver and subscription has an `async fn recv` and an `into_stream` that turns it into a `futures::Stream`.
+`WatchHub` is cheap to clone, so components keep their own clone and pass `&hub` to each wait. `connect` fails if the first connection fails; later failures are retried.
+
+Why waits never miss a change:
+
+- **Subscribe, then read.** A wait subscribes to its item before its first read, and reads again after every wake-up. A change committed before the subscription is visible to the read; a change after it sends a wake-up.
+- **Wake-ups are hints.** They carry nothing, and the wait always reads the item itself. An extra wake-up only costs one read.
+- **Shared subscriptions.** Waits on the same item share one subscription, which the last one to finish removes.
+- **Reconnects.** When the connection drops, or stops answering the pings sent every 15 seconds, the hub reconnects with a backoff, resubscribes, and wakes every wait so it reads what it missed. A wait whose deadline passes meanwhile reads once more before it gives up.
+
+The hub's task stops once every clone of the hub and every wait using it has been dropped.
+
+Each receiver and subscription has an `async fn recv` and an `into_stream` that turns it into a `futures::Stream`. Promises and watches are waited on with a single query and a timeout instead; [Waiting for asynchronous work](/en/docs/guides/waiting-for-async-work) explains when to use which.
 
 ## Server requirements
 
 - Locks and the rate limiter read the server clock with `TIME` inside Lua scripts. This needs effects replication of scripts, the default since Redis 5. Because the clock is the server's, clock skew between your replicas doesn't matter.
-- Pipe receivers block with fractional `BLPOP` timeouts, which need Redis 6.
-- Structures that span several keys keep them in one hash slot, so Redis Cluster is supported.
+- Waits use Pub/Sub: writers `PUBLISH` from Lua scripts, and the hub `SUBSCRIBE`s. Each item's channel has the same name as one of its keys, so with ACLs, grant the hub's user the channels `@@wakuwaku-entity:*` as well as the keys.
+- Structures that span several keys keep them in one hash slot, so Redis Cluster is supported. Writers use plain `PUBLISH`, which the cluster forwards to every node, so connect the hub to any one node.
 
 ## Next steps
 
@@ -275,6 +291,8 @@ The examples in the following pages use this helper. Each receiver and subscript
   <Card title="Caches" href="/en/docs/data/redis/cache" description="Cache-aside with typed bodies and hash-based revalidation." />
   <Card title="Locks" href="/en/docs/data/redis/lock" description="Leases, extension, reader-writer locks and the cron-job pattern." />
   <Card title="Rate limiter" href="/en/docs/data/redis/rate-limiter" description="Token buckets refilled continuously by the server clock." />
+  <Card title="Promises" href="/en/docs/data/redis/promise" description="Outcomes completed once, waited on from any replica." />
+  <Card title="Watches" href="/en/docs/data/redis/watch" description="Versioned state that request handlers wait on to move forward." />
   <Card title="Pipes" href="/en/docs/data/redis/pipe" description="One-way message queues from one sender to one receiver." />
   <Card title="Live views" href="/en/docs/data/redis/live-view" description="Versioned documents followed as diffs." />
   <Card title="Stream buffers" href="/en/docs/data/redis/stream-buffer" description="Append-only arrays for streamed output such as LLM chunks." />

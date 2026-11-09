@@ -1,0 +1,105 @@
+---
+title: ウォッチ
+description: バージョン付きの状態を Redis に投影し、どのレプリカのリクエストハンドラーからもその前進を待てるようにします。マシンをまたぐ watch チャネルのようなものです。
+---
+
+[`Watch`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/watch/struct.Watch.html) はある状態の最新バージョンを保持し、誰でもそれより新しいバージョンを待てるようにします。`tokio::sync::watch` のマシンをまたぐ版にあたります。非同期処理の結果が 1 つの値ではなく、何度も進む状態である場合に使います。決済は pending から requires-action を経て succeeded へ、注文は placed から shipped を経て delivered へと進みます。
+
+状態は所有者のものです。通常は[イベントコンシューマー](/ja/docs/events/consuming)が書き込むプライマリデータベースの行です。所有者は各コミットの後、保存したバージョンと一緒に新しい状態をウォッチに発行します。どのレプリカのリクエストハンドラーも、最後に表示したバージョンより新しいものを要求し、それが届くと[watch hub](/ja/docs/data/redis#following-changes-the-watch-hub)が起こします。
+
+## 発行と待機 [#publishing-and-waiting]
+
+```rust title="src/payment.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::dynamic::Versioned;
+use wakuwaku::entity::redis::dynamic::watch::Watch;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum PaymentStatus {
+    Pending,
+    RequiresAction { redirect_url: String },
+    Succeeded,
+    Failed { reason: String },
+}
+
+/// 決済 ID ごとの決済ステータス。最後の変更から 1 時間保持する。
+pub const PAYMENTS: Watch<u64, PaymentStatus> =
+    Watch::new("payment", Duration::from_secs(3600));
+
+/// 所有者: 決済行の `version` をコミットした直後のコンシューマー。
+pub async fn project(
+    redis: &Redis,
+    payment: u64,
+    version: u64,
+    status: PaymentStatus,
+) -> RedisResult<()> {
+    redis.process(PAYMENTS.publish(&payment, version, status)).await?;
+    Ok(())
+}
+
+/// リクエストハンドラー: どのレプリカでもよい。ページが最後に表示したのはバージョン `seen`。
+pub async fn next_status(
+    redis: &Redis,
+    hub: &WatchHub,
+    payment: u64,
+    seen: u64,
+) -> RedisResult<Option<Versioned<PaymentStatus>>> {
+    let next = PAYMENTS.changed(&payment, seen, hub, Duration::from_secs(10));
+    redis.process(next).await
+}
+```
+
+- `publish(name, version, body)` は `body` を `name` の `version` として保存し、それに対するすべての待機を起こします。ただし `version` が保存済みのものより新しい場合に限ります。そうでなければ何も変更せず `false` を出力します。
+- `changed(name, after, hub, timeout)` は、最新の `Versioned<B>` のバージョンが `after` より新しくなった時点でそれを出力します。すでに新しければすぐに出力します。`timeout` までに新しいものが届かなければ `None` を出力します。任意のバージョンを待つには `after = 0` を渡します。
+- `get(name)` は待たずに最新のバージョンと本体を読みます。ウォッチが存在しなければ `None` です。
+- `remove(name)` はウォッチを削除し、存在していたかどうかを出力します。
+
+待つ側は最後に表示したバージョンを保持し、たとえばページやリダイレクトの `return_url` に入れて、`after` として渡し直します。こうすると、別のレプリカでの待機が前回の待機が止まったところからちょうど再開します。
+
+## バージョンは所有者が決める [#versions-come-from-the-owner]
+
+Redis がバージョンを数える[ライブビュー](/ja/docs/data/redis/live-view)と違い、ウォッチはバージョンを発行者から受け取ります。投影する状態のバージョン、たとえばコンシューマーが変更と同じトランザクションでインクリメントするバージョン列を使ってください。
+
+これにより、発行は繰り返しても順序が入れ替わっても安全になります。
+
+- 2 回配信されたイベントは同じバージョンを 2 回発行しますが、2 回目の発行は何も変更しません。
+- 遅いコンシューマーインスタンスが、別のインスタンスがバージョン 4 を発行した後にバージョン 3 を発行しても、やはり何も変更しません。
+- 存在しないウォッチはバージョン 0 とみなされるので、バージョンは 1 から始まります。
+
+## Redis での表現 [#in-redis]
+
+各名前は 1 つのハッシュ `@@wakuwaku-entity:Watch:<namespace>:<name>` で、バージョン `v` と本体 `b` を持ちます。`publish` は、バージョンの比較、両フィールドの書き込み、TTL の再開始、同名チャネルへの起床通知の発行を一度に行う Lua スクリプトです。バージョンは 10 進文字列として比較されるので、2⁵³ を超えるものも含め、すべての `u64` が正確に比較されます。
+
+## 寿命と TTL [#lifetime-and-the-ttl]
+
+`Watch::new(namespace, ttl)` は、最後の発行からウォッチが生き続ける期間を設定します。発行のたびに TTL は再開始します。決済プロバイダーの 3-D セキュアページから戻ってくるユーザーのように、クライアントが更新を確認しに戻ってくる時間をカバーする TTL を選んでください。
+
+## 保証と落とし穴 [#guarantees-and-pitfalls]
+
+- **コミットの後に発行する。** 後でロールバックで取り消される状態を見た待つ側は、誤った情報を伝えられたことになります。コミットの結果が不明なら発行せず、イベントを再配信させてください。
+- **Redis は記録ではない。** ウォッチはデータベースの投影です。状態が変わっているはずなのに待機がタイムアウトした場合や、存在する状態に対して `get` が `None` を出力した場合は、データベースを読んでください。
+- **前進のみ。** ウォッチが古いバージョンに戻ることはありません。誤りは、より新しいバージョンを発行して訂正してください。
+- **最新のみ。** 見ていなかった待つ側は中間のバージョンを飛ばし、最新のものだけを見ることがあります。すべての変更を見るには、[ライブビュー](/ja/docs/data/redis/live-view)か[ストリームバッファ](/ja/docs/data/redis/stream-buffer)を使ってください。
+- **capability。** `get` と `changed` は読み取り、`publish` と `remove` は書き込みです。
+
+## 他の待機可能な構造との比較 [#compared-with-the-other-waitable-structures]
+
+| | [Promise](/ja/docs/data/redis/promise) | Watch | [ライブビュー](/ja/docs/data/redis/live-view) |
+| --- | --- | --- | --- |
+| 値 | 1 つ | 多数のうち最新 | すべてのバージョン |
+| バージョンを決めるのは | — | 発行者 | Redis |
+| 再書き込み | 無視される | より新しくなければ無視される | 親バージョンでなければ競合 |
+| 待つ側が見るもの | 値 | 最新バージョン | すべての差分 |
+| 期限切れ | 完了から TTL 1 回分の後 | 最後の発行から TTL 1 回分の後 | なし |
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="非同期処理の完了を待つ" href="/ja/docs/guides/waiting-for-async-work" description="コンシューマーで実行される作業の結果でリクエストに応答します。" />
+  <Card title="プロミス" href="/ja/docs/data/redis/promise" description="1 回だけ完了し、どのレプリカからでも待てる結果。" />
+</Cards>

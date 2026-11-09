@@ -14,8 +14,9 @@ use kanau::{JsonMessageDe, JsonMessageSer};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::deps::redis::RedisResult;
 use wakuwaku::entity::redis::dynamic::pipe::Pipe;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
 #[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
 pub enum Frame {
@@ -37,9 +38,8 @@ pub async fn hang_up(redis: &Redis, session: &str) -> RedisResult<()> {
 }
 
 /// Gateway: the instance holding the browser's websocket.
-pub async fn forward(redis: &Redis, client: &redis::Client, session: &str) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
-    let mut receiver = redis.process(TO_CLIENT.receive(session, conn)).await?;
+pub async fn forward(redis: &Redis, hub: &WatchHub, session: &str) -> RedisResult<()> {
+    let mut receiver = redis.process(TO_CLIENT.receive(session, hub)).await?;
     while let Some(frame) = receiver.recv().await? {
         match frame {
             Frame::Text(text) => write_to_websocket(&text).await,
@@ -53,13 +53,13 @@ pub async fn forward(redis: &Redis, client: &redis::Client, session: &str) -> Re
 
 - `send(name, body)` appends a message.
 - `close(name)` ends the pipe: the receiver gets every message sent before the close, then `recv` outputs `None`.
-- `receive(name, conn)` outputs a `PipeReceiver`. Its `recv` waits for the next message; `into_stream` turns it into a `Stream` that ends when the pipe is closed.
+- `receive(name, hub)` outputs a `PipeReceiver`. Its `recv` waits for the next message; `into_stream` turns it into a `Stream` that ends when the pipe is closed.
 
-`receive` takes a connection of its own because `recv` blocks on it; see [dedicated connections](/en/docs/data/redis#following-changes-dedicated-connections) for how to open one and why it must not be shared.
+`receive` takes the process's [`WatchHub`](/en/docs/data/redis#following-changes-the-watch-hub), which wakes the receiver when a message arrives. The receiver reads with ordinary commands on a clone of your `RedisSource` connection, so it holds no connection of its own.
 
 ## In Redis
 
-Each name is two lists in one cluster hash slot: `…:Pipe:{<namespace>:<name>}:m` holds the messages, and `…:c` receives a marker when the sender closes. The receiver waits with `BLPOP` on both, messages first, so it always sees the close after every message sent before it. Each send and the close push and restart the TTL in one `MULTI` block.
+Each name is two lists in one cluster hash slot: `…:Pipe:{<namespace>:<name>}:m` holds the messages, and `…:c` receives a marker when the sender closes. Each send and the close are a Lua script that pushes, restarts the TTL and wakes the receiver at once. The receiver takes the next message, or the close marker only when no message is left, in one script, so it always sees the close after every message sent before it.
 
 ## Lifetime and the TTL
 

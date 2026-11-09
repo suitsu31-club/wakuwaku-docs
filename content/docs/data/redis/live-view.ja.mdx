@@ -49,7 +49,7 @@ impl LiveViewDiff for Scoreboard {
 
 ```rust title="src/scoreboard.rs"
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::deps::redis::RedisResult;
 use wakuwaku::entity::redis::dynamic::live_view::{Commit, LiveView};
 
 /// ゲームごとのスコアボード。200 差分を超えると squash する。
@@ -91,12 +91,12 @@ pub async fn score(redis: &Redis, game: u64, team: &str, points: u32) -> RedisRe
 ## 追従: subscribe
 
 ```rust title="src/scoreboard.rs"
-use wakuwaku::entity::redis::dynamic::live_view::Versioned;
+use wakuwaku::entity::redis::dynamic::Versioned;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
-pub async fn follow(redis: &Redis, client: &redis::Client, game: u64) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
+pub async fn follow(redis: &Redis, hub: &WatchHub, game: u64) -> RedisResult<()> {
     let Some((mut board, mut subscription)) =
-        redis.process(SCOREBOARDS.subscribe(&game, conn)).await?
+        redis.process(SCOREBOARDS.subscribe(&game, hub)).await?
     else {
         return Ok(()); // そのゲームは存在しない
     };
@@ -109,7 +109,7 @@ pub async fn follow(redis: &Redis, client: &redis::Client, game: u64) -> RedisRe
 }
 ```
 
-`subscribe(name, conn)` は、最新の `Versioned<B>` と、それ以降のすべてのバージョンへの `LiveViewSubscription` を組で出力します。ビューが存在しなければ `None` です。`conn` は[専用コネクション](/ja/docs/data/redis#following-changes-dedicated-connections)です。
+`subscribe(name, hub)` は、最新の `Versioned<B>` と、それ以降のすべてのバージョンへの `LiveViewSubscription` を組で出力します。ビューが存在しなければ `None` です。`hub` はプロセスの [`WatchHub`](/ja/docs/data/redis#following-changes-the-watch-hub) です。
 
 各 `recv` は `LiveViewEvent` を出力します。
 
@@ -120,7 +120,7 @@ pub async fn follow(redis: &Redis, client: &redis::Client, game: u64) -> RedisRe
 
 ### 既知のバージョンから再開する
 
-すでにあるバージョンを表示しているクライアント、たとえばネットワークの瞬断の後に再接続するブラウザは、本体全体をもう一度受け取る必要はありません。`resume(name, version, conn)` は `version` の直後から購読を始めます。
+すでにあるバージョンを表示しているクライアント、たとえばネットワークの瞬断の後に再接続するブラウザは、本体全体をもう一度受け取る必要はありません。`resume(name, version, hub)` は `version` の直後から購読を始めます。
 
 ```rust title="src/scoreboard.rs"
 use wakuwaku::entity::redis::dynamic::live_view::LiveViewEvent;
@@ -128,12 +128,11 @@ use wakuwaku::entity::redis::dynamic::live_view::LiveViewEvent;
 /// クライアントはすでに `version` を表示している: その後に来たものを送る。
 pub async fn catch_up(
     redis: &Redis,
-    client: &redis::Client,
+    hub: &WatchHub,
     game: u64,
     version: u64,
 ) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
-    let mut subscription = redis.process(SCOREBOARDS.resume(&game, version, conn)).await?;
+    let mut subscription = redis.process(SCOREBOARDS.resume(&game, version, hub)).await?;
     loop {
         match subscription.recv().await? {
             LiveViewEvent::Diff { version, diff } => send_diff(version, diff).await,
@@ -143,7 +142,7 @@ pub async fn catch_up(
 }
 ```
 
-`recv` が失敗した後も同様です。`subscription.version()` は最後に届けたイベントのバージョンなので、新しいコネクションを開いてそこから `resume` します。
+`recv` が失敗した後も同様です。`subscription.version()` は最後に届けたイベントのバージョンなので、そこから `resume` します。
 
 ## Redis 上の表現
 
@@ -152,9 +151,9 @@ pub async fn catch_up(
 - **head**: `…:LiveView:{<namespace>:<name>}:h`。最新のバージョン `v` と本体 `b` を持つハッシュです。`get` はこれだけを読むので、最新バージョンを O(1) で読めます。
 - **履歴**: `…:l`。エントリ ID が `<version>-0` の Redis ストリームです。そのバージョンの本体を持つ *ベース* エントリから始まり、以降のバージョンごとに差分を持つエントリが 1 つずつ続きます。
 
-`create` と `commit` は Lua スクリプトなので、バージョンの検査、head の更新、履歴への追記はアトミックに行われます。履歴がすでに `max_diffs` 個の差分を持っているとき、次のコミットは履歴を切り詰め、新しい本体とその差分の両方を持つ新しいベースを書き込みます。最新に追いついている購読者は引き続き差分を読み、もっと遅れていた購読者は次の差分があった場所にベースを見つけて `Snapshot` を受け取ります。
+`create` と `commit` は Lua スクリプトなので、バージョンの検査、head の更新、履歴への追記、購読者の起床はアトミックに行われます。履歴がすでに `max_diffs` 個の差分を持っているとき、次のコミットは履歴を切り詰め、新しい本体とその差分の両方を持つ新しいベースを書き込みます。最新に追いついている購読者は引き続き差分を読み、もっと遅れていた購読者は次の差分があった場所にベースを見つけて `Snapshot` を受け取ります。
 
-購読は、持っているバージョンより後の履歴を `XREAD BLOCK` で最大 128 エントリずつ読みます。待機する前に見逃したものをすべて読むので、バージョンを飛ばすことはありません。
+購読は、持っているバージョンより後の履歴を `XRANGE` で最大 128 エントリずつ読み、追いついているときだけ [watch hub](/ja/docs/data/redis#following-changes-the-watch-hub) で眠るので、バージョンを飛ばすことはありません。
 
 `history(name)` はベースとそれ以降の差分を `History<B>` として出力します。`History::into_latest` はそれらを適用するので、監査や、差分が head を再現することのテストに便利です。
 

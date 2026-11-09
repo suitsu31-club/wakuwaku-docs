@@ -1,0 +1,213 @@
+---
+title: 非同期処理の完了を待つ
+description: イベントのコンシューマーや外部システムで動く処理の結果を、その処理を同期にすることなく、リクエストへの応答として返す。
+icon: Hourglass
+---
+
+リクエストハンドラーは、axum のルートであれ gRPC のメソッドであれ、1 つのレプリカで動き、クライアントの接続を保持し、期限までに応答しなければなりません。しかし、リクエストが引き起こす処理の中には、そこでは動かないものがあります。
+
+- **イベントのコンシューマーで動く処理。** 登録は [イベント](/ja/docs/events) として発行され、キーごとに 1 つのコンシューマーがそれを判断します。コンシューマーは別のマシンで、少し後に動くかもしれません。
+- **外部システムで動く処理。** 決済プロバイダーは課金の結果を Webhook で通知します。Webhook はそのエンドポイントを受け持つどれかのレプリカに届き、そこから Iggy にキューイングされます。
+
+それでもクライアントは、応答の中で結果を知りたいのです。登録後のログインセッションや、決済が成功したのか 3-D Secure が必要なのか、といった結果です。
+
+ハンドラーはコンシューマーを関数のように呼び出せません。また、どこか別の場所で何かが起きるまでリクエストをブロックするやり方はスケールしません。これは 1 つのプロセスの中で `async` が解決している問題と同じです。そこで wakuwaku は、同じ方法で、プロセスをまたいで、Redis を使ってこれを解決します。
+
+## モデル: マシンをまたぐ Future [#the-model-a-future-across-machines]
+
+Rust の `Future` は、待っている間スレッドをブロックしません。waker を登録して `Pending` を返し、I/O の準備ができるとランタイムのリアクターがそれを起こし、再び poll されます。wakuwaku の Redis の構造は、同じことをマシン間で行います。
+
+| Rust の async | wakuwaku |
+| --- | --- |
+| Future の共有状態 | 両側が知っている ID で名前の付いた [`Promise`](/ja/docs/data/redis/promise) または [`Watch`](/ja/docs/data/redis/watch) |
+| `poll` | `RedisSource` のコネクションでの Promise または Watch の読み取り |
+| `Pending` を返す前の waker の登録 | 読み取りの前に、ハブを通じて項目を購読すること |
+| リアクター | [`WatchHub`](/ja/docs/data/redis#following-changes-the-watch-hub): すべての待機で共有する、プロセスごとに 1 本の Pub/Sub コネクション |
+| `wake()` | `complete` や `publish` が書き込みと同じスクリプトで送る起床通知 |
+| 呼び出し元に返される `Poll::Pending` | タイムアウトした待機: クライアントに「まだです」と応答し、後でまた来てもらう |
+
+ワーカーは、誰がどこで待っているかを知る必要がありません。待つ側は、ワーカーが終わる前に待ち始めている必要がありません。両者が知っている必要があるのは名前だけです。
+
+## まず、処理が本当に非同期である必要があるかを確かめる [#first-check-that-the-work-must-be-asynchronous]
+
+最も安い待機は、待たないことです。リクエストハンドラー自身が 1 つのデータベーストランザクションの中で判断できるなら、そこで行って直接応答してください。「メールアドレスが一意であること」だけがルールの登録なら、一意制約付きの `INSERT` で済みます。ウェルカムメールや検索インデックスのように後で起きてもよい効果は、それでもイベントとして発行できます。
+
+処理を非同期のままにするのは、そうしなければならないときです。キーごとに 1 つのコンシューマーが判断しなければならないとき、処理が遅いとき、あるいは決済プロバイダーの Webhook のように結果が外部から来るときです。その場合は以下のパターンを使います。
+
+## 構造を選ぶ [#choose-the-structure]
+
+| | [`Promise`](/ja/docs/data/redis/promise) | [`Watch`](/ja/docs/data/redis/watch) |
+| --- | --- | --- |
+| 結果は | 1 つの値 | 前に進んでいく状態 |
+| ワーカーは | 一度だけ完了させる。以降の完了は無視される | 新しいバージョンごとに発行する。古いバージョンは無視される |
+| 待つ側が尋ねるのは | 「終わったか?」 | 「バージョン *v* より新しいものはあるか?」 |
+| 例 | 登録、レポートのエクスポート、単発のジョブ | 決済、注文の履行、審査プロセス |
+
+LLM のチャンクのように少しずつ届く出力には、代わりに [ストリームバッファ](/ja/docs/data/redis/stream-buffer) を使います。
+
+## ルール [#the-rules]
+
+1. **処理の名前は入口で付ける。** リクエストハンドラーが処理を名付ける ID (ユーザー ID、ジョブ ID、決済 ID) を生成し、処理と一緒に送ります。そうすればすぐにその名前で待つことができ、同じ ID でリトライしたクライアントは同じ結果を待つことになります。処理が自分の ID を持っているので、2 回実行しても何かが 2 つ作られることはありません。
+2. **発行してから待つ。順序は問わない。** 待機が始まる前に完了した Promise や Watch はすぐに読み取られるので、処理の完了とハンドラーの待機開始の間に競合はありません。
+3. **効果が永続化されてから完了させる。** ワーカーはまずトランザクションをコミットし、その後に Promise を完了させるか Watch を発行します。その前に行ってはいけません。ロールバックで取り消される結果を、待つ側が報告してしまいます。コミットの結果が不明なら、完了させないでください。イベントは再び配信されます。
+4. **記録はデータベース、Redis は射影。** 結果は効果と一緒に保存します。たとえばアカウントの行や決済の行として保存します。Promise と Watch は TTL で期限切れになり、Redis のフェイルオーバーで失われることもあります。処理が終わっているはずの時点で待機がタイムアウトしたら、データベースを読んでください。
+5. **タイムアウトはエラーではなく `Pending`。** クライアントが poll できる URL を付けて `202 Accepted` を返すか、再読み込みする「処理中」ページを表示します。poll のエンドポイントは短いタイムアウトでもう一度待ちます。遅いコンシューマーを `500` に変えてはいけません。
+6. **ワーカーを冪等にする。** コンシューマーの配信は at-least-once です。`complete` は 2 回目の完了を無視し、`publish` は新しくないバージョンを無視するので、Redis 側はすでに冪等です。データベース側も、ルール 1 の ID をキーにして冪等にしてください。
+7. **ハブはプロセスごとに 1 つ。** 起動時に `WatchHub` を接続し、すべての待機に `&hub` を渡します。待っているリクエストがいくつあっても、それらはハブの 1 本のコネクションを共有します。
+
+## 例: Promise を使った登録 [#example-registration-with-a-promise]
+
+ハンドラーは登録を発行し、その結果を最大 5 秒待ちます。コンシューマーはアカウントを作成し、Promise を完了させます。
+
+```rust title="src/registration.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::redis::dynamic::promise::Promise;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
+use wakuwaku::iggy::error::HandleError;
+use wakuwaku::iggy::{EventHandler, Publisher};
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum Registration {
+    Created,
+    EmailTaken,
+}
+
+/// ユーザー ID ごとの結果。poll するクライアントのために 10 分間保持する。
+pub const REGISTRATIONS: Promise<u64, Registration> =
+    Promise::new("registration", Duration::from_secs(600));
+
+pub enum RegisterResponse {
+    /// 201。新しいログインセッション付き。
+    Created { session: String },
+    /// 409。
+    EmailTaken,
+    /// 202: `/registrations/{user_id}` を poll する。
+    Accepted { user_id: u64 },
+}
+
+/// リクエストハンドラー。`RegisterRequested` はメールアドレスをキーとする
+/// イベントなので、各メールアドレスは 1 つのコンシューマーが順番に判断する。
+pub async fn register(
+    app: &App,
+    email: String,
+    password_hash: String,
+) -> Result<RegisterResponse, AppError> {
+    let user_id = app.ids.next();
+    app.publisher
+        .publish(RegisterRequested { user_id, email, password_hash })
+        .await?;
+    let outcome = REGISTRATIONS.wait(&user_id, &app.hub, Duration::from_secs(5));
+    Ok(match app.redis.process(outcome).await? {
+        Some(Registration::Created) => RegisterResponse::Created {
+            session: app.sessions.create(user_id).await?,
+        },
+        Some(Registration::EmailTaken) => RegisterResponse::EmailTaken,
+        None => RegisterResponse::Accepted { user_id },
+    })
+}
+
+/// コンシューマー: アカウントを作成し、その後に結果を報告する。
+pub struct Register {
+    accounts: AccountStore,
+    redis: Redis,
+}
+
+impl EventHandler<RegisterRequested> for Register {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::MIN;
+
+    async fn handle(&self, run: &[RegisterRequested]) -> Result<(), HandleError> {
+        for request in run {
+            // 1 つのトランザクション。同じユーザー ID を再び挿入すると、
+            // 最初に保存した結果が返る。
+            let outcome = self.accounts.create(request).await.map_err(HandleError::transient)?;
+            self.redis
+                .process(REGISTRATIONS.complete(&request.user_id, outcome))
+                .await
+                .map_err(HandleError::transient)?;
+        }
+        Ok(())
+    }
+}
+```
+
+`Accepted` の先にある poll のエンドポイントは、もう一度待ち、その後データベースにフォールバックします。
+
+```rust title="src/registration.rs"
+pub async fn registration_status(app: &App, user_id: u64) -> Result<Option<Registration>, AppError> {
+    let outcome = REGISTRATIONS.wait(&user_id, &app.hub, Duration::from_secs(20));
+    if let Some(outcome) = app.redis.process(outcome).await? {
+        return Ok(Some(outcome));
+    }
+    // Redis で期限切れか失われたか、まだ実行中: アカウントのテーブルが知っている。
+    Ok(app.accounts.registration_outcome(user_id).await?)
+}
+```
+
+セッションは、結果が `Created` だとわかった時点でリクエストハンドラーが作成します。そのため、セッションが Redis やイベントログを通ることはありません。
+
+## 例: Watch を使った決済 [#example-payment-with-a-watch]
+
+決済には 3 つのリクエストと外部の当事者が関わります。
+
+```text
+browser ──Pay──▶ endpoint A ──charge──▶ provider
+   │                 │ publish PaymentObserved (provider's immediate answer)
+   │◀── 3DS URL ─────┘
+   │──── 3-D Secure challenge ────────▶ provider
+   │                                       │ webhook
+   │                                       ▼
+   │                                  endpoint B ── publish PaymentObserved ──▶ Iggy
+   │                                       └── 2xx once published                │
+   │                                                                             ▼
+   │                                        consumer: update the payment row, version + 1,
+   │                                                  commit, then PAYMENTS.publish
+   │──return_url──▶ any replica: PAYMENTS.changed(id, after = version shown) ──▶ result page
+```
+
+- **エンドポイント A** は決済 ID を発行し、その ID を冪等性キーとしてプロバイダーに課金し、プロバイダーの応答を発行します。3-D Secure の URL などのその応答を、すぐにブラウザに返します。
+- **エンドポイント B** は Webhook の署名を検証し、同じイベント型として発行します。発行に成功したらすぐにプロバイダーに `2xx` を返します。「処理済み」は「永続的に受け取ったのでリトライ不要」という意味であり、「処理が終わった」という意味ではありません。処理の失敗のリトライはコンシューマーの責任で、ここでそれを待つとプロバイダーのタイムアウトと競合します。
+- **コンシューマー** は決済のステータスを書き込む唯一の存在です。決済 ID でパーティション分割されており、各観測結果を行に適用し、バージョンを増やし、コミットし、その後に Watch を発行します。プロバイダーは Webhook を順番どおりに届けることを保証しないので、到着順を信用するのではなく、保留中のステータスよりも終端のステータスを優先させてください。
+- **`return_url` のハンドラー** は、どのレプリカが受け取っても、ページが表示していたバージョンより新しいものを待ちます。
+
+```rust title="src/payment.rs"
+/// コンシューマー。`row` を `row.version` でコミットした後に呼ぶ。
+pub async fn project(redis: &Redis, row: &PaymentRow) -> Result<(), HandleError> {
+    redis
+        .process(PAYMENTS.publish(&row.id, row.version, row.status.clone()))
+        .await
+        .map(|_| ())
+        .map_err(HandleError::transient)
+}
+
+/// `return_url` のハンドラー: ユーザーをプロバイダーに送ったページは
+/// バージョン `seen` を表示していた。
+pub async fn payment_result(app: &App, payment: u64, seen: u64) -> Result<Page, AppError> {
+    let next = PAYMENTS.changed(&payment, seen, &app.hub, Duration::from_secs(10));
+    Ok(match app.redis.process(next).await? {
+        Some(status) => Page::status(status.body, status.version),
+        // まだ新しいものはない: 保存済みの状態を表示し、同じ `seen` で再び poll する。
+        None => Page::processing(app.payments.load(payment).await?),
+    })
+}
+```
+
+プロバイダーは、届けられない Webhook のリトライをいずれ止めます。保留中のステータスのまま長く止まっている決済についてプロバイダーに問い合わせ、その答えを同じイベントとして発行する [cron ジョブ](/ja/docs/services/cron-jobs) を置けば、追加の仕組みなしにこの隙間を埋められます。
+
+## コスト [#what-it-costs]
+
+- **レイテンシ。** 待機は、コンシューマーの poll 間隔、そのハンドラー、そして Redis の 1 往復の後に終わります。リクエストに応答するためのトピックの poll 間隔は短くしてください。
+- **コネクション。** ハブのために、プロセスごとに 1 本の Pub/Sub コネクションを使います。待機の読み取りは、すでにある `RedisSource` のコネクションで行います。
+- **失われる待機。** 停止したレプリカは、保留中の待機を失います。処理自体は完了し、クライアントは同じ ID でリトライし (ルール 1)、次の待機で結果を読み取ります。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="Promise" href="/ja/docs/data/redis/promise" description="一度だけ完了し、どのレプリカからでも待てる結果。" />
+  <Card title="Watch" href="/ja/docs/data/redis/watch" description="リクエストハンドラーが前進を待つ、バージョン付きの状態。" />
+  <Card title="Watch ハブ" href="/ja/docs/data/redis#following-changes-the-watch-hub" description="待機が 1 本のコネクションを共有し、変更を取りこぼさない仕組み。" />
+  <Card title="イベントの購読" href="/ja/docs/events/consuming" description="ハンドラー、バッチ処理、配信モード。" />
+</Cards>

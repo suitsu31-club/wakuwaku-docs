@@ -1,0 +1,105 @@
+---
+title: Watches
+description: Project versioned state into Redis and let request handlers on any replica wait for it to move forward, like a watch channel that crosses machines.
+---
+
+A [`Watch`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/watch/struct.Watch.html) holds the latest version of some state, and lets anyone wait for a newer one. It is the cross-machine counterpart of `tokio::sync::watch`. Use it when the outcome of asynchronous work is not one value but a state that moves on several times. A payment goes from pending to requires-action to succeeded; an order goes from placed to shipped to delivered.
+
+The state belongs to its owner, usually a row in the primary database written by an [event consumer](/en/docs/events/consuming). After each commit, the owner publishes the new state to the watch together with the version it stored. Request handlers on any replica ask for anything newer than the version they last showed, and the [watch hub](/en/docs/data/redis#following-changes-the-watch-hub) wakes them when it arrives.
+
+## Publishing and waiting
+
+```rust title="src/payment.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::dynamic::Versioned;
+use wakuwaku::entity::redis::dynamic::watch::Watch;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum PaymentStatus {
+    Pending,
+    RequiresAction { redirect_url: String },
+    Succeeded,
+    Failed { reason: String },
+}
+
+/// Payment statuses per payment ID, kept an hour after their last change.
+pub const PAYMENTS: Watch<u64, PaymentStatus> =
+    Watch::new("payment", Duration::from_secs(3600));
+
+/// Owner: the consumer, right after committing `version` of the payment row.
+pub async fn project(
+    redis: &Redis,
+    payment: u64,
+    version: u64,
+    status: PaymentStatus,
+) -> RedisResult<()> {
+    redis.process(PAYMENTS.publish(&payment, version, status)).await?;
+    Ok(())
+}
+
+/// Request handler: any replica. The page last showed version `seen`.
+pub async fn next_status(
+    redis: &Redis,
+    hub: &WatchHub,
+    payment: u64,
+    seen: u64,
+) -> RedisResult<Option<Versioned<PaymentStatus>>> {
+    let next = PAYMENTS.changed(&payment, seen, hub, Duration::from_secs(10));
+    redis.process(next).await
+}
+```
+
+- `publish(name, version, body)` stores `body` as `version` of `name` and wakes every wait on it, but only if `version` is newer than the stored one. Otherwise it changes nothing and outputs `false`.
+- `changed(name, after, hub, timeout)` outputs the latest `Versioned<B>` once its version is newer than `after`, at once if it already is. It outputs `None` if nothing newer arrives before `timeout`. Pass `after = 0` to wait for any version.
+- `get(name)` reads the latest version and body without waiting, `None` if the watch is absent.
+- `remove(name)` deletes the watch and outputs whether it was present.
+
+A waiter keeps the version it last showed and passes it back as `after`, for example in the page or in the `return_url` of a redirect. Waits on different replicas then pick up exactly where the previous one stopped.
+
+## Versions come from the owner
+
+Unlike a [live view](/en/docs/data/redis/live-view), whose versions Redis counts, a watch takes its versions from the publisher. Use the version of the state it projects, such as a version column that the consumer increments in the same transaction as the change.
+
+This makes publishing safe to repeat and to reorder:
+
+- An event delivered twice publishes the same version twice; the second publication changes nothing.
+- A slow consumer instance that publishes version 3 after another published version 4 changes nothing either.
+- A watch that is absent counts as version 0, so versions start at 1.
+
+## In Redis
+
+Each name is one hash, `@@wakuwaku-entity:Watch:<namespace>:<name>`, with the version `v` and the body `b`. `publish` is a Lua script that compares the versions, writes both fields, restarts the TTL and publishes a wake-up on the channel of the same name, all at once. Versions are compared as decimal strings, so every `u64` compares exactly, including those above 2⁵³.
+
+## Lifetime and the TTL
+
+`Watch::new(namespace, ttl)` sets how long a watch lives after its last publication. Every publication restarts it. Choose a TTL that covers the time a client may come back for news, such as a user returning from a payment provider's 3-D Secure page.
+
+## Guarantees and pitfalls
+
+- **Publish after the commit.** A waiter that sees a state a rollback later undoes has been told something false. If the commit outcome is unknown, don't publish. Let the event be redelivered.
+- **Redis is not the record.** A watch is a projection of your database. When a wait times out after the state should have changed, or `get` outputs `None` for a state that exists, read the database.
+- **Only forward.** A watch never goes back to an older version. Correct a mistake by publishing a newer version.
+- **Latest only.** A waiter that was not looking may skip intermediate versions and only see the latest. To see every change, use a [live view](/en/docs/data/redis/live-view) or a [stream buffer](/en/docs/data/redis/stream-buffer).
+- **Capability.** `get` and `changed` are reads; `publish` and `remove` are writes.
+
+## Compared with the other waitable structures
+
+| | [Promise](/en/docs/data/redis/promise) | Watch | [Live view](/en/docs/data/redis/live-view) |
+| --- | --- | --- | --- |
+| Values | one | latest of many | every version |
+| Versions chosen by | — | the publisher | Redis |
+| Writing again | ignored | ignored unless newer | conflict unless at the parent version |
+| Waiters see | the value | the latest version | every diff |
+| Expires | one TTL after completion | one TTL after the last publication | never |
+
+## Next steps
+
+<Cards>
+  <Card title="Waiting for asynchronous work" href="/en/docs/guides/waiting-for-async-work" description="Answer a request with the outcome of work running in a consumer." />
+  <Card title="Promises" href="/en/docs/data/redis/promise" description="Outcomes completed once, waited on from any replica." />
+</Cards>

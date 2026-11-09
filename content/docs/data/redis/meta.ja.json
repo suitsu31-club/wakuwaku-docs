@@ -5,6 +5,8 @@
     "cache",
     "lock",
     "rate-limiter",
+    "promise",
+    "watch",
     "pipe",
     "live-view",
     "stream-buffer"

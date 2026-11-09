@@ -1,6 +1,6 @@
 ---
 title: Redis
-description: Redis を capability で検査されるデータソースとして使い、型付きのキャッシュ、ロック、レートリミッター、パイプ、ライブビュー、ストリームバッファを利用します。
+description: Redis を capability で検査されるデータソースとして使い、型付きのキャッシュ、ロック、レートリミッター、プロミス、ウォッチ、パイプ、ライブビュー、ストリームバッファを利用します。
 ---
 
 Redis は、レプリカ間で共有したいがメインのデータベースに置くほどではない状態を保持する場所です。キャッシュした読み取り結果、ロック、レート制限のカウンター、websocket へ届ける途中のメッセージ、ストリーミングされる LLM の回答のチャンクなどがこれに当たります。wakuwaku の `redis` feature は、Redis を PostgreSQL と同じ[データソース](/ja/docs/data/queries)にします。すべてのコマンドは型付きのクエリであり、`Db` ハンドルは自身の capability が許可するクエリしか実行しません。
@@ -12,11 +12,13 @@ Redis は、レプリカ間で共有したいがメインのデータベース�
 | [`Cache`、`HashedCache`](/ja/docs/data/redis/cache) | `collection::cache` | TTL 付きの本体。ハッシュ版は本体をダウンロードせずに「変わったか」を判定できます。 |
 | [`Lock`、`RwLock`](/ja/docs/data/redis/lock) | `collection::lock` | リースによるレプリカ間の排他制御。 |
 | [`TokenBucket`](/ja/docs/data/redis/rate-limiter) | `collection::token_bucket_limiter` | バーストを許すレート制限。 |
+| [`Promise`](/ja/docs/data/redis/promise) | `dynamic::promise` | 一度だけ完了し、誰でも待機できる値。レプリカをまたぐ `oneshot` に相当します。 |
+| [`Watch`](/ja/docs/data/redis/watch) | `dynamic::watch` | ある状態の最新バージョン。より新しいバージョンを待機できます。レプリカをまたぐ `watch` チャネルに相当します。 |
 | [`Pipe`](/ja/docs/data/redis/pipe) | `dynamic::pipe` | 受信者が 1 人の一方向メッセージキュー。websocket の片方向に相当します。 |
 | [`LiveView`](/ja/docs/data/redis/live-view) | `dynamic::live_view` | バージョン付きのコミットを持つ永続的なドキュメント。購読者は差分として追従します。 |
 | [`StreamBuffer`](/ja/docs/data/redis/stream-buffer) | `dynamic::stream_buffer` | 終端を持つ追記専用の配列。任意の数の購読者が追従できます。 |
 
-*collection* は必要なときに問い合わせる構造です。*dynamic* な構造は、変化に合わせて追従することもできます。
+*collection* は必要なときに問い合わせる構造です。*dynamic* な構造は、プロセスごとにひとつの [watch hub](#following-changes-the-watch-hub) を通じて、変化を待機することもできます。
 
 Spring から来た方向けに言えば、このページは Spring Data Redis の接続設定に相当する内容を扱います。各サブページは、`RedisCacheManager`、分散ロックのレジストリ、レート制限ライブラリといった寄せ集めを、ひとつの型の規律で置き換えます。
 
@@ -207,6 +209,8 @@ impl Name for UserId {
 | `Lock` | | `try_lock`、`release`、`extend` |
 | `RwLock` | | `try_read`、`try_write`、`release`、`extend` |
 | `TokenBucket` | | `acquire`、`reset` |
+| `Promise` | `get`、`wait` | `complete`、`remove` |
+| `Watch` | `get`、`changed` | `publish`、`remove` |
 | `Pipe` | | `send`、`close`、`receive`（メッセージを取り出すと削除される） |
 | `LiveView` | `get`、`version`、`history`、`subscribe`、`resume` | `create`、`commit`、`remove` |
 | `StreamBuffer` | `read`、`subscribe` | `append`、`finish`、`remove` |
@@ -242,32 +246,44 @@ impl<N: ?Sized, B> CanRead<Cache<N, B>> for Gateway {}
 impl CanWrite<Cache<SessionToken, Session>> for Gateway {}
 ```
 
-## 変化への追従: 専用コネクション [#following-changes-dedicated-connections]
+## 変化への追従: watch hub [#following-changes-the-watch-hub]
 
-パイプからの受信や、ライブビュー・ストリームバッファの購読もクエリなので、capability は通常どおり検査されます。これらは受信者や購読を出力し、それはクエリに渡したコネクション上でブロッキングな Redis コマンド（`BLPOP`、`XREAD BLOCK`）を使って待機します。
+プロミスやウォッチの待機、パイプからの受信、ライブビューやストリームバッファの購読もクエリなので、capability は通常どおり検査されます。いずれもコネクションをブロックしません。待機は `RedisSource` のコネクション上で通常のコマンドを使って要素を読み、まだ新しいものがなければ、プロセスの [`WatchHub`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/watch_hub/struct.WatchHub.html) に起こされるまでスリープします。
 
-ブロッキングコマンドは同じソケットに送られた他のすべてのコマンドを止めてしまうため、そのコネクションは他の用途に使ってはいけません。`RedisSource` の中のマルチプレクスコネクションのクローンを渡すのは厳禁です。また、ブロックが終わる前にレスポンスをタイムアウトさせてもいけません。受信者ごとに、レスポンスタイムアウトを無効にしたコネクションを開きます。
+hub は非同期ランタイムにおけるリアクターの役割を担います。dynamic な構造への書き込みはすべて、書き込みと同じ Lua スクリプトの中で、その要素のチャネルにウェイクアップを publish します。hub は待機が必要とするチャネルをひとつの Pub/Sub コネクションで購読するので、保留中の待機が千個あってもコネクションはひとつで済みます。サービスの起動時に、プロセスごとにひとつ接続します。
 
-```rust title="src/redis.rs"
-use wakuwaku::deps::redis::AsyncConnectionConfig;
-use wakuwaku::deps::redis::aio::MultiplexedConnection;
+```rust title="src/main.rs"
+use wakuwaku::ServiceBuilder;
+use wakuwaku::deps::redis;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
-/// 1 つの受信者または購読だけが使うコネクション。
-pub async fn dedicated_connection(
-    client: &redis::Client,
-) -> redis::RedisResult<MultiplexedConnection> {
-    let config = AsyncConnectionConfig::new().set_response_timeout(None);
-    client.get_multiplexed_async_connection_with_config(&config).await
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let hub = WatchHub::connect(client.clone()).await?;
+    let services = ServiceBuilder::new(connect(&client).await?).push(hub);
+    let hub: &WatchHub = services.provide::<WatchHub, _>();
+    Ok(())
 }
 ```
 
-以降のページの例はこのヘルパーを使います。受信者と購読はいずれも `async fn recv` と、`futures::Stream` に変換する `into_stream` を持ちます。
+`WatchHub` はクローンのコストが小さいので、コンポーネントはそれぞれ自分のクローンを持ち、待機のたびに `&hub` を渡します。`connect` は最初の接続に失敗するとエラーを返します。それ以降の失敗はリトライされます。
+
+待機が変化を取りこぼさない理由は次のとおりです。
+
+- **購読してから読む。** 待機は最初の読み取りの前に要素を購読し、ウェイクアップのたびに読み直します。購読より前にコミットされた変化は読み取りで見え、購読より後の変化はウェイクアップを送ります。
+- **ウェイクアップはヒントにすぎない。** ウェイクアップは何も運ばず、待機は常に要素を自分で読みます。余計なウェイクアップのコストは読み取り 1 回だけです。
+- **購読の共有。** 同じ要素に対する待機はひとつの購読を共有し、最後に終わった待機がそれを解除します。
+- **再接続。** コネクションが切れるか、15 秒ごとに送る ping に応答しなくなると、hub はバックオフ付きで再接続して購読し直し、すべての待機を起こして取りこぼした内容を読ませます。その間に期限を過ぎた待機も、諦める前にもう一度だけ読みます。
+
+hub のタスクは、hub のすべてのクローンと、それを使うすべての待機が drop されると停止します。
+
+受信者と購読はいずれも `async fn recv` と、`futures::Stream` に変換する `into_stream` を持ちます。一方、プロミスとウォッチは、タイムアウト付きの単一のクエリで待機します。どちらを使うべきかは [非同期処理の完了を待つ](/ja/docs/guides/waiting-for-async-work) で説明します。
 
 ## サーバーの要件
 
 - ロックとレートリミッターは Lua スクリプトの中で `TIME` を使ってサーバーの時刻を読みます。これにはスクリプトの effects replication が必要で、Redis 5 以降はこれがデフォルトです。時刻はサーバーのものなので、レプリカ間の時計のずれは影響しません。
-- パイプの受信者は小数秒の `BLPOP` タイムアウトでブロックするため、Redis 6 が必要です。
-- 複数のキーにまたがる構造はそれらを同じハッシュスロットに置くので、Redis Cluster に対応しています。
+- 待機は Pub/Sub を使います。書き手は Lua スクリプトから `PUBLISH` し、hub は `SUBSCRIBE` します。各要素のチャネルはそのキーのひとつと同じ名前を持つので、ACL を使う場合は、キーに加えてチャネル `@@wakuwaku-entity:*` も hub のユーザーに許可してください。
+- 複数のキーにまたがる構造はそれらを同じハッシュスロットに置くので、Redis Cluster に対応しています。書き手は通常の `PUBLISH` を使い、クラスターはそれをすべてのノードに転送するので、hub はどれかひとつのノードに接続すれば十分です。
 
 ## 次のステップ
 
@@ -275,6 +291,8 @@ pub async fn dedicated_connection(
   <Card title="キャッシュ" href="/ja/docs/data/redis/cache" description="型付きの本体による cache-aside と、ハッシュによる再検証。" />
   <Card title="ロック" href="/ja/docs/data/redis/lock" description="リース、延長、リーダー・ライターロック、cron ジョブのパターン。" />
   <Card title="レートリミッター" href="/ja/docs/data/redis/rate-limiter" description="サーバーの時刻で連続的に補充されるトークンバケット。" />
+  <Card title="プロミス" href="/ja/docs/data/redis/promise" description="一度だけ完了し、どのレプリカからでも待機できる結果。" />
+  <Card title="ウォッチ" href="/ja/docs/data/redis/watch" description="リクエストハンドラーが先へ進むのを待機する、バージョン付きの状態。" />
   <Card title="パイプ" href="/ja/docs/data/redis/pipe" description="1 人の送信者から 1 人の受信者への一方向メッセージキュー。" />
   <Card title="ライブビュー" href="/ja/docs/data/redis/live-view" description="差分として追従できるバージョン付きドキュメント。" />
   <Card title="ストリームバッファ" href="/ja/docs/data/redis/stream-buffer" description="LLM のチャンクのようなストリーミング出力のための追記専用配列。" />

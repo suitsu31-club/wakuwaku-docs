@@ -49,7 +49,7 @@ impl LiveViewDiff for Scoreboard {
 
 ```rust title="src/scoreboard.rs"
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::deps::redis::RedisResult;
 use wakuwaku::entity::redis::dynamic::live_view::{Commit, LiveView};
 
 /// Scoreboards per game, squashed after 200 diffs.
@@ -91,12 +91,12 @@ The retry loop above is the usual way to handle `Conflict`: re-read, re-apply th
 ## Following: subscribe
 
 ```rust title="src/scoreboard.rs"
-use wakuwaku::entity::redis::dynamic::live_view::Versioned;
+use wakuwaku::entity::redis::dynamic::Versioned;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
-pub async fn follow(redis: &Redis, client: &redis::Client, game: u64) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
+pub async fn follow(redis: &Redis, hub: &WatchHub, game: u64) -> RedisResult<()> {
     let Some((mut board, mut subscription)) =
-        redis.process(SCOREBOARDS.subscribe(&game, conn)).await?
+        redis.process(SCOREBOARDS.subscribe(&game, hub)).await?
     else {
         return Ok(()); // no such game
     };
@@ -109,7 +109,7 @@ pub async fn follow(redis: &Redis, client: &redis::Client, game: u64) -> RedisRe
 }
 ```
 
-`subscribe(name, conn)` outputs the latest `Versioned<B>` together with a `LiveViewSubscription` to every version after it, or `None` if the view doesn't exist. `conn` is a [dedicated connection](/en/docs/data/redis#following-changes-dedicated-connections).
+`subscribe(name, hub)` outputs the latest `Versioned<B>` together with a `LiveViewSubscription` to every version after it, or `None` if the view doesn't exist. `hub` is the process's [`WatchHub`](/en/docs/data/redis#following-changes-the-watch-hub).
 
 Each `recv` outputs a `LiveViewEvent`:
 
@@ -120,7 +120,7 @@ Each `recv` outputs a `LiveViewEvent`:
 
 ### Resuming from a known version
 
-A client that already shows some version, for example a browser reconnecting after a network blip, doesn't need the whole body again. `resume(name, version, conn)` starts a subscription right after `version`:
+A client that already shows some version, for example a browser reconnecting after a network blip, doesn't need the whole body again. `resume(name, version, hub)` starts a subscription right after `version`:
 
 ```rust title="src/scoreboard.rs"
 use wakuwaku::entity::redis::dynamic::live_view::LiveViewEvent;
@@ -128,12 +128,11 @@ use wakuwaku::entity::redis::dynamic::live_view::LiveViewEvent;
 /// The client already shows `version`: send it what came after.
 pub async fn catch_up(
     redis: &Redis,
-    client: &redis::Client,
+    hub: &WatchHub,
     game: u64,
     version: u64,
 ) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
-    let mut subscription = redis.process(SCOREBOARDS.resume(&game, version, conn)).await?;
+    let mut subscription = redis.process(SCOREBOARDS.resume(&game, version, hub)).await?;
     loop {
         match subscription.recv().await? {
             LiveViewEvent::Diff { version, diff } => send_diff(version, diff).await,
@@ -143,7 +142,7 @@ pub async fn catch_up(
 }
 ```
 
-The same applies after a failed `recv`: `subscription.version()` is the version of the last event it delivered, so open a new connection and `resume` from it.
+The same applies after a failed `recv`: `subscription.version()` is the version of the last event it delivered, so `resume` from it.
 
 ## In Redis
 
@@ -152,9 +151,9 @@ Each name is two keys in one cluster hash slot:
 - The **head**, `…:LiveView:{<namespace>:<name>}:h`, a hash with the latest version `v` and body `b`. `get` reads only this, which is why the latest version reads in O(1).
 - The **history**, `…:l`, a Redis stream whose entry IDs are `<version>-0`. It starts with a *base* entry holding the body at its version, followed by one entry per later version holding its diff.
 
-`create` and `commit` are Lua scripts, so the version check, the head update and the history append happen atomically. When the history already holds `max_diffs` diffs, the next commit trims it and writes a new base holding both the new body and its diff. A subscriber that is up to date still reads a diff; one that was further behind finds a base where its next diff used to be, and receives a `Snapshot`.
+`create` and `commit` are Lua scripts, so the version check, the head update, the history append and the wake-up of subscribers happen atomically. When the history already holds `max_diffs` diffs, the next commit trims it and writes a new base holding both the new body and its diff. A subscriber that is up to date still reads a diff; one that was further behind finds a base where its next diff used to be, and receives a `Snapshot`.
 
-Subscriptions read the history with `XREAD BLOCK` after the version they have, in batches of up to 128 entries. They catch up on everything they missed before they wait, so they never skip a version.
+Subscriptions read the history with `XRANGE` after the version they have, in batches of up to 128 entries, and sleep on the [watch hub](/en/docs/data/redis#following-changes-the-watch-hub) only when they are caught up, so they never skip a version.
 
 `history(name)` outputs the base and the diffs after it, as a `History<B>`; `History::into_latest` applies them, which is handy for audits and for testing that your diffs reproduce the head.
 

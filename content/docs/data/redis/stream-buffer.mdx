@@ -14,8 +14,9 @@ use kanau::{JsonMessageDe, JsonMessageSer};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::deps::redis::RedisResult;
 use wakuwaku::entity::redis::dynamic::stream_buffer::StreamBuffer;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
 #[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
 pub struct Chunk {
@@ -41,12 +42,11 @@ pub async fn produce(redis: &Redis, request: u64, tokens: Vec<String>) -> RedisR
 /// received `seen` chunks (0 on the first connection).
 pub async fn stream_to_client(
     redis: &Redis,
-    client: &redis::Client,
+    hub: &WatchHub,
     request: u64,
     seen: u64,
 ) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
-    let mut subscription = redis.process(COMPLETIONS.subscribe(&request, seen, conn)).await?;
+    let mut subscription = redis.process(COMPLETIONS.subscribe(&request, seen, hub)).await?;
     while let Some(chunk) = subscription.recv().await? {
         send_to_client(&chunk.text).await;
     }
@@ -56,7 +56,7 @@ pub async fn stream_to_client(
 
 - `append(name, body)` adds a body, creating the buffer if needed. It outputs the body's index (from 0), or `None` if the buffer is already finished.
 - `finish(name)` ends the buffer, creating it empty if needed. Subscribers end after the last body, and later appends output `None`. It outputs `false` if the buffer was already finished.
-- `subscribe(name, from, conn)` outputs a subscription that first reads the bodies from index `from` on, then waits for new ones, and ends (`recv` outputs `None`) after the last body of a finished buffer. It may start before the buffer exists. `conn` is a [dedicated connection](/en/docs/data/redis#following-changes-dedicated-connections).
+- `subscribe(name, from, hub)` outputs a subscription that first reads the bodies from index `from` on, then waits for new ones, and ends (`recv` outputs `None`) after the last body of a finished buffer. It may start before the buffer exists. `hub` is the process's [`WatchHub`](/en/docs/data/redis#following-changes-the-watch-hub).
 - `remove(name)` deletes the buffer.
 
 Since `finish` is also how a *consumer* can stop the producer (the next `append` outputs `None`), a "stop generating" button needs nothing more than a call to `finish` from the handler that received the click.
@@ -79,7 +79,7 @@ An absent buffer reads as empty and unfinished, so `read` can't tell "not starte
 
 Each name is one Redis stream, `@@wakuwaku-entity:StreamBuffer:<namespace>:<name>`. The body at index `i` is the entry with ID `0-(i + 1)`, and a finished buffer ends with one more entry marking the end. `append` and `finish` are Lua scripts that check for the end marker and write the next entry atomically, so appends from several producers never get the same index and nothing is appended after the end.
 
-Subscribers read with `XREAD BLOCK` after the index they have, in batches of up to 128 entries, so they catch up on everything before waiting and never skip a body.
+Subscribers read with `XRANGE` after the index they have, in batches of up to 128 entries, and sleep only when they are caught up. `append` and `finish` wake them through the watch hub, so they never skip a body.
 
 ## Lifetime and the TTL
 
@@ -109,6 +109,6 @@ Subscribers read with `XREAD BLOCK` after the index they have, in batches of up 
 ## Next steps
 
 <Cards>
-  <Card title="Redis overview" href="/en/docs/data/redis" description="Setup, keys, capabilities and dedicated connections." />
+  <Card title="Redis overview" href="/en/docs/data/redis" description="Setup, keys, capabilities and the watch hub." />
   <Card title="Events" href="/en/docs/events" description="Durable, typed event streams on Apache Iggy." />
 </Cards>

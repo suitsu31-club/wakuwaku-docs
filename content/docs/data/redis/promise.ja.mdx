@@ -1,0 +1,77 @@
+---
+title: プロミス
+description: 値を 1 回だけ完了させ、どのレプリカのリクエストハンドラーからもそれを待てるようにします。マシンをまたぐ oneshot チャネルのようなものです。
+---
+
+[`Promise`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/promise/struct.Promise.html) は、1 回だけ値で完了し、誰でもそれを待てる名前付きのスロットです。`tokio::sync::oneshot` のマシンをまたぐ版にあたります。リクエストハンドラーはプロミスに名前を付けて作業を始め（たとえば[イベント](/ja/docs/events)を発行して）、その名前で待機します。ワーカーは作業の効果が永続化されたらプロミスを完了させます。
+
+待つ側とワーカーが直接やり取りすることはありません。待機は完了の前に始めても後に始めてもよく、どのレプリカからでもかまいません。複数のハンドラーが同じプロミスを待つこともできます。起こすのは[watch hub](/ja/docs/data/redis#following-changes-the-watch-hub)なので、保留中の待機はコネクションを占有しません。
+
+## 完了と待機 [#completing-and-waiting]
+
+```rust title="src/registration.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::dynamic::promise::Promise;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum Registration {
+    Created,
+    EmailTaken,
+}
+
+/// ユーザー ID ごとの登録結果。完了後 10 分間保持する。
+pub const REGISTRATIONS: Promise<u64, Registration> =
+    Promise::new("registration", Duration::from_secs(600));
+
+/// ワーカー: アカウントがコミットされた後。
+pub async fn report(redis: &Redis, user: u64, outcome: Registration) -> RedisResult<()> {
+    redis.process(REGISTRATIONS.complete(&user, outcome)).await?;
+    Ok(())
+}
+
+/// リクエストハンドラー: どのレプリカでもよい。
+pub async fn outcome(
+    redis: &Redis,
+    hub: &WatchHub,
+    user: u64,
+) -> RedisResult<Option<Registration>> {
+    redis.process(REGISTRATIONS.wait(&user, hub, Duration::from_secs(5))).await
+}
+```
+
+- `complete(name, value)` は値を保存し、`name` に対するすべての待機を起こします。プロミスがすでに完了していれば `false` を出力し何も変更しないので、同じ作業に対して 2 回実行されたワーカー（たとえばイベントが再配信された場合）でも安全にもう一度完了できます。最初の値が勝ちます。
+- `wait(name, hub, timeout)` はプロミスが完了した時点で値を出力します。すでに完了していればすぐに出力し、`timeout` が尽きてもまだ完了していなければ `None` を出力します。
+- `get(name)` は待たずに値を読みます。プロミスが完了していなければ `None` です。
+- `remove(name)` はプロミスを削除し、完了していたかどうかを出力します。
+
+`wait` の `None` は「まだ終わっていない」という意味であり、「失敗した」という意味ではありません。クライアントには後で戻ってこられる応答、たとえば `202 Accepted` とポーリング用の名前を返し、次のリクエストで再び待たせてください。リクエストの流れ全体は[非同期処理の完了を待つ](/ja/docs/guides/waiting-for-async-work)で説明しています。
+
+## Redis での表現 [#in-redis]
+
+各名前は 1 つの文字列キー `@@wakuwaku-entity:Promise:<namespace>:<name>` です。`complete` は `SET … NX PX <ttl>` を実行し、キーが設定された場合は同名のチャネルに起床通知を発行する Lua スクリプトです。そのため、待つ側が起床通知なしに値を見ることも、その逆もありません。`wait` はハブを通じて購読した後に `GET` でキーを読み、起床通知のたびにもう一度読みます。
+
+## 寿命と TTL [#lifetime-and-the-ttl]
+
+`Promise::new(namespace, ttl)` は、完了したプロミスが値を保持する期間を設定します。TTL は完了の時点から始まり、一度も完了しないプロミスは領域を使いません。
+
+TTL は、完了から想定される最後の待機までの時間より長くしてください。これには、最初のリクエストがタイムアウトした後にクライアントが再びポーリングする場合も含まれます。TTL が過ぎると、プロミスは再び未完了として読まれます。
+
+## 保証と落とし穴 [#guarantees-and-pitfalls]
+
+- **効果が永続化されてから完了させる。** 先にデータベーストランザクションをコミットし、それから完了させます。後でロールバックで取り消される結果を見た待つ側は、誤った情報を伝えられたことになります。コミットの結果が不明なら完了させず、作業をもう一度実行させてください。
+- **Redis は記録ではない。** 結果は作業の効果と一緒にデータベースにも保存してください（たとえばアカウントの行そのものとして）。作業が終わっているはずなのに待機がタイムアウトした場合（プロミスが期限切れになった、または Redis のフェイルオーバーで失われた場合）は、データベースを読んでください。
+- **作業を始める前に名前を付ける。** 待つ側は名前を知っている必要があるので、リクエストハンドラーで名前（ユーザー ID やジョブ ID）を生成し、作業と一緒に送ります。同じ名前でリトライするクライアントは、同じプロミスを待つことになります。
+- **値は 1 つ。** プロミスは 1 回だけ完了します。成功前に 3-D セキュアが必要な決済のように、複数回変化する状態には[ウォッチ](/ja/docs/data/redis/watch)を使ってください。
+- **capability。** `get` と `wait` は読み取り、`complete` と `remove` は書き込みです。
+
+## 次のステップ [#next-steps]
+
+<Cards>
+  <Card title="非同期処理の完了を待つ" href="/ja/docs/guides/waiting-for-async-work" description="コンシューマーで実行される作業の結果でリクエストに応答します。" />
+  <Card title="ウォッチ" href="/ja/docs/data/redis/watch" description="リクエストハンドラーが前進を待つ、バージョン付きの状態。" />
+</Cards>

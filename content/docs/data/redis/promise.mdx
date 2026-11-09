@@ -1,0 +1,77 @@
+---
+title: Promises
+description: Complete a value once and let request handlers on any replica wait for it, like a oneshot channel that crosses machines.
+---
+
+A [`Promise`](https://docs.rs/wakuwaku-entity/latest/wakuwaku_entity/redis/dynamic/promise/struct.Promise.html) is a named slot that is completed once with a value, and that anyone can wait on. It is the cross-machine counterpart of `tokio::sync::oneshot`. A request handler names the promise and starts the work, for example by publishing an [event](/en/docs/events), then waits on the name. The worker completes the promise once the work's effect is durable.
+
+The waiter and the worker never meet. The wait may start before or after the completion, on any replica, and several handlers may wait on the same promise. The [watch hub](/en/docs/data/redis#following-changes-the-watch-hub) wakes them, so a pending wait holds no connection.
+
+## Completing and waiting
+
+```rust title="src/registration.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::deps::redis::RedisResult;
+use wakuwaku::entity::redis::dynamic::promise::Promise;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
+
+#[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum Registration {
+    Created,
+    EmailTaken,
+}
+
+/// Outcomes of registrations per user ID, kept 10 minutes once completed.
+pub const REGISTRATIONS: Promise<u64, Registration> =
+    Promise::new("registration", Duration::from_secs(600));
+
+/// Worker: after the account is committed.
+pub async fn report(redis: &Redis, user: u64, outcome: Registration) -> RedisResult<()> {
+    redis.process(REGISTRATIONS.complete(&user, outcome)).await?;
+    Ok(())
+}
+
+/// Request handler: any replica.
+pub async fn outcome(
+    redis: &Redis,
+    hub: &WatchHub,
+    user: u64,
+) -> RedisResult<Option<Registration>> {
+    redis.process(REGISTRATIONS.wait(&user, hub, Duration::from_secs(5))).await
+}
+```
+
+- `complete(name, value)` stores the value and wakes every wait on `name`. It outputs `false` and changes nothing if the promise was already completed, so a worker that runs twice for the same work (an event delivered again, for example) can complete it again safely. The first value wins.
+- `wait(name, hub, timeout)` outputs the value as soon as the promise is completed, at once if it already is, or `None` if it is still not completed when `timeout` runs out.
+- `get(name)` reads the value without waiting, `None` if the promise is not completed.
+- `remove(name)` deletes the promise and outputs whether it was completed.
+
+`None` from `wait` means "not done yet", not "failed". Answer the client with something it can come back to, such as `202 Accepted` and the name to poll, and let the next request wait again. [Waiting for asynchronous work](/en/docs/guides/waiting-for-async-work) walks through the whole request flow.
+
+## In Redis
+
+Each name is one string key, `@@wakuwaku-entity:Promise:<namespace>:<name>`. `complete` is a Lua script that runs `SET … NX PX <ttl>` and, if the key was set, publishes a wake-up on the channel of the same name, so a waiter can't see the value without the wake-up or the other way round. `wait` reads the key with `GET` after subscribing through the hub, and again after each wake-up.
+
+## Lifetime and the TTL
+
+`Promise::new(namespace, ttl)` sets how long a completed promise keeps its value. The TTL starts at the completion, and a promise that is never completed takes no space.
+
+Pick a TTL longer than the time between the completion and the last wait you expect. That includes a client polling again after its first request timed out. Once the TTL passes, the promise reads as not completed again.
+
+## Guarantees and pitfalls
+
+- **Complete after the effect is durable.** Commit the database transaction first, then complete. A waiter that sees an outcome a rollback later undoes has been told something false. If the commit outcome is unknown, don't complete. Let the work run again.
+- **Redis is not the record.** Store the outcome with the work's effect in your database too, for example as the account row itself. If a wait times out after the work should have finished, because the promise expired or a Redis failover lost it, read the database.
+- **Name the work before starting it.** The waiter must know the name, so generate it in the request handler (a user ID, a job ID) and send it along with the work. A client that retries with the same name then waits on the same promise.
+- **One value.** A promise is completed once. For state that changes more than once, such as a payment that needs 3-D Secure before it succeeds, use a [watch](/en/docs/data/redis/watch).
+- **Capability.** `get` and `wait` are reads; `complete` and `remove` are writes.
+
+## Next steps
+
+<Cards>
+  <Card title="Waiting for asynchronous work" href="/en/docs/guides/waiting-for-async-work" description="Answer a request with the outcome of work running in a consumer." />
+  <Card title="Watches" href="/en/docs/data/redis/watch" description="Versioned state that request handlers wait on to move forward." />
+</Cards>

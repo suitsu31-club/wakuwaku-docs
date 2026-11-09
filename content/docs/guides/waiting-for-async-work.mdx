@@ -1,0 +1,213 @@
+---
+title: Waiting for asynchronous work
+description: Answer a request with the outcome of work that runs in an event consumer or an external system, without making that work synchronous.
+icon: Hourglass
+---
+
+A request handler, whether an axum route or a gRPC method, runs on one replica, holds the client's connection, and must answer before a deadline. Some of the work a request triggers doesn't run there:
+
+- **Work in an event consumer.** A registration is published as an [event](/en/docs/events) so that one consumer per key decides it, and the consumer may run on another machine, a moment later.
+- **Work in an external system.** A payment provider reports the outcome of a charge through a webhook, which lands on whichever replica serves that endpoint, and is queued in Iggy from there.
+
+Yet the client wants the outcome in the response: the login session after registering, or whether the payment succeeded or needs 3-D Secure.
+
+The handler can't call the consumer like a function, and blocking the request until something happens elsewhere doesn't scale. This is the same problem `async` solves inside one process, so wakuwaku solves it the same way, across processes, with Redis.
+
+## The model: a future across machines
+
+A Rust `Future` doesn't block a thread while it waits. It registers a waker, returns `Pending`, and the runtime's reactor wakes it when its I/O is ready; then it is polled again. wakuwaku's Redis structures do the same between machines:
+
+| Rust async | wakuwaku |
+| --- | --- |
+| The future's shared state | A [`Promise`](/en/docs/data/redis/promise) or a [`Watch`](/en/docs/data/redis/watch), named by an ID both sides know |
+| `poll` | A read of the promise or watch on the `RedisSource` connection |
+| Registering the waker before returning `Pending` | Subscribing to the item through the hub before the read |
+| The reactor | The [`WatchHub`](/en/docs/data/redis#following-changes-the-watch-hub): one Pub/Sub connection per process for every wait |
+| `wake()` | The wake-up that `complete` or `publish` sends in the same script as the write |
+| `Poll::Pending` returned to the caller | A wait that times out: answer the client with "not yet" and let it come back |
+
+The worker never needs to know who is waiting, or where. The waiter never needs to have started before the worker finished. Both only need the name.
+
+## First, check that the work must be asynchronous
+
+The cheapest wait is none. If the request handler can make the decision itself, in one database transaction, do it there and answer directly. A registration whose only rule is "the email is unique" is an `INSERT` with a unique constraint. Effects that may happen later, such as the welcome mail or the search index, can still be published as events.
+
+Keep the work asynchronous when it must be: when one consumer per key must decide it, when it is slow, or when the outcome comes from outside, like a payment provider's webhook. Then use the pattern below.
+
+## Choose the structure
+
+| | [`Promise`](/en/docs/data/redis/promise) | [`Watch`](/en/docs/data/redis/watch) |
+| --- | --- | --- |
+| The outcome is | one value | a state that moves forward |
+| The worker | completes it once; later completions are ignored | publishes each new version; older versions are ignored |
+| The waiter asks | "is it done?" | "is there anything newer than version *v*?" |
+| Examples | registration, a report export, a one-off job | payment, order fulfilment, a review process |
+
+For output that arrives in pieces, such as LLM chunks, use a [stream buffer](/en/docs/data/redis/stream-buffer) instead.
+
+## The rules
+
+1. **Name the work at the edge.** The request handler generates the ID that names the work (a user ID, a job ID, a payment ID) and sends it with the work. It can then wait on that name at once, and a client that retries with the same ID waits on the same outcome. Since the work carries its own ID, running it twice creates nothing twice.
+2. **Publish, then wait. The order doesn't matter.** A promise or watch completed before the wait starts is read at once, so there is no race between the work finishing and the handler starting to wait.
+3. **Complete after the effect is durable.** The worker commits its transaction first, then completes the promise or publishes the watch. Never before: a waiter would report an outcome that a rollback undoes. If the commit outcome is unknown, don't complete. The event will be delivered again.
+4. **The database is the record; Redis is a projection.** Store the outcome with the effect, for example as the account row or the payment row. Promises and watches expire with their TTL, and a Redis failover may lose them. When a wait times out after the work should have finished, read the database.
+5. **A timeout is `Pending`, not an error.** Answer `202 Accepted` with a URL the client can poll, or render a "processing" page that reloads. The poll endpoint waits again, with a short timeout. Never turn a slow consumer into a `500`.
+6. **Make the worker idempotent.** Consumers deliver at least once. `complete` ignores a second completion and `publish` ignores versions that are not newer, so the Redis side already is. Make the database side idempotent too, keyed by the ID from rule 1.
+7. **One hub per process.** Connect a `WatchHub` at startup and pass `&hub` to every wait. However many requests are waiting, they share its one connection.
+
+## Example: registration with a promise
+
+The handler publishes the registration and waits up to 5 seconds for its outcome. The consumer creates the account and completes the promise.
+
+```rust title="src/registration.rs"
+use kanau::{JsonMessageDe, JsonMessageSer};
+use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
+use std::time::Duration;
+use wakuwaku::deps::kanau::processor::Processor;
+use wakuwaku::entity::redis::dynamic::promise::Promise;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
+use wakuwaku::iggy::error::HandleError;
+use wakuwaku::iggy::{EventHandler, Publisher};
+
+#[derive(Clone, Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
+pub enum Registration {
+    Created,
+    EmailTaken,
+}
+
+/// Outcomes per user ID, kept 10 minutes for clients that poll.
+pub const REGISTRATIONS: Promise<u64, Registration> =
+    Promise::new("registration", Duration::from_secs(600));
+
+pub enum RegisterResponse {
+    /// 201, with a new login session.
+    Created { session: String },
+    /// 409.
+    EmailTaken,
+    /// 202: poll `/registrations/{user_id}`.
+    Accepted { user_id: u64 },
+}
+
+/// Request handler. `RegisterRequested` is an event keyed by the email, so
+/// one consumer decides each email in order.
+pub async fn register(
+    app: &App,
+    email: String,
+    password_hash: String,
+) -> Result<RegisterResponse, AppError> {
+    let user_id = app.ids.next();
+    app.publisher
+        .publish(RegisterRequested { user_id, email, password_hash })
+        .await?;
+    let outcome = REGISTRATIONS.wait(&user_id, &app.hub, Duration::from_secs(5));
+    Ok(match app.redis.process(outcome).await? {
+        Some(Registration::Created) => RegisterResponse::Created {
+            session: app.sessions.create(user_id).await?,
+        },
+        Some(Registration::EmailTaken) => RegisterResponse::EmailTaken,
+        None => RegisterResponse::Accepted { user_id },
+    })
+}
+
+/// Consumer: creates the account, then reports the outcome.
+pub struct Register {
+    accounts: AccountStore,
+    redis: Redis,
+}
+
+impl EventHandler<RegisterRequested> for Register {
+    const MAX_BATCH: NonZeroUsize = NonZeroUsize::MIN;
+
+    async fn handle(&self, run: &[RegisterRequested]) -> Result<(), HandleError> {
+        for request in run {
+            // One transaction; inserting the same user ID again returns the
+            // outcome stored the first time.
+            let outcome = self.accounts.create(request).await.map_err(HandleError::transient)?;
+            self.redis
+                .process(REGISTRATIONS.complete(&request.user_id, outcome))
+                .await
+                .map_err(HandleError::transient)?;
+        }
+        Ok(())
+    }
+}
+```
+
+The poll endpoint behind `Accepted` waits again, then falls back to the database:
+
+```rust title="src/registration.rs"
+pub async fn registration_status(app: &App, user_id: u64) -> Result<Option<Registration>, AppError> {
+    let outcome = REGISTRATIONS.wait(&user_id, &app.hub, Duration::from_secs(20));
+    if let Some(outcome) = app.redis.process(outcome).await? {
+        return Ok(Some(outcome));
+    }
+    // Expired or lost in Redis, or still running: the account table knows.
+    Ok(app.accounts.registration_outcome(user_id).await?)
+}
+```
+
+The session is created by the request handler once the outcome says `Created`, so it never travels through Redis or the event log.
+
+## Example: payment with a watch
+
+A payment involves three requests and an outside party:
+
+```text
+browser ──Pay──▶ endpoint A ──charge──▶ provider
+   │                 │ publish PaymentObserved (provider's immediate answer)
+   │◀── 3DS URL ─────┘
+   │──── 3-D Secure challenge ────────▶ provider
+   │                                       │ webhook
+   │                                       ▼
+   │                                  endpoint B ── publish PaymentObserved ──▶ Iggy
+   │                                       └── 2xx once published                │
+   │                                                                             ▼
+   │                                        consumer: update the payment row, version + 1,
+   │                                                  commit, then PAYMENTS.publish
+   │──return_url──▶ any replica: PAYMENTS.changed(id, after = version shown) ──▶ result page
+```
+
+- **Endpoint A** mints the payment ID, charges the provider with that ID as the idempotency key, and publishes what the provider answered. It returns that answer, such as the 3-D Secure URL, to the browser at once.
+- **Endpoint B** verifies the webhook's signature and publishes it as the same event type. It answers the provider `2xx` as soon as the publish succeeded. "Handled" means "durably received; stop retrying", not "processed". Processing failures are the consumer's to retry, and waiting for them here would race the provider's timeout.
+- **The consumer** is the only writer of the payment's status. Partitioned by payment ID, it applies each observation to the row, increments its version, commits, and then publishes the watch. Providers don't promise to deliver webhooks in order, so let a terminal status win over a pending one instead of trusting arrival order.
+- **The `return_url` handler**, on whichever replica gets it, waits for anything newer than the version the page showed.
+
+```rust title="src/payment.rs"
+/// Consumer, after committing `row` at `row.version`.
+pub async fn project(redis: &Redis, row: &PaymentRow) -> Result<(), HandleError> {
+    redis
+        .process(PAYMENTS.publish(&row.id, row.version, row.status.clone()))
+        .await
+        .map(|_| ())
+        .map_err(HandleError::transient)
+}
+
+/// `return_url` handler: the page that sent the user to the provider
+/// showed version `seen`.
+pub async fn payment_result(app: &App, payment: u64, seen: u64) -> Result<Page, AppError> {
+    let next = PAYMENTS.changed(&payment, seen, &app.hub, Duration::from_secs(10));
+    Ok(match app.redis.process(next).await? {
+        Some(status) => Page::status(status.body, status.version),
+        // Nothing new yet: show the stored state and poll again with the same `seen`.
+        None => Page::processing(app.payments.load(payment).await?),
+    })
+}
+```
+
+The provider eventually stops retrying webhooks it can't deliver. A [cron job](/en/docs/services/cron-jobs) that asks the provider about payments stuck in a pending status for too long, and publishes the answer as the same event, closes that gap with no extra machinery.
+
+## What it costs
+
+- **Latency.** The wait ends after the consumer's poll interval, its handler, and one Redis round trip. Keep the poll interval of request-serving topics short.
+- **Connections.** One Pub/Sub connection per process for the hub. Waits read on the `RedisSource` connection you already have.
+- **Lost waiters.** A replica that stops loses its pending waits. The work still completes; the client retries with the same ID (rule 1) and its next wait reads the outcome.
+
+## Next steps
+
+<Cards>
+  <Card title="Promises" href="/en/docs/data/redis/promise" description="Outcomes completed once, waited on from any replica." />
+  <Card title="Watches" href="/en/docs/data/redis/watch" description="Versioned state that request handlers wait on to move forward." />
+  <Card title="The watch hub" href="/en/docs/data/redis#following-changes-the-watch-hub" description="How waits share one connection and never miss a change." />
+  <Card title="Consuming events" href="/en/docs/events/consuming" description="Handlers, batching and delivery modes." />
+</Cards>

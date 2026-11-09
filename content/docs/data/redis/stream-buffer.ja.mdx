@@ -14,8 +14,9 @@ use kanau::{JsonMessageDe, JsonMessageSer};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::deps::redis::RedisResult;
 use wakuwaku::entity::redis::dynamic::stream_buffer::StreamBuffer;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
 #[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
 pub struct Chunk {
@@ -41,12 +42,11 @@ pub async fn produce(redis: &Redis, request: u64, tokens: Vec<String>) -> RedisR
 /// （初回接続では 0）へストリーミングする HTTP ハンドラー。
 pub async fn stream_to_client(
     redis: &Redis,
-    client: &redis::Client,
+    hub: &WatchHub,
     request: u64,
     seen: u64,
 ) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
-    let mut subscription = redis.process(COMPLETIONS.subscribe(&request, seen, conn)).await?;
+    let mut subscription = redis.process(COMPLETIONS.subscribe(&request, seen, hub)).await?;
     while let Some(chunk) = subscription.recv().await? {
         send_to_client(&chunk.text).await;
     }
@@ -56,7 +56,7 @@ pub async fn stream_to_client(
 
 - `append(name, body)` は本体を追加し、必要ならバッファを作成します。本体のインデックス（0 から）を出力し、バッファがすでに finish 済みなら `None` を出力します。
 - `finish(name)` はバッファを終わらせ、必要なら空のバッファを作成します。購読者は最後の本体の後で終わり、以降の append は `None` を出力します。すでに finish 済みだった場合は `false` を出力します。
-- `subscribe(name, from, conn)` は購読を出力します。購読はまずインデックス `from` 以降の本体を読み、次に新しい本体を待ち、finish 済みのバッファの最後の本体の後で終わります（`recv` が `None` を出力します）。バッファが存在する前に始めてもかまいません。`conn` は[専用コネクション](/ja/docs/data/redis#following-changes-dedicated-connections)です。
+- `subscribe(name, from, hub)` は購読を出力します。購読はまずインデックス `from` 以降の本体を読み、次に新しい本体を待ち、finish 済みのバッファの最後の本体の後で終わります（`recv` が `None` を出力します）。バッファが存在する前に始めてもかまいません。`hub` はプロセスの [`WatchHub`](/ja/docs/data/redis#following-changes-the-watch-hub) です。
 - `remove(name)` はバッファを削除します。
 
 `finish` は *消費者* がプロデューサーを止める手段にもなる（次の `append` が `None` を出力する）ので、「生成を停止」ボタンは、クリックを受けたハンドラーから `finish` を呼ぶだけで実現できます。
@@ -79,7 +79,7 @@ pub async fn poll(redis: &Redis, request: u64, seen: u64) -> RedisResult<(String
 
 各名前は 1 つの Redis ストリーム `@@wakuwaku-entity:StreamBuffer:<namespace>:<name>` です。インデックス `i` の本体は ID `0-(i + 1)` のエントリで、finish 済みのバッファの末尾には終端を示すエントリがもう 1 つあります。`append` と `finish` は終端マーカーを確認して次のエントリをアトミックに書き込む Lua スクリプトなので、複数のプロデューサーの append が同じインデックスを得ることも、終端の後に何かが追記されることもありません。
 
-購読者は持っているインデックスより後を `XREAD BLOCK` で最大 128 エントリずつ読みます。待機する前にすべてに追いつくので、本体を飛ばすことはありません。
+購読者は持っているインデックスより後を `XRANGE` で最大 128 エントリずつ読み、追いついているときだけ眠ります。`append` と `finish` は watch hub を通じて購読者を起こすので、本体を飛ばすことはありません。
 
 ## 寿命と TTL
 
@@ -109,6 +109,6 @@ pub async fn poll(redis: &Redis, request: u64, seen: u64) -> RedisResult<(String
 ## 次のステップ
 
 <Cards>
-  <Card title="Redis の概要" href="/ja/docs/data/redis" description="セットアップ、キー、capability、専用コネクション。" />
+  <Card title="Redis の概要" href="/ja/docs/data/redis" description="セットアップ、キー、capability、watch hub。" />
   <Card title="イベント" href="/ja/docs/events" description="Apache Iggy 上の永続的で型付きのイベントストリーム。" />
 </Cards>

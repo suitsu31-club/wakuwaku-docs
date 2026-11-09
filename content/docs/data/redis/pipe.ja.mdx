@@ -14,8 +14,9 @@ use kanau::{JsonMessageDe, JsonMessageSer};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use wakuwaku::deps::kanau::processor::Processor;
-use wakuwaku::deps::redis::{self, RedisResult};
+use wakuwaku::deps::redis::RedisResult;
 use wakuwaku::entity::redis::dynamic::pipe::Pipe;
+use wakuwaku::entity::redis::watch_hub::WatchHub;
 
 #[derive(Serialize, Deserialize, JsonMessageSer, JsonMessageDe)]
 pub enum Frame {
@@ -37,9 +38,8 @@ pub async fn hang_up(redis: &Redis, session: &str) -> RedisResult<()> {
 }
 
 /// ゲートウェイ: ブラウザの websocket を持つインスタンス。
-pub async fn forward(redis: &Redis, client: &redis::Client, session: &str) -> RedisResult<()> {
-    let conn = dedicated_connection(client).await?;
-    let mut receiver = redis.process(TO_CLIENT.receive(session, conn)).await?;
+pub async fn forward(redis: &Redis, hub: &WatchHub, session: &str) -> RedisResult<()> {
+    let mut receiver = redis.process(TO_CLIENT.receive(session, hub)).await?;
     while let Some(frame) = receiver.recv().await? {
         match frame {
             Frame::Text(text) => write_to_websocket(&text).await,
@@ -53,13 +53,13 @@ pub async fn forward(redis: &Redis, client: &redis::Client, session: &str) -> Re
 
 - `send(name, body)` はメッセージを追加します。
 - `close(name)` はパイプを終わらせます。受信者は close の前に送られたすべてのメッセージを受け取り、その後 `recv` は `None` を出力します。
-- `receive(name, conn)` は `PipeReceiver` を出力します。その `recv` は次のメッセージを待ち、`into_stream` はパイプが閉じられると終わる `Stream` に変換します。
+- `receive(name, hub)` は `PipeReceiver` を出力します。その `recv` は次のメッセージを待ち、`into_stream` はパイプが閉じられると終わる `Stream` に変換します。
 
-`recv` はコネクション上でブロックするため、`receive` は専用のコネクションを受け取ります。開き方と共有してはいけない理由は[専用コネクション](/ja/docs/data/redis#following-changes-dedicated-connections)を参照してください。
+`receive` はプロセスの [`WatchHub`](/ja/docs/data/redis#following-changes-the-watch-hub) を受け取り、メッセージが届くとそれが受信者を起こします。受信者は `RedisSource` のコネクションのクローン上で通常のコマンドを使って読むので、自分専用のコネクションは持ちません。
 
 ## Redis 上の表現
 
-各名前は同じクラスターハッシュスロットにある 2 つのリストです。`…:Pipe:{<namespace>:<name>}:m` がメッセージを持ち、`…:c` は送信者が閉じたときにマーカーを受け取ります。受信者は `BLPOP` で両方を（メッセージを先に）待つので、close は必ずそれより前に送られたすべてのメッセージの後に見えます。各 send と close は、push と TTL の再設定を 1 つの `MULTI` ブロックで行います。
+各名前は同じクラスターハッシュスロットにある 2 つのリストです。`…:Pipe:{<namespace>:<name>}:m` がメッセージを持ち、`…:c` は送信者が閉じたときにマーカーを受け取ります。各 send と close は、push、TTL の再設定、受信者の起床を一度に行う Lua スクリプトです。受信者は次のメッセージを、メッセージが残っていない場合に限って close マーカーを、1 つのスクリプトで取り出すので、close は必ずそれより前に送られたすべてのメッセージの後に見えます。
 
 ## 寿命と TTL
 
