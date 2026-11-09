@@ -22,19 +22,28 @@ The second release candidate kept everything rc1 contained and refined it:
 - **Events**: many events of one type can be published as a batch.
 - **Validation**: pure verifiers, declarable as constants, prove properties that need no context or I/O.
 
-### 1.0.0-rc3 (current)
+### 1.0.0-rc3
 
-The current release candidate fixes what porting a production service to rc2 found:
+The third release candidate fixed what porting a production service to rc2 found:
 
 - **Data access**: a transaction flow declares the entities it reads and writes with `tx_effect!`, and every query it runs must stay within that declaration. A flow can no longer touch an entity that neither it nor its handle covers.
 - **Validation**: `ValidateError` is a standard error type, so it propagates with `?`. `Proven` values can be printed with `Debug`, and a pure verifier can check a `String` through `&str`.
 - **Documentation**: how to run a transaction and model its states, and how to assign consumer partitions.
 
+### 1.0.0-rc4 (current)
+
+The final release candidate before 1.0.0. Its features are frozen: no new feature will be added before 1.0.0, and only bug fixes are accepted.
+
+- **Data access**: waits on the Redis dynamic structures no longer hold a dedicated connection blocked in `BLPOP` or `XREAD BLOCK`. One `WatchHub` per process, a reactor on a single Pub/Sub connection, wakes them. `Promise` (a value completed once and awaited by anyone) and `Watch` (state versioned by its writer, awaited for newer versions) join the dynamic structures.
+- **Errors**: `TxError`, `FilterError`, and the Iggy consumer and publisher `Error` are `#[non_exhaustive]`, so a variant added by a bug fix does not break your `match`.
+
+Upgrading from rc3: `Pipe::receive`, `LiveView::subscribe`, `LiveView::resume`, and `StreamBuffer::subscribe` take a `&WatchHub` instead of a connection, `Versioned` moved from `live_view` to `dynamic`, and a `match` on the errors above needs a wildcard arm.
+
 Everything listed as available in the table below ships in this release.
 
 ### 1.0.0
 
-1.0.0 will be released once end-to-end tests on real-world projects pass. Until then, the release candidate can still change where those tests show it has to.
+1.0.0 will be released once end-to-end tests on real-world projects pass. It will have the same features as rc4: the only changes between the two are fixes for the bugs those tests find.
 
 ### 2.0.0
 
@@ -44,7 +53,7 @@ No dates are attached to these milestones.
 
 ## Spring modules and their counterparts
 
-"Available" means the counterpart exists in 1.0.0-rc3. It does not mean that wakuwaku copies the Spring API. The counterparts are designed so that the compiler checks as much as possible, so they often work differently. [Coming from Spring](/en/docs/guides/coming-from-spring) explains the differences.
+"Available" means the counterpart exists in 1.0.0-rc4. It does not mean that wakuwaku copies the Spring API. The counterparts are designed so that the compiler checks as much as possible, so they often work differently. [Coming from Spring](/en/docs/guides/coming-from-spring) explains the differences.
 
 | Spring                                                    | wakuwaku                                                                                | Status    |
 | --------------------------------------------------------- | --------------------------------------------------------------------------------------- | --------- |
@@ -75,4 +84,4 @@ A "not yet" row means that wakuwaku has nothing for it today. Until a counterpar
 
 ## Changes since 0.3
 
-0.3 was a set of utilities around RabbitMQ, Redis, and sqlx. 1.0.0-rc3 replaces most of them. See [Migrating from 0.3](/en/docs/guides/migrating-from-0.3).
+0.3 was a set of utilities around RabbitMQ, Redis, and sqlx. 1.0.0-rc4 replaces most of them. See [Migrating from 0.3](/en/docs/guides/migrating-from-0.3).

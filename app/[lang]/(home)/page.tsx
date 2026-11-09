@@ -19,7 +19,7 @@ import { i18n } from "@/lib/i18n";
 const apiReference = "https://docs.rs/wakuwaku/latest/wakuwaku/";
 
 const installCode = `[dependencies]
-wakuwaku = { version = "1.0.0-rc3", features = ["iggy", "sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc4", features = ["iggy", "sqlx-pg", "redis"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }`;
 
 const exampleCode = `use std::time::Duration;
@@ -248,14 +248,14 @@ const text: Record<"en" | "ja", Text> = {
         body: "The first release candidate.",
       },
       {
-        version: "1.0.0-rc3",
+        version: "1.0.0-rc4",
         label: "Now",
-        body: "The release candidate these docs describe.",
+        body: "The final release candidate. Features are frozen; only bug fixes until 1.0.0.",
       },
       {
         version: "1.0.0",
         label: "Stable",
-        body: "After end-to-end tests on real-world projects.",
+        body: "Same features as rc4, after end-to-end tests on real-world projects.",
       },
       {
         version: "2.0.0",
@@ -351,14 +351,14 @@ const text: Record<"en" | "ja", Text> = {
         body: "最初のリリース候補版です。",
       },
       {
-        version: "1.0.0-rc3",
+        version: "1.0.0-rc4",
         label: "現在",
-        body: "このドキュメントが対象とするリリース候補版です。",
+        body: "最後のリリース候補版です。機能は凍結され、1.0.0 まではバグ修正のみを受け付けます。",
       },
       {
         version: "1.0.0",
         label: "安定版",
-        body: "実際のプロジェクトでの E2E テストを経てリリースします。",
+        body: "rc4 と同じ機能で、実際のプロジェクトでの E2E テストを経てリリースします。",
       },
       {
         version: "2.0.0",
