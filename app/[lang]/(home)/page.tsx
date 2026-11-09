@@ -19,7 +19,7 @@ import { i18n } from "@/lib/i18n";
 const apiReference = "https://docs.rs/wakuwaku/latest/wakuwaku/";
 
 const installCode = `[dependencies]
-wakuwaku = { version = "1.0.0-rc2", features = ["iggy", "sqlx-pg", "redis"] }
+wakuwaku = { version = "1.0.0-rc3", features = ["iggy", "sqlx-pg", "redis"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }`;
 
 const exampleCode = `use std::time::Duration;
