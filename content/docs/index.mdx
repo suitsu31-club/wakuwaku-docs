@@ -1,25 +1,96 @@
 ---
 title: Introduction
-description: wakuwaku is a proof-driven microservice framework for Rust that wires gRPC servers, event handlers, and cron jobs from one compile-time registry.
+description: wakuwaku is a proof-driven microservice framework for Rust. You build with the libraries you already know, such as axum, tonic, and sqlx, and wakuwaku glues them together with types that prove how they fit.
 icon: BookOpen
 ---
 
-**wakuwaku** is a proof-driven microservice framework for Rust. Its goal is to become for Rust what Spring is for Java: one framework that covers the everyday needs of a backend service, with Rust's compiler doing most of the checking.
+**wakuwaku** is a proof-driven microservice framework for Rust. It does not replace the libraries you already know. You write HTTP routes with axum, gRPC services with tonic, and SQL with sqlx, the way their own documentation describes. wakuwaku is the glue between them, and every joint is a proof the compiler checks:
 
-A wakuwaku service is assembled from plain values. You register shared dependencies (a connection pool, a client, a config struct) in a `ServiceBuilder`. Every component, whether a gRPC server, an event handler, or a cron job, declares the one dependency it is built from, and the builder creates it. Lookups go through the trait solver, not a runtime container, so a component that asks for something you never registered fails to compile.
+- a registry that builds each component from shared dependencies, so a component cannot ask for something that was never registered;
+- data-access handles whose type says which entities they may read and write;
+- events whose type says how they may be reordered, batched, and folded;
+- validated values whose type says which check they passed.
 
-The crates that do the actual work are re-exported behind feature flags. A service depends on `wakuwaku` alone.
+What wakuwaku does not do is decide the shape of your project. Full-stack frameworks such as Elixir's Phoenix or PHP's Laravel *are* the project: they bring the directory layout, the generators, the router, the ORM, the job system, and slots where your code goes. That is productive as long as your service looks like the one they were designed for. A wakuwaku service is an ordinary Rust binary with your `main`, your module layout, and your `Cargo.toml`. wakuwaku is one dependency in it.
 
-<ArchitectureDiagram lang="en" />
+<GlueDiagram lang="en" />
+
+## Libraries you already know
+
+Each integration is a thin layer over a library, not a replacement for it. The library's own API, documentation, and examples stay valid:
+
+| You write with | wakuwaku adds |
+| --- | --- |
+| `tonic` servers generated from `.proto` files | Builds each server from registered dependencies and adds them all to one router. [gRPC services](/en/docs/services/grpc) |
+| `sqlx` queries, checked against your schema at compile time | A query type that declares what it reads and writes, run through a handle whose capability must cover it, and transactions as flows. [sqlx](/en/docs/data/sqlx) |
+| `redis` commands | Typed caches, locks, and rate limiters, plus structures that replicas can wait on, all as capability-checked queries. [Redis](/en/docs/data/redis) |
+| `meilisearch-sdk` | Typed filters, capability-checked searches and writes, tenant tokens, and keeping an index in sync with its source. [Meilisearch](/en/docs/data/meilisearch) |
+| `iggy` streams | Typed events with per-key ordering, algebraic batching, and retries. [Events](/en/docs/events) |
+| `axum` routes | No HTTP layer of its own yet (see the [roadmap](/en/docs/roadmap)). Take handles from the `ServiceBuilder`, and require `Proven` values and capability-typed handles in your handlers, as in any other function. |
+
+The glue itself is small: a component is a plain struct that implements a [`kanau`](https://docs.rs/kanau) `Processor` (or a trait built on it), so code that does not need wakuwaku does not have to know about it.
 
 ## Proof-driven programming
 
 wakuwaku splits correctness in two:
 
 - **Macro correctness**: how components fit together. Traits prove it and the compiler checks it. A component whose dependency was never registered, a write query sent through a read-only database handle, or a cron job with a zero interval does not build.
-- **Micro correctness**: what a single component does. Unit tests prove it. Every component is a plain value that implements a [`kanau`](https://docs.rs/kanau) `Processor` (or a trait built on it), so a test constructs it and calls it directly, without starting the service.
+- **Micro correctness**: what a single component does. Unit tests prove it. Every component is a plain value, so a test constructs it and calls it directly, without starting the service.
 
-As a result, most wiring mistakes surface when you build, and the remaining tests stay small and fast. [Proof-driven programming](/en/docs/core/proof-driven) explains the idea in depth.
+### A proof is as strong as Rust's safety
+
+"Proof" here means what "safety" means in Rust. The compiler checks every claim written in types, and it trusts the places where you assert something it cannot check. In Rust that place is an `unsafe` block; in wakuwaku it is the code that *creates* a proof. A `Proven<Request, Authenticated>` is exactly as trustworthy as the predicate that produced it. If that predicate is a mocked authentication check that accepts every request, the program still compiles, every function that requires an authenticated request still receives one, and the guarantee is gone. A `PureVerifier` that always succeeds, or a query declared as a read whose SQL writes, is unsound in the same way. Nothing formally verifies that a predicate means what its name says.
+
+That is a deliberate choice. A framework built on a real proof system such as Lean could check the predicates too, but it would be too hard to use for everyday web development. In practice only AI agents would write it, which is worse: code that no human on the team can follow is not code the team can trust. Full verification would not reach the bottom anyway. Even with a formally verified compiler and verified libraries, the hardware leaks: data can be read by measuring power consumption, and no proof about the program covers physics. Every system trusts something. For web applications, Rust's level is the right one: checked wherever checking is cheap, trusted only where the trust is explicit.
+
+### Mistakes become obvious
+
+The value of a proof is not that mistakes become impossible. It is that they become obvious:
+
+- **Some become compile errors.** A missing dependency, a write through a read-only handle, a raw value where a validated one is required. The [catalogue](/en/docs/core/proof-driven#what-the-compiler-rejects) lists them.
+- **The rest become visible in declarations.** A handler that takes a read-write handle where it should only read, an event declared `Idempotent` that is not, a `Proven` built by a stub: each one sits in a signature or a trait impl, where a reader sees it without tracing execution.
+
+Both kinds of reader benefit. An AI agent gets feedback in seconds: the compiler points at the line that is wrong, long before a bug reaches production. A human reviewer reads types and declarations instead of reasoning through each line. In the age of AI programming, almost nobody is willing to read code line by line and reason about it, and wakuwaku is built so that you do not have to. What each component does is checked by unit tests, which an AI agent can write and run. How the components fit together is checked by the compiler, and can be reviewed at a glance.
+
+### Macro correctness rests on micro correctness
+
+The two halves are not independent: **macro correctness is real when, and only when, micro correctness is real.** The compiler proves that every function requiring `Proven<_, Authenticated>` receives one. Whether "authenticated" is true depends on the predicate, a single small component that its tests prove. A capability proves that a read-only handle never runs a query *declared* as a write. Whether the declaration matches the SQL is a property of that one query.
+
+So the work splits cleanly. Test the small pieces thoroughly, and the type system carries their truth through the whole service. Correct wiring cannot hide a wrong piece, and a wrong piece is a small thing to find. [Proof-driven programming](/en/docs/core/proof-driven) goes through the idea in depth.
+
+## Why these integrations
+
+wakuwaku integrates with a deliberately small set of infrastructure. Each integration is there for a reason, and so is each omission.
+
+### gRPC
+
+gRPC is the default choice for communication between microservices. The contract is a `.proto` file that every side shares, the client and server code is generated from it, and calls carry deadlines and streams. wakuwaku builds the tonic servers from the `ServiceBuilder`. A public HTTP API, if you need one, is written with axum next to them. [gRPC services](/en/docs/services/grpc)
+
+### Cron jobs
+
+A cron job is a trigger: it fires at a given frequency and dispatches work, such as expiring stale rows, retrying stuck jobs, or publishing events for consumers to process. The interval is a constant of the job type, and the job runs inside the process, so it is built from the same dependencies and tested like any other component. [Cron jobs](/en/docs/services/cron-jobs)
+
+### SQL through sqlx
+
+sqlx is the best SQL toolkit in Rust: plain SQL, checked against the database schema at compile time, asynchronous throughout, with no ORM in between. wakuwaku adds capability types on top and leaves the SQL to you. The database is your choice: PostgreSQL (`sqlx-pg`) or MySQL (`sqlx-mysql`).
+
+SQLite is unsupported on purpose. It is a file next to one process, while a microservice runs as replicas that share their database. Nobody should use SQLite in a microservice. [sqlx](/en/docs/data/sqlx)
+
+### Redis
+
+Redis is everywhere. Most services already run one for caching, locking, or rate limiting, so it is built in, along with structures that let one replica wait for work done on another. [Redis](/en/docs/data/redis)
+
+### Meilisearch
+
+Meilisearch is a search engine written in Rust, and it is supported because it belongs to the Rust ecosystem. Searches and document writes are queries, checked like SQL ones. [Meilisearch](/en/docs/data/meilisearch)
+
+Other data stores, such as MongoDB and Apache Cassandra, may be supported in the next major version. Until then, register their clients in the `ServiceBuilder` like any other dependency.
+
+### Events on Apache Iggy
+
+The event layer is built on Apache Iggy, a message streaming platform written in Rust, again because of the Rust ecosystem. What the event layer needs from it is a partitioned, append-only log: records are stored in order, consumers store how far they got, and a failing key can be moved to a retry topic while the rest of the partition keeps flowing. Per-key ordering and algebraic batching are proven on top of that model. In theory Apache Kafka, NATS JetStream, or SierraDB could carry the same design, because they provide the same kind of log.
+
+RabbitMQ, ZeroMQ, and Redis-based queues are not recommended, and therefore not supported. They hand messages out instead of keeping an ordered log to read from, so the ordering and delivery guarantees the event layer proves would be much harder to establish on them. [Events](/en/docs/events)
 
 ## Crates
 
@@ -46,14 +117,6 @@ Third-party crates that appear in these APIs (`kanau`, `tonic`, `iggy`, `sqlx`, 
 | `meilisearch` | no      | `entity` with Meilisearch, `deps::meilisearch_sdk`          |
 
 Cron jobs and the `ServiceBuilder` itself are always available. [Installation](/en/docs/getting-started/installation) shows common feature combinations.
-
-## What you can build today
-
-- **gRPC services** built from tonic-generated servers: [gRPC services](/en/docs/services/grpc).
-- **Cron jobs** that run inside the process on an interval declared as a constant: [Cron jobs](/en/docs/services/cron-jobs).
-- **Event-driven services** on Apache Iggy, with per-key ordering, batching, and retries: [Events](/en/docs/events).
-- **Data access** to PostgreSQL, MySQL, Redis, and Meilisearch, where the type of the handle says what it is allowed to touch: [Data access](/en/docs/data).
-- **Validation** whose result is a type, so unvalidated input cannot reach code that requires validated input: [Validation](/en/docs/validation).
 
 ## Version status
 

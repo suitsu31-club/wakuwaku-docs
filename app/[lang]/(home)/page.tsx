@@ -438,10 +438,7 @@ export default async function HomePage(props: PageProps<"/[lang]">) {
             {t.intro}
           </p>
           <div className="mt-8 flex flex-wrap justify-center gap-3">
-            <Link
-              href={`/${lang}/docs/getting-started/quick-start`}
-              className={primaryButton}
-            >
+            <Link href={`/${lang}/docs`} className={primaryButton}>
               {t.getStarted}
               <ArrowRight className="size-4" />
             </Link>
@@ -644,10 +641,7 @@ export default async function HomePage(props: PageProps<"/[lang]">) {
             {t.ctaBody}
           </p>
           <div className="mt-6 flex flex-wrap justify-center gap-3">
-            <Link
-              href={`/${lang}/docs/getting-started/quick-start`}
-              className={primaryButton}
-            >
+            <Link href={`/${lang}/docs`} className={primaryButton}>
               {t.getStarted}
               <ArrowRight className="size-4" />
             </Link>

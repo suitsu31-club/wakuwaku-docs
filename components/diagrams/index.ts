@@ -5,6 +5,7 @@ export { ConsumerPipelineDiagram } from "./consumer-pipeline";
 export { CorrectnessDiagram } from "./correctness";
 export { CronScheduleDiagram } from "./cron-schedule";
 export { EventFlowDiagram } from "./event-flow";
+export { GlueDiagram } from "./glue";
 export { GrpcRegistrationDiagram } from "./grpc-registration";
 export { LiveViewDiagram } from "./live-view";
 export { MeiliSyncDiagram } from "./meili-sync";
